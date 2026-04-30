@@ -1,0 +1,76 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package
+    Name="Run Config Manager"
+    Version="$(PackageVersion)"
+    Manufacturer="Run Config Manager"
+    Language="1033"
+    UpgradeCode="edd5601c-e5f4-45f1-bce2-41cadc8ff01a"
+    UpgradeStrategy="majorUpgrade"
+    Scope="perMachine">
+    <MajorUpgrade
+      Schedule="afterInstallInitialize"
+      DowngradeErrorMessage="A newer version of [ProductName] is already installed." />
+    <Media Id="1" Cabinet="media1.cab" EmbedCab="yes" />
+
+    <Icon Id="AppIcon.ico" SourceFile="$(SourceDir)\packaging\windows\AppIcon.ico" />
+    <Property Id="ARPPRODUCTICON" Value="AppIcon.ico" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="Run Config Manager" />
+    </StandardDirectory>
+
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="ApplicationProgramsFolder" Name="Run Config Manager" />
+    </StandardDirectory>
+
+    <ComponentGroup Id="MainComponents" Directory="INSTALLFOLDER">
+      <Component Id="ApplicationComponent" Bitness="always64">
+        <File
+          Id="ApplicationFile"
+          Source="$(SourceDir)\target\release\run_config_manager.exe"
+          KeyPath="yes">
+          <Shortcut
+            Id="ApplicationStartMenuShortcut"
+            Name="Run Config Manager"
+            Directory="ApplicationProgramsFolder"
+            Description="Run/Debug configuration management tool"
+            WorkingDirectory="INSTALLFOLDER"
+            Advertise="yes" />
+        </File>
+      </Component>
+
+      <Component Id="LicenseComponent" Bitness="always64">
+        <File
+          Id="LicenseFile"
+          Source="$(SourceDir)\LICENSE"
+          Name="LICENSE"
+          KeyPath="yes" />
+      </Component>
+
+      <Component Id="ReadmeComponent" Bitness="always64">
+        <File
+          Id="ReadmeFile"
+          Source="$(SourceDir)\README.md"
+          Name="README.md"
+          KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <Component Id="StartMenuFolderComponent" Directory="ApplicationProgramsFolder" Bitness="always64">
+      <RemoveFolder Id="RemoveApplicationProgramsFolder" On="uninstall" />
+      <RegistryValue
+        Root="HKLM"
+        Key="Software\RunConfigManager"
+        Name="Installed"
+        Type="integer"
+        Value="1"
+        KeyPath="yes" />
+    </Component>
+
+    <Feature Id="MainFeature" Title="Run Config Manager" Level="1">
+      <ComponentGroupRef Id="MainComponents" />
+      <ComponentRef Id="StartMenuFolderComponent" />
+    </Feature>
+  </Package>
+</Wix>

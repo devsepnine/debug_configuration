@@ -1,0 +1,359 @@
+use serde_json::Value;
+use std::path::{Path, PathBuf};
+
+/// SVG 아이콘을 바이너리에 embed
+///
+/// 컴파일 타임에 SVG 파일을 바이너리에 직접 포함시킵니다.
+/// 이를 통해 단일 실행 파일만으로 배포할 수 있습니다.
+// Configuration Editor
+pub const ICON_FOLDER_OPEN: &[u8] = include_bytes!("../assets/mingcute--folder-open-line.svg");
+pub const ICON_EDIT: &[u8] = include_bytes!("../assets/mingcute--edit-3-line.svg");
+pub const ICON_DELETE: &[u8] = include_bytes!("../assets/mingcute--delete-2-fill.svg");
+pub const ICON_SAVE: &[u8] = include_bytes!("../assets/mingcute--save-2-line.svg");
+pub const ICON_CLOSE: &[u8] = include_bytes!("../assets/mingcute--close-fill.svg");
+pub const ICON_ADD: &[u8] = include_bytes!("../assets/mingcute--add-square-line.svg");
+pub const ICON_CONFIGURATIONS: &[u8] = include_bytes!("../assets/app--configurations.svg");
+pub const ICON_SESSIONS: &[u8] = include_bytes!("../assets/app--sessions.svg");
+
+// Shared sentinels
+pub const DIALOG_CANCELLED: &str = "cancelled";
+
+// Configuration List
+pub const ICON_PLAY: &[u8] = include_bytes!("../assets/mingcute--play-fill.svg");
+
+// Pane View
+pub const ICON_REFRESH: &[u8] = include_bytes!("../assets/mingcute--refresh-1-fill.svg");
+pub const ICON_STOP: &[u8] = include_bytes!("../assets/mingcute--stop-fill.svg");
+pub const ICON_ARROW_DOWN_FILL: &[u8] =
+    include_bytes!("../assets/mingcute--arrow-down-circle-fill.svg");
+pub const ICON_ARROW_DOWN_LINE: &[u8] =
+    include_bytes!("../assets/mingcute--arrow-down-circle-line.svg");
+pub const ICON_PANE_MAXIMIZE: &[u8] = include_bytes!("../assets/app--pane-maximize.svg");
+pub const ICON_PANE_RESTORE: &[u8] = include_bytes!("../assets/app--pane-restore.svg");
+
+// ============================================================================
+// Node package manager utility functions
+// ============================================================================
+
+/// `working_directory`에서 상위 디렉토리로 이동하며 `package.json` 파일 탐색
+///
+/// # Arguments
+/// * `working_dir` - 탐색을 시작할 디렉토리
+///
+/// # Returns
+/// * `Some(PathBuf)` - package.json 파일을 찾은 경우
+/// * `None` - package.json을 찾지 못한 경우
+pub fn find_package_json(working_dir: &Path) -> Option<PathBuf> {
+    let mut current = working_dir;
+    loop {
+        let pkg = current.join("package.json");
+        if pkg.exists() {
+            return Some(pkg);
+        }
+        current = current.parent()?;
+    }
+}
+
+/// package.json 파일에서 scripts 섹션 파싱
+///
+/// # Arguments
+/// * `package_json_path` - package.json 파일 경로
+///
+/// # Returns
+/// * `Ok(Vec<String>)` - 스크립트 이름 목록 (알파벳 순)
+/// * `Err(String)` - 파싱 실패 시 에러 메시지
+pub fn parse_scripts(package_json_path: &Path) -> Result<Vec<String>, String> {
+    let content = std::fs::read_to_string(package_json_path)
+        .map_err(|e| format!("Failed to read package.json: {e}"))?;
+
+    let json: Value =
+        serde_json::from_str(&content).map_err(|e| format!("Invalid JSON in package.json: {e}"))?;
+
+    let scripts = json
+        .get("scripts")
+        .and_then(|s| s.as_object())
+        .map(|obj| {
+            let mut keys: Vec<String> = obj.keys().cloned().collect();
+            keys.sort();
+            keys
+        })
+        .unwrap_or_default();
+
+    Ok(scripts)
+}
+
+/// `working_directory`의 lockfile을 기반으로 패키지 매니저 감지
+///
+/// # Arguments
+/// * `working_dir` - 확인할 디렉토리
+///
+/// # Returns
+/// * "npm" - package-lock.json 존재
+/// * "yarn" - yarn.lock 존재
+/// * "pnpm" - pnpm-lock.yaml 존재
+/// * "bun" - bun.lockb 또는 bun.lock 존재
+/// * "npm" - lockfile이 없는 경우 기본값
+pub fn detect_package_manager(working_dir: &Path) -> String {
+    if working_dir.join("package-lock.json").exists() {
+        return "npm".to_string();
+    }
+    if working_dir.join("yarn.lock").exists() {
+        return "yarn".to_string();
+    }
+    if working_dir.join("pnpm-lock.yaml").exists() {
+        return "pnpm".to_string();
+    }
+    if working_dir.join("bun.lockb").exists() || working_dir.join("bun.lock").exists() {
+        return "bun".to_string();
+    }
+    "npm".to_string()
+}
+
+/// `project_directory` 하위의 모든 `package.json` 파일 탐색 (재귀)
+///
+/// # Arguments
+/// * `project_dir` - 탐색 시작 디렉토리
+///
+/// # Returns
+/// * `Vec<PathBuf>` - 발견된 package.json 파일들의 절대 경로 목록
+pub fn find_all_package_jsons(project_dir: &Path) -> Vec<PathBuf> {
+    find_package_jsons_recursive(project_dir, 0, 5)
+}
+
+/// package.json 파일 재귀 탐색 (깊이 제한 포함)
+fn find_package_jsons_recursive(dir: &Path, depth: usize, max_depth: usize) -> Vec<PathBuf> {
+    // 제외할 디렉토리 목록
+    const IGNORED_DIRS: &[&str] = &[
+        "node_modules",
+        ".git",
+        ".svn",
+        ".hg",
+        "dist",
+        "build",
+        "out",
+        ".next",
+        ".nuxt",
+        "coverage",
+        ".nyc_output",
+        "target",
+        "vendor",
+        ".cache",
+        ".temp",
+        ".tmp",
+        "__pycache__",
+        ".pytest_cache",
+        ".venv",
+        "venv",
+    ];
+
+    let mut results = Vec::new();
+
+    // 깊이 제한 초과 시 중단
+    if depth > max_depth {
+        return results;
+    }
+
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+
+            // package.json 파일 발견
+            if path.is_file() && path.file_name().is_some_and(|n| n == "package.json") {
+                results.push(path);
+            }
+            // 하위 디렉토리 재귀 탐색 (제외 목록 확인)
+            else if path.is_dir() {
+                let dir_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+
+                // 숨김 폴더 또는 제외 목록에 있는 폴더는 스킵
+                if !dir_name.starts_with('.') && !IGNORED_DIRS.contains(&dir_name) {
+                    results.extend(find_package_jsons_recursive(&path, depth + 1, max_depth));
+                }
+            }
+        }
+    }
+
+    if depth == 0 {
+        results.sort();
+    }
+    results
+}
+
+/// Node.js runtime 경로 감지 (시스템 전체)
+///
+/// # Returns
+/// * `Vec<(label, path)>` - 표시용 레이블과 실행 파일 경로 튜플 목록
+///   예: [("Default (system)", "node"), ("v20.11.0", "C:\\...\\node.exe")]
+pub fn detect_node_runtimes() -> Vec<(String, String)> {
+    let mut runtimes = Vec::new();
+
+    add_runtime(
+        &mut runtimes,
+        String::from("Default (system)"),
+        String::from("node"),
+    );
+
+    #[cfg(target_os = "windows")]
+    {
+        collect_windows_node_runtimes(&mut runtimes);
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        collect_unix_node_runtimes(&mut runtimes);
+    }
+
+    runtimes
+}
+
+fn add_runtime(runtimes: &mut Vec<(String, String)>, label: String, path: String) {
+    if !runtimes
+        .iter()
+        .any(|(_, existing_path)| existing_path == &path)
+    {
+        runtimes.push((label, path));
+    }
+}
+
+fn command_version(
+    path: &std::path::Path,
+    configure: impl FnOnce(&mut std::process::Command),
+) -> Option<String> {
+    let mut command = std::process::Command::new(path);
+    command.arg("--version");
+    configure(&mut command);
+
+    let output = command.output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn command_version_str(
+    path: &str,
+    configure: impl FnOnce(&mut std::process::Command),
+) -> Option<String> {
+    command_version(std::path::Path::new(path), configure)
+}
+
+#[cfg(target_os = "windows")]
+fn collect_windows_node_runtimes(runtimes: &mut Vec<(String, String)>) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    if let Ok(output) = std::process::Command::new("cmd")
+        .args(["/C", "where", "node"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        && output.status.success()
+    {
+        let paths = String::from_utf8_lossy(&output.stdout);
+        for path in paths
+            .lines()
+            .map(str::trim)
+            .filter(|path| !path.is_empty() && *path != "node")
+        {
+            if let Some(version) = command_version_str(path, |command| {
+                command.creation_flags(CREATE_NO_WINDOW);
+            }) {
+                add_runtime(runtimes, format!("{version} - {path}"), path.to_string());
+            }
+        }
+    }
+
+    if let Ok(user_profile) = std::env::var("USERPROFILE") {
+        let nvm_path = PathBuf::from(user_profile).join("AppData\\Roaming\\nvm");
+        collect_nvm_dir(runtimes, &nvm_path, "node.exe", "nvm", |command| {
+            command.creation_flags(CREATE_NO_WINDOW);
+        });
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn collect_unix_node_runtimes(runtimes: &mut Vec<(String, String)>) {
+    if let Ok(output) = std::process::Command::new("sh")
+        .args(["-c", "which -a node 2>/dev/null"])
+        .output()
+        && output.status.success()
+    {
+        let paths = String::from_utf8_lossy(&output.stdout);
+        for path in paths
+            .lines()
+            .map(str::trim)
+            .filter(|path| !path.is_empty() && *path != "node")
+        {
+            if let Some(version) = command_version_str(path, |_| {}) {
+                add_runtime(runtimes, format!("{version} - {path}"), path.to_string());
+            }
+        }
+    }
+
+    if let Ok(home) = std::env::var("HOME") {
+        let nvm_path = PathBuf::from(home).join(".nvm/versions/node");
+        collect_nvm_dir(runtimes, &nvm_path, "bin/node", "nvm", |_| {});
+    }
+}
+
+fn collect_nvm_dir(
+    runtimes: &mut Vec<(String, String)>,
+    root: &Path,
+    binary_relative_path: &str,
+    source: &str,
+    configure: impl Copy + Fn(&mut std::process::Command),
+) {
+    if !root.exists() {
+        return;
+    }
+
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+
+        let node_binary = path.join(binary_relative_path);
+        if !node_binary.exists() {
+            continue;
+        }
+
+        if let Some(version) = command_version(&node_binary, configure) {
+            let path_str = node_binary.to_string_lossy().to_string();
+            add_runtime(
+                runtimes,
+                format!("{version} ({source}) - {}", node_binary.to_string_lossy()),
+                path_str,
+            );
+        }
+    }
+}
+
+/// 절대 경로를 `project_directory` 기준 상대 경로로 변환
+///
+/// # Arguments
+/// * `absolute_path` - 절대 경로
+/// * `project_dir` - 기준 디렉토리
+///
+/// # Returns
+/// * 상대 경로 문자열 (예: "./package.json", "packages/app1/package.json")
+pub fn to_relative_path(absolute_path: &Path, project_dir: &Path) -> String {
+    absolute_path
+        .strip_prefix(project_dir)
+        .ok()
+        .and_then(|p| p.to_str())
+        .map_or_else(
+            || absolute_path.to_string_lossy().to_string(),
+            |path| {
+                if path.is_empty() {
+                    String::from("./package.json")
+                } else {
+                    path.replace('\\', "/")
+                }
+            },
+        )
+}

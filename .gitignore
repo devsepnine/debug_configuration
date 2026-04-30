@@ -1,0 +1,18 @@
+# Rust build artifacts
+/target/
+*.app
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+nul
+
+# Run configuration save file
+.run_configurations.json

@@ -1,0 +1,1104 @@
+use crate::messages::Message;
+use crate::models::{
+    ConfigTypeData, ConfigurationType, ExecuteMode, ExecuteModeType, NodeCommand, PackageManager,
+    RunConfiguration,
+};
+use crate::utils::{
+    ICON_ADD, ICON_CLOSE, ICON_DELETE, ICON_EDIT, ICON_FOLDER_OPEN, ICON_REFRESH, ICON_SAVE,
+    to_relative_path,
+};
+use iced::widget::scrollable;
+use iced::{
+    Alignment, Background, Border, Color, Element, Length, Padding, Theme,
+    alignment::{Horizontal, Vertical},
+    widget::{Column, Space, button, column, combo_box, container, row, svg, text, text_input},
+};
+use std::fmt::Display;
+
+#[derive(Debug, Clone, Copy)]
+pub struct EditorLoadingState {
+    pub file_dialog: FileDialogLoadingState,
+    pub node: NodeLoadingState,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct FileDialogLoadingState {
+    pub folder: bool,
+    pub script_file: bool,
+    pub interpreter: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct NodeLoadingState {
+    pub scripts: bool,
+    pub project_directory: bool,
+}
+
+struct NodeFieldOptions {
+    selected_package_json: Option<String>,
+    is_loading_scripts: bool,
+    is_loading_project_directory: bool,
+}
+
+pub struct EditorSelectState {
+    pub config_type: combo_box::State<ConfigurationType>,
+    pub execute_mode: combo_box::State<ExecuteModeType>,
+    pub package_manager: combo_box::State<PackageManager>,
+    pub node_command: combo_box::State<NodeCommand>,
+    pub node_runtime: combo_box::State<String>,
+    pub package_json: combo_box::State<String>,
+    pub node_script: combo_box::State<String>,
+}
+
+impl EditorSelectState {
+    pub fn new() -> Self {
+        Self {
+            config_type: combo_box::State::new(ConfigurationType::ALL.to_vec()),
+            execute_mode: combo_box::State::new(ExecuteModeType::ALL.to_vec()),
+            package_manager: combo_box::State::new(PackageManager::ALL.to_vec()),
+            node_command: combo_box::State::new(NodeCommand::all_commands()),
+            node_runtime: combo_box::State::new(vec![String::from("Default (system)")]),
+            package_json: combo_box::State::new(Vec::new()),
+            node_script: combo_box::State::new(Vec::new()),
+        }
+    }
+
+    pub fn set_node_runtimes(&mut self, runtimes: &[(String, String)]) {
+        self.node_runtime =
+            combo_box::State::new(runtimes.iter().map(|(label, _)| label.clone()).collect());
+    }
+
+    pub fn set_package_jsons(&mut self, package_jsons: Vec<String>) {
+        self.package_json = combo_box::State::new(package_jsons);
+    }
+
+    pub fn set_node_scripts(&mut self, scripts: Vec<String>) {
+        self.node_script = combo_box::State::new(scripts);
+    }
+}
+
+impl Default for EditorSelectState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// 구성 편집 패널 렌더링
+///
+/// 선택된 구성의 상세 정보를 편집할 수 있는 폼
+/// 이름, 타입, 명령어, 인자, 작업 디렉토리, 환경 변수 등을 설정
+///
+/// # Arguments
+/// * `configurations` - 전체 구성 목록
+/// * `selected_config_index` - 현재 선택된 구성의 인덱스
+/// * `env_key_input` - 환경 변수 키 입력 필드 값
+/// * `env_value_input` - 환경 변수 값 입력 필드 값
+/// * `editing_env_key` - 현재 편집 중인 환경 변수 키
+/// * `is_loading_folder` - 폴더 선택 처리 중 여부
+/// * `is_loading_script_file` - 스크립트 파일 선택 처리 중 여부
+/// * `is_loading_interpreter` - 인터프리터 선택 처리 중 여부
+/// * `node_available_scripts` - Node package scripts 목록
+/// * `is_loading_node_scripts` - Node package scripts 로드 중 여부
+/// * `node_available_package_jsons` - 프로젝트에서 발견된 package.json 목록
+/// * `is_loading_project_directory` - 프로젝트 디렉토리 선택 처리 중 여부
+/// * `available_node_runtimes` - 시스템에서 감지된 Node.js 런타임 목록
+///
+/// # Note
+/// iced 프레임워크의 view 함수는 많은 파라미터를 받는 것이 일반적인 패턴입니다.
+#[allow(clippy::too_many_arguments)]
+pub fn view_configuration_editor<'a>(
+    configurations: &'a [RunConfiguration],
+    selected_config_index: Option<usize>,
+    env_key_input: &'a str,
+    env_value_input: &'a str,
+    editing_env_key: Option<&'a str>,
+    loading: EditorLoadingState,
+    select_state: &'a EditorSelectState,
+    available_node_runtimes: &'a [(String, String)],
+) -> Element<'a, Message> {
+    let Some(index) = selected_config_index else {
+        return view_empty_configuration_editor();
+    };
+    let Some(config) = configurations.get(index) else {
+        return view_empty_configuration_editor();
+    };
+
+    let type_specific_fields = match &config.type_data {
+        ConfigTypeData::Application { command, arguments } => {
+            view_application_fields(command, arguments)
+        }
+        ConfigTypeData::ShellScript { execute_mode } => view_shell_script_fields(
+            execute_mode,
+            loading.file_dialog.script_file,
+            loading.file_dialog.interpreter,
+            select_state,
+        ),
+        ConfigTypeData::Node {
+            project_directory,
+            package_manager,
+            node_runtime_path,
+            command,
+            script_name,
+            arguments,
+            node_options,
+        } => view_node_fields(
+            project_directory,
+            &config.working_directory,
+            node_runtime_path.as_ref(),
+            available_node_runtimes,
+            select_state,
+            package_manager,
+            command,
+            script_name.as_ref(),
+            arguments,
+            node_options,
+            NodeFieldOptions {
+                selected_package_json: selected_package_json(
+                    project_directory,
+                    &config.working_directory,
+                ),
+                is_loading_scripts: loading.node.scripts,
+                is_loading_project_directory: loading.node.project_directory,
+            },
+        ),
+    };
+
+    let mut basics = column![
+        view_name_row(&config.name),
+        Space::new().height(12),
+        view_type_row(&config.config_type, select_state),
+        Space::new().height(12),
+        type_specific_fields,
+    ]
+    .width(Length::Fill);
+
+    if !matches!(config.config_type, ConfigurationType::Node) {
+        basics = basics
+            .push(Space::new().height(12))
+            .push(view_working_directory_row(
+                &config.working_directory,
+                loading.file_dialog.folder,
+            ));
+    }
+
+    column![
+        view_section_block("Basics", basics.into()),
+        Space::new().height(16),
+        view_section_block(
+            "Environment",
+            view_environment_variables(config, env_key_input, env_value_input, editing_env_key),
+        ),
+    ]
+    .width(Length::Fill)
+    .padding(Padding::new(0.0).right(10.0).bottom(14.0))
+    .into()
+}
+
+fn view_empty_configuration_editor() -> Element<'static, Message> {
+    container(
+        column![
+            text("Configuration Details")
+                .size(17)
+                .color(Color::from_rgba8(255, 255, 255, 0.82)),
+            Space::new().height(8),
+            text("Select a configuration from the list to edit its command,\nworking directory, and environment.")
+                .size(14)
+                .align_x(Horizontal::Center)
+                .align_y(Vertical::Center)
+                .color(Color::from_rgba8(255, 255, 255, 0.56)),
+        ]
+        .align_x(Alignment::Center),
+    )
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .center_x(Length::Fill)
+    .center_y(Length::Fill)
+    .into()
+}
+
+fn view_section_block<'a>(title: &'a str, content: Element<'a, Message>) -> Element<'a, Message> {
+    column![
+        row![
+            text(title).size(12),
+            Space::new().width(Length::Fixed(10.0)),
+            container(Space::new().height(1))
+                .width(Length::Fill)
+                .style(divider_style),
+        ]
+        .align_y(Alignment::Center),
+        Space::new().height(12),
+        container(content).width(Length::Fill).padding([2, 0]),
+    ]
+    .width(Length::Fill)
+    .into()
+}
+
+fn view_editor_row<'a>(
+    label: &'a str,
+    input: Element<'a, Message>,
+) -> iced::widget::Row<'a, Message> {
+    row![
+        container(text(label).size(12).style(editor_label_style)).width(Length::Fixed(136.0)),
+        container(input).width(Length::Fill)
+    ]
+    .spacing(12)
+    .align_y(Alignment::Center)
+    .width(Length::Fill)
+}
+
+fn editor_label_style(theme: &Theme) -> text::Style {
+    text::Style {
+        color: Some(Color {
+            a: 0.58,
+            ..theme.extended_palette().background.base.text
+        }),
+    }
+}
+
+fn muted_text_style(theme: &Theme) -> text::Style {
+    text::Style {
+        color: Some(Color {
+            a: 0.48,
+            ..theme.extended_palette().background.base.text
+        }),
+    }
+}
+
+fn divider_style(theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(Color {
+            a: 0.10,
+            ..theme.extended_palette().background.base.text
+        })),
+        ..container::Style::default()
+    }
+}
+
+fn readonly_value(value: &str) -> iced::widget::Container<'_, Message> {
+    container(
+        scrollable(text(value).size(13).style(muted_text_style))
+            .direction(scrollable::Direction::Horizontal(
+                scrollable::Scrollbar::new()
+                    .width(4.0)
+                    .spacing(2.0)
+                    .scroller_width(4),
+            ))
+            .width(Length::Fill),
+    )
+    .padding([7, 10])
+    .width(Length::Fill)
+    .style(flat_readonly_style)
+}
+
+fn editor_input<'a>(placeholder: &'a str, value: &'a str) -> iced::widget::TextInput<'a, Message> {
+    text_input(placeholder, value)
+        .padding([7, 10])
+        .size(14)
+        .width(Length::Fill)
+        .style(flat_text_input_style)
+}
+
+fn editor_combo_box<'a, T, MessageFn>(
+    state: &'a combo_box::State<T>,
+    placeholder: &'a str,
+    selected: Option<&'a T>,
+    on_selected: MessageFn,
+) -> iced::widget::ComboBox<'a, T, Message, Theme>
+where
+    T: Display + Clone + 'a,
+    MessageFn: Fn(T) -> Message + 'static,
+{
+    combo_box(state, placeholder, selected, on_selected)
+        .padding([7, 10])
+        .size(14)
+        .width(Length::Fill)
+        .input_style(flat_text_input_style)
+}
+
+fn flat_text_input_style(theme: &Theme, status: text_input::Status) -> text_input::Style {
+    let _palette = theme.extended_palette();
+    let base = Color::from_rgba8(17, 19, 24, 1.0);
+    let line = Color::from_rgba8(255, 255, 255, 0.08);
+    let hover_line = Color::from_rgba8(255, 255, 255, 0.14);
+    let focus_line = Color::from_rgba8(96, 138, 255, 0.72);
+
+    let border_color = match status {
+        text_input::Status::Active => line,
+        text_input::Status::Hovered => hover_line,
+        text_input::Status::Focused { .. } => focus_line,
+        text_input::Status::Disabled => Color::from_rgba8(255, 255, 255, 0.04),
+    };
+
+    text_input::Style {
+        background: Background::Color(Color { a: 1.0, ..base }),
+        border: Border {
+            radius: 4.0.into(),
+            width: 1.0,
+            color: border_color,
+        },
+        icon: Color::from_rgba8(255, 255, 255, 0.32),
+        placeholder: Color::from_rgba8(255, 255, 255, 0.30),
+        value: Color::from_rgba8(255, 255, 255, 0.88),
+        selection: Color::from_rgba8(95, 140, 255, 0.28),
+    }
+}
+
+fn flat_readonly_style(theme: &Theme) -> container::Style {
+    let palette = theme.extended_palette();
+
+    container::Style {
+        background: Some(Background::Color(Color {
+            a: 0.42,
+            ..palette.background.weak.color
+        })),
+        border: Border {
+            radius: 4.0.into(),
+            width: 1.0,
+            color: Color {
+                a: 0.10,
+                ..palette.background.base.text
+            },
+        },
+        ..container::Style::default()
+    }
+}
+
+fn empty_state_box(message: &str) -> iced::widget::Container<'_, Message> {
+    container(
+        text(message)
+            .size(13)
+            .align_x(Horizontal::Center)
+            .style(muted_text_style),
+    )
+    .padding([12, 10])
+    .width(Length::Fill)
+    .style(flat_readonly_style)
+}
+
+fn flat_icon_button_style(_theme: &Theme, status: button::Status) -> button::Style {
+    let subtle = Color::from_rgba8(255, 255, 255, 0.05);
+    let hover = Color::from_rgba8(255, 255, 255, 0.08);
+    let pressed = Color::from_rgba8(57, 84, 148, 0.78);
+
+    let background = match status {
+        button::Status::Active => None,
+        button::Status::Hovered => Some(Background::Color(hover)),
+        button::Status::Pressed => Some(Background::Color(pressed)),
+        button::Status::Disabled => Some(Background::Color(subtle)),
+    };
+
+    button::Style {
+        background,
+        border: Border {
+            radius: 4.0.into(),
+            width: 0.0,
+            color: Color::TRANSPARENT,
+        },
+        text_color: Color::from_rgba8(255, 255, 255, 0.64),
+        ..button::Style::default()
+    }
+}
+
+fn view_name_row(name: &str) -> iced::widget::Row<'_, Message> {
+    view_editor_row(
+        "Name:",
+        editor_input("Configuration name", name)
+            .on_input(Message::NameChanged)
+            .into(),
+    )
+}
+
+fn view_type_row<'a>(
+    config_type: &'a ConfigurationType,
+    select_state: &'a EditorSelectState,
+) -> iced::widget::Row<'a, Message> {
+    view_editor_row(
+        "Type:",
+        editor_combo_box(
+            &select_state.config_type,
+            "Select type",
+            Some(config_type),
+            Message::TypeChanged,
+        )
+        .into(),
+    )
+}
+
+fn view_working_directory_row(
+    working_directory: &str,
+    is_loading_folder: bool,
+) -> iced::widget::Row<'_, Message> {
+    let mut browse_btn = icon_button(ICON_FOLDER_OPEN, None)
+        .padding(0)
+        .width(34)
+        .height(34);
+
+    if !is_loading_folder {
+        browse_btn = browse_btn.on_press(Message::BrowseWorkingDirectory);
+    }
+
+    row![
+        container(
+            text("Working Directory:")
+                .size(12)
+                .style(editor_label_style)
+        )
+        .width(Length::Fixed(136.0)),
+        editor_input("Working directory path", working_directory)
+            .on_input(Message::WorkingDirectoryChanged),
+        browse_btn,
+    ]
+    .spacing(10)
+    .align_y(Alignment::Center)
+    .width(Length::Fill)
+}
+
+fn selected_package_json(project_directory: &str, working_directory: &str) -> Option<String> {
+    use std::path::Path;
+
+    if working_directory.is_empty() || working_directory == "." {
+        return None;
+    }
+
+    let working_dir_path = Path::new(working_directory);
+    let package_json_path = working_dir_path.join("package.json");
+
+    if project_directory.is_empty() || project_directory == "." {
+        None
+    } else {
+        Some(to_relative_path(
+            &package_json_path,
+            Path::new(project_directory),
+        ))
+    }
+}
+
+/// 환경 변수 섹션 렌더링
+///
+/// 현재 설정된 환경 변수 목록과 새 환경 변수 추가 폼
+///
+/// # Arguments
+/// * `config` - 현재 구성
+/// * `env_key_input` - 환경 변수 키 입력 필드 값
+/// * `env_value_input` - 환경 변수 값 입력 필드 값
+fn view_environment_variables<'a>(
+    config: &'a RunConfiguration,
+    env_key_input: &'a str,
+    env_value_input: &'a str,
+    editing_key: Option<&'a str>,
+) -> Element<'a, Message> {
+    let mut env_list = Column::new().spacing(5);
+
+    for (key, value) in &config.environment_variables {
+        let env_row = if editing_key == Some(key.as_str()) {
+            view_editing_environment_row(env_key_input, env_value_input)
+        } else {
+            view_environment_display_row(key, value, editing_key.is_some())
+        };
+
+        env_list = env_list.push(env_row);
+    }
+
+    if config.environment_variables.is_empty() && editing_key.is_none() {
+        env_list = env_list.push(empty_state_box("No environment variables configured"));
+    }
+
+    let add_section = if editing_key.is_none() {
+        column![
+            Space::new().height(10),
+            text("Add variable").size(12).style(editor_label_style),
+            Space::new().height(5),
+            view_new_environment_row(env_key_input, env_value_input),
+        ]
+    } else {
+        column![]
+    };
+
+    column![env_list, add_section]
+        .spacing(8)
+        .width(Length::Fill)
+        .into()
+}
+
+fn view_editing_environment_row<'a>(
+    env_key_input: &'a str,
+    env_value_input: &'a str,
+) -> iced::widget::Row<'a, Message> {
+    row![
+        editor_input("Key", env_key_input)
+            .on_input(Message::EnvKeyChanged)
+            .width(Length::FillPortion(4)),
+        editor_input("Value", env_value_input)
+            .on_input(Message::EnvValueChanged)
+            .width(Length::FillPortion(6)),
+        icon_button(ICON_SAVE, Some(Message::UpdateEnvironmentVariable)),
+        icon_button(ICON_CLOSE, Some(Message::CancelEditEnvironmentVariable)),
+    ]
+    .spacing(5)
+    .align_y(Alignment::Center)
+}
+
+fn view_environment_display_row<'a>(
+    key: &'a str,
+    value: &'a str,
+    is_another_editing: bool,
+) -> iced::widget::Row<'a, Message> {
+    let edit_message =
+        (!is_another_editing).then(|| Message::EditEnvironmentVariable(key.to_owned()));
+    let remove_message =
+        (!is_another_editing).then(|| Message::RemoveEnvironmentVariable(key.to_owned()));
+
+    row![
+        view_environment_value(key).width(Length::FillPortion(4)),
+        view_environment_value(value).width(Length::FillPortion(6)),
+        icon_button(ICON_EDIT, edit_message),
+        icon_button(ICON_DELETE, remove_message),
+    ]
+    .spacing(5)
+    .align_y(Alignment::Center)
+}
+
+fn view_environment_value(value: &str) -> iced::widget::Container<'_, Message> {
+    container(
+        scrollable(text(value).size(13)).direction(scrollable::Direction::Horizontal(
+            scrollable::Scrollbar::new()
+                .width(4.0)
+                .spacing(2.0)
+                .scroller_width(4),
+        )),
+    )
+    .padding(8)
+    .style(flat_readonly_style)
+}
+
+fn view_new_environment_row<'a>(
+    env_key_input: &'a str,
+    env_value_input: &'a str,
+) -> iced::widget::Row<'a, Message> {
+    row![
+        editor_input("Key", env_key_input)
+            .on_input(Message::EnvKeyChanged)
+            .width(Length::FillPortion(4)),
+        editor_input("Value", env_value_input)
+            .on_input(Message::EnvValueChanged)
+            .width(Length::FillPortion(6)),
+        icon_button(ICON_ADD, Some(Message::AddEnvironmentVariable)),
+    ]
+    .spacing(4)
+    .align_y(Alignment::Center)
+}
+
+fn icon_button(
+    icon_bytes: &'static [u8],
+    on_press: Option<Message>,
+) -> iced::widget::Button<'static, Message> {
+    let icon = container(
+        svg(svg::Handle::from_memory(icon_bytes))
+            .width(20)
+            .height(20)
+            .style(editor_icon_style),
+    )
+    .center_x(Length::Fill)
+    .center_y(Length::Fill);
+    let button = button(icon)
+        .padding(0)
+        .width(34)
+        .height(34)
+        .style(flat_icon_button_style);
+
+    if let Some(message) = on_press {
+        button.on_press(message)
+    } else {
+        button
+    }
+}
+
+fn editor_icon_style(theme: &Theme, _status: svg::Status) -> svg::Style {
+    let palette = theme.extended_palette();
+    svg::Style {
+        color: Some(Color {
+            a: 0.62,
+            ..palette.background.base.text
+        }),
+    }
+}
+
+/// Application 타입 필드 렌더링
+///
+/// Command와 Arguments 입력 필드
+fn view_application_fields<'a>(command: &'a str, arguments: &'a str) -> Element<'a, Message> {
+    let command_label = text("Command:").size(12).style(editor_label_style);
+    let command_input =
+        editor_input("Command to execute", command).on_input(Message::CommandChanged);
+
+    let args_label = text("Arguments:").size(12).style(editor_label_style);
+    let args_input =
+        editor_input("Program arguments", arguments).on_input(Message::ArgumentsChanged);
+
+    let command_row = row![
+        container(command_label).width(Length::Fixed(136.0)),
+        command_input
+    ]
+    .spacing(10)
+    .align_y(Alignment::Center)
+    .width(Length::Fill);
+
+    let args_row = row![
+        container(args_label).width(Length::Fixed(136.0)),
+        args_input
+    ]
+    .spacing(10)
+    .align_y(Alignment::Center)
+    .width(Length::Fill);
+
+    column![command_row, Space::new().height(10), args_row]
+        .width(Length::Fill)
+        .into()
+}
+
+/// Shell Script 타입 필드 렌더링
+///
+/// Execute Mode 선택 및 모드별 필드
+fn view_shell_script_fields<'a>(
+    execute_mode: &'a ExecuteMode,
+    is_loading_script_file: bool,
+    is_loading_interpreter: bool,
+    select_state: &'a EditorSelectState,
+) -> Element<'a, Message> {
+    // 현재 모드 타입 결정
+    let current_mode_type = match execute_mode {
+        ExecuteMode::ScriptFile { .. } => &ExecuteModeType::ScriptFile,
+        ExecuteMode::ScriptText { .. } => &ExecuteModeType::ScriptText,
+    };
+
+    let mode_label = text("Execute Mode:").size(12).style(editor_label_style);
+    let mode_picker = editor_combo_box(
+        &select_state.execute_mode,
+        "Select execute mode",
+        Some(current_mode_type),
+        Message::ExecuteModeChanged,
+    );
+
+    let mode_row = row![
+        container(mode_label).width(Length::Fixed(136.0)),
+        mode_picker,
+    ]
+    .spacing(10)
+    .align_y(Alignment::Center)
+    .width(Length::Fill);
+
+    // 모드별 필드
+    let mode_fields = match execute_mode {
+        ExecuteMode::ScriptFile { .. } => {
+            view_script_file_fields(execute_mode, is_loading_script_file, is_loading_interpreter)
+        }
+        ExecuteMode::ScriptText { .. } => view_script_text_fields(execute_mode),
+    };
+
+    column![mode_row, Space::new().height(10), mode_fields]
+        .width(Length::Fill)
+        .into()
+}
+
+/// Script File 모드 필드 렌더링
+fn view_script_file_fields(
+    execute_mode: &ExecuteMode,
+    is_loading_script_file: bool,
+    is_loading_interpreter: bool,
+) -> Element<'_, Message> {
+    let ExecuteMode::ScriptFile {
+        script_path,
+        script_options,
+        interpreter_path,
+        interpreter_options,
+    } = execute_mode
+    else {
+        unreachable!();
+    };
+
+    // 1. Script Path (file select 버튼 포함)
+    let path_label = text("Script Path:").size(12).style(editor_label_style);
+    let path_input =
+        editor_input("Script file path", script_path).on_input(Message::ScriptPathChanged);
+
+    let browse_svg = svg::Handle::from_memory(ICON_FOLDER_OPEN);
+    let browse_icon = container(
+        svg(browse_svg)
+            .width(20)
+            .height(20)
+            .style(editor_icon_style),
+    )
+    .center_x(Length::Fill)
+    .center_y(Length::Fill);
+
+    let mut browse_btn = button(browse_icon)
+        .padding(0)
+        .width(34)
+        .height(34)
+        .style(flat_icon_button_style);
+
+    if !is_loading_script_file {
+        browse_btn = browse_btn.on_press(Message::BrowseScriptPath);
+    }
+
+    let path_row = row![
+        container(path_label).width(Length::Fixed(136.0)),
+        path_input,
+        browse_btn,
+    ]
+    .spacing(10)
+    .align_y(Alignment::Center)
+    .width(Length::Fill);
+
+    // 2. Script Options
+    let options_label = text("Script Options:").size(12).style(editor_label_style);
+    let options_input = editor_input("Options (e.g., -v --release)", script_options)
+        .on_input(Message::ScriptOptionsChanged);
+
+    let options_row = row![
+        container(options_label).width(Length::Fixed(136.0)),
+        options_input
+    ]
+    .spacing(10)
+    .align_y(Alignment::Center)
+    .width(Length::Fill);
+
+    // 3. Interpreter Path (optional)
+    let interp_label = text("Interpreter:").size(12).style(editor_label_style);
+    let interp_value = interpreter_path.as_ref().map_or("", String::as_str);
+    let interp_input = editor_input("Interpreter path (optional)", interp_value)
+        .on_input(Message::InterpreterPathChanged);
+
+    let interp_browse_svg = svg::Handle::from_memory(ICON_FOLDER_OPEN);
+    let interp_browse_icon = container(
+        svg(interp_browse_svg)
+            .width(20)
+            .height(20)
+            .style(editor_icon_style),
+    )
+    .center_x(Length::Fill)
+    .center_y(Length::Fill);
+
+    let mut interp_browse_btn = button(interp_browse_icon)
+        .padding(0)
+        .width(34)
+        .height(34)
+        .style(flat_icon_button_style);
+
+    if !is_loading_interpreter {
+        interp_browse_btn = interp_browse_btn.on_press(Message::BrowseInterpreterPath);
+    }
+
+    let interp_row = row![
+        container(interp_label).width(Length::Fixed(136.0)),
+        interp_input,
+        interp_browse_btn,
+    ]
+    .spacing(10)
+    .align_y(Alignment::Center)
+    .width(Length::Fill);
+
+    // 4. Interpreter Options (optional)
+    let interp_opts_label = text("Interpreter Options:")
+        .size(12)
+        .style(editor_label_style);
+    let interp_opts_value = interpreter_options.as_ref().map_or("", String::as_str);
+    let interp_opts_input = editor_input("Interpreter options (optional)", interp_opts_value)
+        .on_input(Message::InterpreterOptionsChanged);
+
+    let interp_opts_row = row![
+        container(interp_opts_label).width(Length::Fixed(136.0)),
+        interp_opts_input
+    ]
+    .spacing(10)
+    .align_y(Alignment::Center)
+    .width(Length::Fill);
+
+    column![
+        path_row,
+        Space::new().height(10),
+        options_row,
+        Space::new().height(10),
+        interp_row,
+        Space::new().height(10),
+        interp_opts_row,
+    ]
+    .width(Length::Fill)
+    .into()
+}
+
+/// Script Text 모드 필드 렌더링
+fn view_script_text_fields(execute_mode: &ExecuteMode) -> Element<'_, Message> {
+    let ExecuteMode::ScriptText { script_text } = execute_mode else {
+        unreachable!();
+    };
+
+    let text_label = text("Script Text:").size(12).style(editor_label_style);
+    let text_area =
+        editor_input("Enter script here...", script_text).on_input(Message::ScriptTextChanged);
+
+    column![
+        text_label,
+        Space::new().height(5),
+        container(text_area).width(Length::Fill),
+    ]
+    .width(Length::Fill)
+    .into()
+}
+
+/// Node package manager 타입 필드 렌더링
+///
+/// 프로젝트 디렉토리, package.json 선택, Node Runtime, package manager 명령어, 스크립트 선택, 인자, Node 옵션 설정
+#[allow(clippy::too_many_arguments)]
+fn view_node_fields<'a>(
+    project_directory: &'a str,
+    working_directory: &'a str,
+    node_runtime_path: Option<&'a String>,
+    available_node_runtimes: &'a [(String, String)],
+    select_state: &'a EditorSelectState,
+    package_manager: &'a PackageManager,
+    command: &'a NodeCommand,
+    script_name: Option<&'a String>,
+    arguments: &'a str,
+    node_options: &'a str,
+    options: NodeFieldOptions,
+) -> Element<'a, Message> {
+    let NodeFieldOptions {
+        selected_package_json,
+        is_loading_scripts,
+        is_loading_project_directory,
+    } = options;
+    let selected_package_json = selected_package_json.as_ref().and_then(|path| {
+        select_state
+            .package_json
+            .options()
+            .iter()
+            .find(|option| *option == path)
+    });
+
+    let mut col = column![
+        view_node_project_directory_row(project_directory, is_loading_project_directory),
+        Space::new().height(5),
+        view_node_package_json_row(select_state, selected_package_json),
+        Space::new().height(5),
+        view_node_working_directory_row(working_directory),
+        Space::new().height(10),
+    ]
+    .width(Length::Fill);
+
+    col = col
+        .push(view_node_package_manager_row(package_manager, select_state))
+        .push(Space::new().height(10))
+        .push(view_node_command_row(command, select_state));
+
+    if command.requires_script() {
+        col = col.push(Space::new().height(10)).push(view_node_script_row(
+            select_state,
+            script_name,
+            is_loading_scripts,
+        ));
+
+        if select_state.node_script.options().is_empty() {
+            col = col
+                .push(Space::new().height(5))
+                .push(view_node_script_hint_row());
+        }
+    }
+
+    col = col
+        .push(Space::new().height(10))
+        .push(Space::new().height(10))
+        .push(view_node_arguments_row(arguments))
+        .push(Space::new().height(10))
+        .push(view_node_runtime_row(
+            node_runtime_path,
+            available_node_runtimes,
+            select_state,
+        ))
+        .push(Space::new().height(10))
+        .push(view_node_options_row(node_options));
+
+    col.into()
+}
+
+fn view_node_project_directory_row(
+    project_directory: &str,
+    is_loading_project_directory: bool,
+) -> iced::widget::Row<'_, Message> {
+    let proj_display: Element<'_, Message> =
+        if project_directory.is_empty() || project_directory == "." {
+            readonly_value("Not selected").into()
+        } else {
+            readonly_value(project_directory).into()
+        };
+
+    let mut browse_btn = icon_button(ICON_FOLDER_OPEN, None)
+        .padding(0)
+        .width(34)
+        .height(34);
+
+    if !is_loading_project_directory {
+        browse_btn = browse_btn.on_press(Message::BrowseProjectDirectory);
+    }
+
+    row![
+        container(
+            text("Project Directory:")
+                .size(12)
+                .style(editor_label_style)
+        )
+        .width(Length::Fixed(136.0)),
+        proj_display,
+        browse_btn,
+    ]
+    .spacing(10)
+    .align_y(Alignment::Center)
+    .width(Length::Fill)
+}
+
+fn view_node_package_json_row<'a>(
+    select_state: &'a EditorSelectState,
+    selected_package_json: Option<&'a String>,
+) -> iced::widget::Row<'a, Message> {
+    view_editor_row(
+        "package.json:",
+        editor_combo_box(
+            &select_state.package_json,
+            "Search package.json",
+            selected_package_json,
+            Message::PackageJsonDropdownChanged,
+        )
+        .into(),
+    )
+}
+
+fn view_node_working_directory_row(working_directory: &str) -> iced::widget::Row<'_, Message> {
+    view_editor_row(
+        "Working Directory:",
+        readonly_value(working_directory).into(),
+    )
+}
+
+fn view_node_command_row<'a>(
+    command: &'a NodeCommand,
+    select_state: &'a EditorSelectState,
+) -> iced::widget::Row<'a, Message> {
+    view_editor_row(
+        "Command:",
+        editor_combo_box(
+            &select_state.node_command,
+            "Search command",
+            Some(command),
+            Message::NodeCommandChanged,
+        )
+        .into(),
+    )
+}
+
+fn view_node_package_manager_row<'a>(
+    package_manager: &'a PackageManager,
+    select_state: &'a EditorSelectState,
+) -> iced::widget::Row<'a, Message> {
+    view_editor_row(
+        "Package Manager:",
+        editor_combo_box(
+            &select_state.package_manager,
+            "Search package manager",
+            Some(package_manager),
+            Message::PackageManagerChanged,
+        )
+        .into(),
+    )
+}
+
+fn view_node_script_row<'a>(
+    select_state: &'a EditorSelectState,
+    script_name: Option<&'a String>,
+    is_loading_scripts: bool,
+) -> iced::widget::Row<'a, Message> {
+    let script_picker: Element<'_, Message> = if select_state.node_script.options().is_empty() {
+        editor_combo_box(
+            &select_state.node_script,
+            "No scripts found",
+            None,
+            Message::NodeScriptNameChanged,
+        )
+        .into()
+    } else {
+        editor_combo_box(
+            &select_state.node_script,
+            "Search script",
+            script_name,
+            Message::NodeScriptNameChanged,
+        )
+        .into()
+    };
+
+    let mut refresh_btn = icon_button(ICON_REFRESH, None)
+        .padding(0)
+        .width(34)
+        .height(34);
+
+    if !is_loading_scripts {
+        refresh_btn = refresh_btn.on_press(Message::NodeRefreshScripts);
+    }
+
+    row![
+        container(text("Script:").size(12).style(editor_label_style)).width(Length::Fixed(136.0)),
+        container(script_picker).width(Length::Fill),
+        refresh_btn,
+    ]
+    .spacing(10)
+    .align_y(Alignment::Center)
+    .width(Length::Fill)
+}
+
+fn view_node_script_hint_row() -> iced::widget::Row<'static, Message> {
+    row![
+        Space::new().width(Length::Fixed(148.0)),
+        text("Select a package.json from the dropdown above")
+            .size(12)
+            .style(muted_text_style),
+    ]
+}
+
+fn view_node_arguments_row(arguments: &str) -> iced::widget::Row<'_, Message> {
+    view_editor_row(
+        "Arguments:",
+        editor_input("--flag value", arguments)
+            .on_input(Message::NodeArgumentsChanged)
+            .into(),
+    )
+}
+
+fn view_node_runtime_row<'a>(
+    node_runtime_path: Option<&'a String>,
+    available_node_runtimes: &'a [(String, String)],
+    select_state: &'a EditorSelectState,
+) -> iced::widget::Row<'a, Message> {
+    let current_runtime = node_runtime_path.map_or("node", String::as_str);
+    let current_label = available_node_runtimes
+        .iter()
+        .find(|(_, path)| path == current_runtime)
+        .map(|(label, _)| label);
+
+    view_editor_row(
+        "Node Runtime:",
+        editor_combo_box(
+            &select_state.node_runtime,
+            "Search Node runtime",
+            current_label,
+            Message::NodeRuntimeChanged,
+        )
+        .into(),
+    )
+}
+
+fn view_node_options_row(node_options: &str) -> iced::widget::Row<'_, Message> {
+    view_editor_row(
+        "Node Options:",
+        editor_input("--max-old-space-size=4096", node_options)
+            .on_input(Message::NodeOptionsChanged)
+            .into(),
+    )
+}

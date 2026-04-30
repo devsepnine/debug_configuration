@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Run Config Manager
+Comment=Run/Debug configuration management tool
+Exec=run_config_manager
+Icon=dev.runconfigmanager.app
+Terminal=false
+Categories=Development;Utility;
+StartupNotify=true
