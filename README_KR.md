@@ -1,6 +1,6 @@
 # Run/Debug Configuration Manager
 
-[English](README.md) · **한국어**
+[English](README.md) · **한국어** · [日本語](README_JA.md)
 
 Run/Debug 구성 관리 도구입니다.
 Rust와 iced GUI 프레임워크로 개발되었으며, 여러 프로그램 실행 구성을 저장하고 관리할 수 있는 크로스플랫폼 데스크톱 애플리케이션입니다.

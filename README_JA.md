@@ -1,0 +1,209 @@
+# Run/Debug Configuration Manager
+
+[English](README.md) · [한국어](README_KR.md) · **日本語**
+
+Run/Debug 構成管理ツールです。
+Rust と iced GUI フレームワークで開発されたクロスプラットフォームのデスクトップアプリケーションで、複数のプログラム実行構成を保存・管理できます。
+
+![Preview](static/preview.gif)
+
+## ダウンロード
+
+プラットフォーム別の最新ビルドは [Releases ページ](https://github.com/devsepnine/debug_configuration/releases/latest) から取得するか、下記の直リンクをご利用ください:
+
+| プラットフォーム | ファイル |
+|---|---|
+| Windows x64 | [`run_config_manager-windows-x64.msi`](https://github.com/devsepnine/debug_configuration/releases/latest/download/run_config_manager-windows-x64.msi) |
+| macOS (Apple Silicon) | [`run_config_manager-macos-arm64.dmg`](https://github.com/devsepnine/debug_configuration/releases/latest/download/run_config_manager-macos-arm64.dmg) |
+| macOS (Intel) | [`run_config_manager-macos-x64.dmg`](https://github.com/devsepnine/debug_configuration/releases/latest/download/run_config_manager-macos-x64.dmg) |
+| Linux x64 | [`run_config_manager-linux-x64.tar.gz`](https://github.com/devsepnine/debug_configuration/releases/latest/download/run_config_manager-linux-x64.tar.gz) |
+| SHA-256 チェックサム | [`checksums.txt`](https://github.com/devsepnine/debug_configuration/releases/latest/download/checksums.txt) |
+
+> macOS ユーザー向け: .app バンドルは ad-hoc 署名のみです (有料の Apple Developer ID は使用していません)。初回起動時の対応は [macOS — 初回起動](#macos--初回起動) セクションを参照してください。
+
+## 主な機能
+
+### 構成管理
+- 実行構成の作成、編集、削除
+- 構成タイプの選択 (Application, Shell Script, Node)
+- コマンド、引数、作業ディレクトリの設定
+- 環境変数の管理 (追加、編集、削除)
+- ドラッグ&ドロップで構成の並び替え
+- 構成のオープン/保存 (JSON 形式)
+
+### Node プロジェクトサポート
+- Node 関連コマンドのサポート (run, install, start, test, build など)
+- Node Runtime の自動検出 (system PATH, nvm, nvm-windows)
+- package.json の自動スキャンとスクリプトの解析
+- パッケージマネージャーの選択または自動検出 (npm, yarn, pnpm, bun)
+- 非同期初期化による高速起動
+
+### 実行セッション管理
+- 複数セッションの同時実行
+- リアルタイム出力表示 (ANSI カラー対応)
+- セッションの再実行、停止、削除、ワークスペースから非表示
+- ワークスペース別の開閉状態を持つ永続セッションリスト
+- ワークスペースタブシステム
+  - 最低 1 つのワークスペースタブを保持
+  - ワークスペースの追加、クローズ、リネーム
+  - セッションリストから選択中のワークスペースに開く
+- ペインベースのワークスペースレイアウト
+  - iced pane grid によるペイン分割
+  - ドラッグ&ドロップでペイン再配置
+  - ペインのリサイズ
+  - 複数ペイン時の最大化/復元
+
+### UI の特徴
+- Catppuccin Mocha テーマ
+- D2Coding フォント
+- ターミナル風の出力
+- カスタムウィンドウタイトルバーと丸みのあるウィンドウクロム
+- ツールバー、セッション、ペインで統一されたアイコンボタン
+- URL クリックでブラウザを開く
+- クリップボードコピー対応
+- 自動スクロール機能
+
+## スクリーンショット
+
+### 構成管理画面
+![Configuration Management](static/config.png)
+
+### 実行セッション画面
+![Execution Sessions](static/session.png)
+
+## インストールと実行
+
+### 必要要件
+- Rust 1.85 以上
+- Cargo
+
+### ビルド
+```bash
+cargo build --release
+```
+
+### 実行
+```bash
+cargo run --release
+```
+
+### プラットフォームチェック
+本プロジェクトは Windows、macOS、Linux での動作を目標としています。
+
+以下のターゲットでコンパイルチェックを通過しています:
+```bash
+cargo check --target x86_64-pc-windows-msvc
+cargo check --target x86_64-unknown-linux-gnu
+cargo check --target x86_64-apple-darwin
+cargo check --target aarch64-apple-darwin
+```
+
+透過の丸ウィンドウ角のような OS コンポジターに依存する見え方は、各プラットフォームでの実機確認が必要です。
+
+### 自動リリース
+GitHub Actions は pull request と `develop`、`release/**` ブランチへの push で CI 検証を実行します。
+リリース成果物は 4 つのプラットフォーム向けにビルドされます:
+- Windows x64 — MSI インストーラー
+- Linux x64 — desktop エントリ、アイコン、インストールスクリプトを含む tarball
+- macOS x64 — DMG ディスクイメージ
+- macOS arm64 — DMG ディスクイメージ
+
+Linux のリリースアーカイブをインストール:
+```bash
+tar -xzf run_config_manager-linux-x64.tar.gz
+cd run_config_manager-linux-x64
+./install-linux.sh
+```
+
+#### 自動リリース (推奨)
+`release/vX.Y.Z` ブランチを push すると自動ビルドと draft GitHub Release が作成されます:
+```bash
+git checkout -b release/v0.2.0 develop
+# Cargo.toml のバージョン更新、最後の調整
+git push -u origin release/v0.2.0
+```
+ワークフローはバージョン形式 (`vX.Y.Z` または `vX.Y.Z-suffix`) を検証し、4 つのプラットフォームをビルドして `checksums.txt` とともに draft リリースにアップロードします。
+GitHub Releases ページで draft を確認し、**Publish release** ボタンで公開してください。タグは publish 時にブランチの tip に作成されます。
+その後 `release/v0.2.0` を `develop` にマージしてください。
+
+#### 手動リリース (フォールバック)
+タグが既に存在する場合や、ブランチフローを経由しない場合は、タグを先に push して GitHub Actions タブから `Release` ワークフローを手動実行してください:
+```bash
+git tag v0.2.0 <commit>
+git push origin v0.2.0
+```
+
+両方の経路とも、同じタグのリリースが既にあれば停止します。
+既存リリースの checksum を再生成するときだけ `Checksum` ワークフローを実行してください。
+
+### macOS — 初回起動
+
+.app バンドルは ad-hoc 署名のみです (有料の Apple Developer ID は使用していません)。初回起動時に macOS が以下のいずれかを表示する場合があります:
+- `Apple could not verify "RunConfigManager" is free of malware...` (macOS 14+)
+- `"RunConfigManager" is damaged and can't be opened` (quarantine 属性が有効な場合)
+
+![macOS Gatekeeper dialog](static/done.png)
+
+許可する 2 通りの方法:
+
+**方法 1 — システム設定 (推奨)**
+1. ダイアログで `Done` をクリックして閉じる。
+2. **システム設定 → プライバシーとセキュリティ** を開く。
+3. セキュリティセクションに `"RunConfigManager" was blocked` メッセージと **Open Anyway** ボタンが表示されているはず。
+
+   ![Privacy & Security – Open Anyway](static/openanyway.png)
+
+4. **Open Anyway** をクリックし、Touch ID またはパスワードで認証。
+5. RunConfigManager を再度起動 → 以後は通常起動できます。
+
+**方法 2 — ターミナル (一発で)**
+```bash
+xattr -dr com.apple.quarantine /Applications/RunConfigManager.app
+open /Applications/RunConfigManager.app
+```
+
+`com.apple.quarantine` 属性を削除して Gatekeeper の検査自体をバイパスし、ダイアログなしで直接起動できます。
+
+## 使い方
+
+### 1. 構成の作成
+1. `Configurations` タブで `Add` ボタンをクリック
+2. 構成名、タイプ、コマンドなどを設定
+3. 必要に応じて環境変数を追加
+4. `Save` ボタンで保存
+
+### 2. プログラムの実行
+1. 実行する構成を選択
+2. `Run` ボタンまたは構成リストの再生ボタンをクリック
+3. `Sessions` タブに自動切り替え、実行結果を確認
+
+### 3. ペイン管理
+- **セッションを開く**: 左のセッションリストでセッションをクリックして、選択中のワークスペースで開く
+- **セッションを非表示**: ペインのクローズボタンで、実行中のセッションは保持したままワークスペースから外す
+- **セッションの停止/削除**: セッションリストのアクションボタンで停止または削除
+- **ペイン移動**: ペインヘッダーをドラッグして再配置
+- **ペインのサイズ変更**: ペイン境界をドラッグしてリサイズ
+- **ペイン最大化**: ワークスペースに 2 つ以上ペインがある場合、最大化ボタンを使用
+
+### 4. 構成のオープン/保存
+- **Open**: JSON 構成ファイルを開いて現在の構成を置き換える
+- **Save**: 現在のファイルに保存、パスがない場合は保存先を選択
+
+## データ保存場所
+
+構成ファイルは OS 別の設定ディレクトリに自動保存されます:
+- **Linux**: `~/.config/run_config_manager/configs.json`
+- **macOS**: `~/Library/Application Support/run_config_manager/configs.json`
+- **Windows**: `%APPDATA%\run_config_manager\configs.json`
+
+## 終了処理
+
+アプリケーション終了時に実行中の全プロセスを自動的にクリーンアップします:
+1. Ctrl+C またはウィンドウクローズで Drop trait が実行
+2. 全セッションに SIGTERM (Windows では taskkill) を送信
+3. 2 秒待機 (graceful shutdown の機会を提供)
+4. 残存プロセスを強制終了 (SIGKILL または taskkill /F)
+
+## ライセンス
+
+本プロジェクトは GNU General Public License v3.0 で配布されています。詳細は [LICENSE](LICENSE) を参照してください。
