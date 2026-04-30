@@ -1,9 +1,25 @@
 # Run/Debug Configuration Manager
 
+**English** · [한국어](README_KR.md)
+
 A Run/Debug configuration management tool.
 Built with Rust and the iced GUI framework, this cross-platform desktop application allows you to save and manage multiple program execution configurations.
 
 ![Preview](static/preview.gif)
+
+## Download
+
+Grab the latest pre-built binary for your platform from the [Releases page](https://github.com/devsepnine/debug_configuration/releases/latest), or use the direct links below:
+
+| Platform | File |
+|---|---|
+| Windows x64 | [`run_config_manager-windows-x64.msi`](https://github.com/devsepnine/debug_configuration/releases/latest/download/run_config_manager-windows-x64.msi) |
+| macOS (Apple Silicon) | [`run_config_manager-macos-arm64.dmg`](https://github.com/devsepnine/debug_configuration/releases/latest/download/run_config_manager-macos-arm64.dmg) |
+| macOS (Intel) | [`run_config_manager-macos-x64.dmg`](https://github.com/devsepnine/debug_configuration/releases/latest/download/run_config_manager-macos-x64.dmg) |
+| Linux x64 | [`run_config_manager-linux-x64.tar.gz`](https://github.com/devsepnine/debug_configuration/releases/latest/download/run_config_manager-linux-x64.tar.gz) |
+| SHA-256 checksums | [`checksums.txt`](https://github.com/devsepnine/debug_configuration/releases/latest/download/checksums.txt) |
+
+> macOS users: the .app bundle is ad-hoc signed (no paid Apple Developer ID). On first launch, see the [macOS — First Launch](#macos--first-launch) section for how to allow it.
 
 ## Key Features
 
