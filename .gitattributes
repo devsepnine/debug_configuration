@@ -9,3 +9,4 @@
 Cargo.lock text eol=lf
 
 *.ps1 text eol=crlf
+*.rtf text eol=crlf
