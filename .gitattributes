@@ -1,0 +1,11 @@
+/.gitattributes text eol=lf
+
+*.sh text eol=lf
+*.desktop text eol=lf
+*.wxs text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.toml text eol=lf
+Cargo.lock text eol=lf
+
+*.ps1 text eol=crlf

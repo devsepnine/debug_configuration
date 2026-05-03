@@ -36,6 +36,8 @@
             Directory="ApplicationProgramsFolder"
             Description="Run/Debug configuration management tool"
             WorkingDirectory="INSTALLFOLDER"
+            Icon="AppIcon.ico"
+            IconIndex="0"
             Advertise="yes" />
         </File>
       </Component>

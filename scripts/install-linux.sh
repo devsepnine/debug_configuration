@@ -29,6 +29,8 @@ install -Dm644 "${SCRIPT_DIR}/share/doc/run_config_manager/README.md" "${PREFIX}
 install -Dm644 "${SCRIPT_DIR}/share/doc/run_config_manager/README_KR.md" "${PREFIX}/share/doc/run_config_manager/README_KR.md"
 install -Dm644 "${SCRIPT_DIR}/share/doc/run_config_manager/LICENSE" "${PREFIX}/share/doc/run_config_manager/LICENSE"
 
+sed -i "s|^Exec=.*|Exec=${PREFIX}/bin/run_config_manager|" "${PREFIX}/share/applications/dev.runconfigmanager.app.desktop"
+
 if command -v update-desktop-database >/dev/null 2>&1; then
     update-desktop-database "${PREFIX}/share/applications" >/dev/null 2>&1 || true
 fi
