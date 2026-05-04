@@ -12,9 +12,9 @@ use crate::views::shared::{
     IconButtonState, chrome_border_color, icon_button_foreground, icon_button_style, icon_tooltip,
 };
 use crate::views::{
-    EditorLoadingState, EditorSelectState, FileDialogLoadingState, NodeLoadingState,
-    view_configuration_editor, view_configuration_list, view_main_tabs, view_pane_layout,
-    view_toolbar, view_workspace_tab_bar,
+    EditorLoadingState, EditorSelectState, EnvModalView, FileDialogLoadingState, NodeLoadingState,
+    env_modal_key_id, env_modal_value_id, view_configuration_editor, view_configuration_list,
+    view_env_modal, view_main_tabs, view_pane_layout, view_toolbar, view_workspace_tab_bar,
 };
 use crate::widgets::pane_grid;
 use iced::{
@@ -71,6 +71,56 @@ struct TabUiState {
 #[derive(Default)]
 struct ConfigurationUiState {
     editor_focus_area_active: bool,
+}
+
+/// 환경변수 편집 모달의 staging 상태 (always-inline 패턴).
+///
+/// 모든 row가 항상 편집 가능. 모달 OK 시 entries를 `environment_variables`에 commit
+/// (빈 키 row 제거 + HashMap 변환으로 자동 dedupe). Cancel 시 폐기.
+pub struct EnvModalState {
+    /// 어떤 구성의 모달인지
+    pub config_id: Uuid,
+    /// staging entries (입력 순서 유지). 빈 row는 view에서 자동 표시되며
+    /// 사용자가 빈 row에 타이핑하기 시작하면 entries 끝에 push됨.
+    pub entries: Vec<(String, String)>,
+    /// Tab cycle 추적용 — 현재 focus 가진 cell. 마우스 클릭으로 외부 변경된 경우
+    /// 다음 Tab까지는 stale일 수 있으나 cycle 자체는 항상 모달 내부에 머무름.
+    pub focused_cell: ModalCell,
+}
+
+/// 모달 내부의 한 input cell 위치 (row index + key/value 구분).
+#[derive(Debug, Clone, Copy)]
+pub struct ModalCell {
+    pub row: usize,
+    pub kind: ModalCellKind,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum ModalCellKind {
+    Key,
+    Value,
+}
+
+impl ModalCell {
+    /// row * 2 + (Key=0, Value=1). cycle 모듈로 연산용.
+    pub fn linear_index(self) -> usize {
+        self.row * 2
+            + match self.kind {
+                ModalCellKind::Key => 0,
+                ModalCellKind::Value => 1,
+            }
+    }
+
+    /// linear_index의 역변환.
+    pub fn from_linear(linear: usize) -> Self {
+        let row = linear / 2;
+        let kind = if linear.is_multiple_of(2) {
+            ModalCellKind::Key
+        } else {
+            ModalCellKind::Value
+        };
+        Self { row, kind }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -139,10 +189,11 @@ pub struct RunConfigManager {
     /// 상태바 메시지
     status_message: String,
 
-    /// 각 구성별 환경 변수 입력 필드 (`config_id` -> (key, value))
-    env_inputs: HashMap<Uuid, (String, String)>,
-    /// 현재 편집 중인 환경 변수 키 (`config_id` -> `original_key`)
-    editing_env_key: HashMap<Uuid, String>,
+    /// 각 구성별 환경변수 메인 input의 raw text (`config_id` -> `KEY=val;...`)
+    /// `None`이면 `environment_variables`를 직렬화한 값을 표시
+    env_bulk_inputs: HashMap<Uuid, String>,
+    /// 환경변수 편집 모달 상태 (`Some`이면 모달 열림)
+    env_modal: Option<EnvModalState>,
     file_dialog: FileDialogState,
 
     /// Node package script 캐시 (`config_id` 기준)
@@ -194,8 +245,8 @@ impl RunConfigManager {
             configurations: vec![],
             selected_config_index: None,
             status_message: String::from("Ready"),
-            env_inputs: HashMap::new(),
-            editing_env_key: HashMap::new(),
+            env_bulk_inputs: HashMap::new(),
+            env_modal: None,
             file_dialog: FileDialogState::default(),
             node_available_scripts: HashMap::new(),
             node_ui: NodeUiState::default(),
@@ -259,6 +310,12 @@ impl RunConfigManager {
     /// # Returns
     /// 다음에 실행할 Task (부수 효과가 필요한 경우)
     pub fn update(&mut self, message: Message) -> Task<Message> {
+        let task = self.dispatch_message(message);
+        self.ensure_selected_env_bulk_input();
+        task
+    }
+
+    fn dispatch_message(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::SwitchView(view_mode) => {
                 self.current_view = view_mode;
@@ -299,13 +356,17 @@ impl RunConfigManager {
             | Message::WorkingDirectoryChanged(_)
             | Message::BrowseWorkingDirectory
             | Message::WorkingDirectorySelected(_)
-            | Message::EnvKeyChanged(_)
-            | Message::EnvValueChanged(_)
-            | Message::AddEnvironmentVariable
-            | Message::RemoveEnvironmentVariable(_)
-            | Message::EditEnvironmentVariable(_)
-            | Message::UpdateEnvironmentVariable
-            | Message::CancelEditEnvironmentVariable
+            | Message::EnvBulkInputChanged(_)
+            | Message::EnvBulkInputSubmitted
+            | Message::OpenEnvModal
+            | Message::ConfirmEnvModal
+            | Message::CancelEnvModal
+            | Message::EnvModalRowKeyChanged(_, _)
+            | Message::EnvModalRowValueChanged(_, _)
+            | Message::EnvModalDuplicateEntry(_)
+            | Message::EnvModalRemoveEntry(_)
+            | Message::EnvModalFocusNext
+            | Message::EnvModalFocusPrev
             | Message::MoveEditorFocus(_)
             | Message::EditorFocusAreaChanged(_)
             | Message::ConfigurationsLoaded(_)
@@ -410,17 +471,21 @@ impl RunConfigManager {
             Message::WorkingDirectorySelected(result) => {
                 self.handle_working_directory_selected(result)
             }
-            Message::EnvKeyChanged(key) => self.handle_env_key_changed(key),
-            Message::EnvValueChanged(value) => self.handle_env_value_changed(value),
-            Message::AddEnvironmentVariable => self.handle_add_environment_variable(),
-            Message::RemoveEnvironmentVariable(key) => {
-                self.handle_remove_environment_variable(&key)
+            Message::EnvBulkInputChanged(text) => self.handle_env_bulk_input_changed(text),
+            Message::EnvBulkInputSubmitted => self.handle_env_bulk_input_submitted(),
+            Message::OpenEnvModal => self.handle_open_env_modal(),
+            Message::ConfirmEnvModal => self.handle_confirm_env_modal(),
+            Message::CancelEnvModal => self.handle_cancel_env_modal(),
+            Message::EnvModalRowKeyChanged(idx, key) => {
+                self.handle_env_modal_row_key_changed(idx, key)
             }
-            Message::EditEnvironmentVariable(key) => self.handle_edit_environment_variable(key),
-            Message::UpdateEnvironmentVariable => self.handle_update_environment_variable(),
-            Message::CancelEditEnvironmentVariable => {
-                self.handle_cancel_edit_environment_variable()
+            Message::EnvModalRowValueChanged(idx, value) => {
+                self.handle_env_modal_row_value_changed(idx, value)
             }
+            Message::EnvModalDuplicateEntry(idx) => self.handle_env_modal_duplicate_entry(idx),
+            Message::EnvModalRemoveEntry(idx) => self.handle_env_modal_remove_entry(idx),
+            Message::EnvModalFocusNext => self.handle_env_modal_focus_shift(false),
+            Message::EnvModalFocusPrev => self.handle_env_modal_focus_shift(true),
             Message::MoveEditorFocus(backward) => Self::handle_move_editor_focus(backward),
             Message::EditorFocusAreaChanged(is_active) => {
                 self.handle_editor_focus_area_changed(is_active)
@@ -722,7 +787,12 @@ impl RunConfigManager {
         {
             let config_id = self.configurations[idx].id;
             self.configurations.remove(idx);
-            self.env_inputs.remove(&config_id);
+            self.env_bulk_inputs.remove(&config_id);
+            if let Some(modal) = &self.env_modal
+                && modal.config_id == config_id
+            {
+                self.env_modal = None;
+            }
 
             self.selected_config_index = if self.configurations.is_empty() {
                 None
@@ -1431,6 +1501,8 @@ impl RunConfigManager {
         match result {
             Ok(configs) => {
                 self.configurations = configs;
+                self.env_bulk_inputs.clear();
+                self.env_modal = None;
                 self.status_message = if let Some(path) = &self.last_file_path {
                     format!("Loaded: {}", path.display())
                 } else {
@@ -1491,6 +1563,8 @@ impl RunConfigManager {
         match result {
             Ok((configs, path)) => {
                 self.configurations = configs;
+                self.env_bulk_inputs.clear();
+                self.env_modal = None;
                 self.selected_config_index = (!self.configurations.is_empty()).then_some(0);
                 self.load_node_metadata_for_current_configurations();
 
@@ -1543,111 +1617,196 @@ impl RunConfigManager {
             .collect()
     }
 
-    fn handle_env_key_changed(&mut self, key: String) -> Task<Message> {
-        if let Some(index) = self.selected_config_index
-            && let Some(config) = self.configurations.get(index)
-        {
-            let entry = self
-                .env_inputs
-                .entry(config.id)
-                .or_insert((String::new(), String::new()));
-            entry.0 = key;
-        }
+    fn selected_config_id(&self) -> Option<Uuid> {
+        self.selected_config_index
+            .and_then(|idx| self.configurations.get(idx))
+            .map(|config| config.id)
+    }
 
+    fn handle_env_bulk_input_changed(&mut self, text: String) -> Task<Message> {
+        if let Some(config_id) = self.selected_config_id() {
+            self.env_bulk_inputs.insert(config_id, text);
+        }
         Task::none()
     }
 
-    fn handle_env_value_changed(&mut self, value: String) -> Task<Message> {
-        if let Some(index) = self.selected_config_index
-            && let Some(config) = self.configurations.get(index)
-        {
-            let entry = self
-                .env_inputs
-                .entry(config.id)
-                .or_insert((String::new(), String::new()));
-            entry.1 = value;
-        }
-
+    fn handle_env_bulk_input_submitted(&mut self) -> Task<Message> {
+        let Some(index) = self.selected_config_index else {
+            return Task::none();
+        };
+        let Some(config) = self.configurations.get_mut(index) else {
+            return Task::none();
+        };
+        let config_id = config.id;
+        let raw = self
+            .env_bulk_inputs
+            .get(&config_id)
+            .cloned()
+            .unwrap_or_default();
+        let entries = crate::env_string::parse_env_string(&raw);
+        config.environment_variables = entries.into_iter().collect();
+        // raw text는 정렬된 형태로 normalize하여 표시 일관성 유지
+        let normalized = crate::env_string::serialize_env_map(&config.environment_variables);
+        self.env_bulk_inputs.insert(config_id, normalized);
         Task::none()
     }
 
-    fn handle_add_environment_variable(&mut self) -> Task<Message> {
-        if let Some(index) = self.selected_config_index
-            && let Some(config) = self.configurations.get_mut(index)
-        {
-            let config_id = config.id;
-            if let Some((key, value)) = self.env_inputs.get(&config_id)
-                && !key.is_empty()
-            {
-                config
-                    .environment_variables
-                    .insert(key.clone(), value.clone());
-                self.env_inputs
-                    .insert(config_id, (String::new(), String::new()));
-            }
-        }
+    fn handle_open_env_modal(&mut self) -> Task<Message> {
+        let Some(index) = self.selected_config_index else {
+            return Task::none();
+        };
+        let Some(config) = self.configurations.get(index) else {
+            return Task::none();
+        };
+        let config_id = config.id;
+        // 사용자가 메인 input에 타이핑 후 Enter 누르지 않은 raw text가 남아 있으면
+        // 그 결과를 staging으로 사용 (데이터 손실 방지). 일치하면 environment_variables 그대로.
+        let serialized = crate::env_string::serialize_env_map(&config.environment_variables);
+        let raw = self
+            .env_bulk_inputs
+            .get(&config_id)
+            .cloned()
+            .unwrap_or_default();
+        let mut entries: Vec<(String, String)> = if raw == serialized {
+            config
+                .environment_variables
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect()
+        } else {
+            crate::env_string::parse_env_string(&raw)
+        };
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        self.env_modal = Some(EnvModalState {
+            config_id,
+            entries,
+            focused_cell: ModalCell {
+                row: 0,
+                kind: ModalCellKind::Key,
+            },
+        });
+        // 모달 열림과 동시에 첫 row(idx=0)의 key input에 focus.
+        // entries가 비었어도 placeholder row가 idx=0이라 동일하게 동작.
+        iced::widget::operation::focus(env_modal_key_id(0))
+    }
 
+    fn handle_confirm_env_modal(&mut self) -> Task<Message> {
+        let Some(modal) = self.env_modal.take() else {
+            return Task::none();
+        };
+        let Some(config) = self
+            .configurations
+            .iter_mut()
+            .find(|c| c.id == modal.config_id)
+        else {
+            return Task::none();
+        };
+        // 빈 키 row 제거 + HashMap 변환으로 중복 키 자동 dedupe (마지막 값 우선)
+        config.environment_variables = modal
+            .entries
+            .into_iter()
+            .filter(|(k, _)| !k.trim().is_empty())
+            .map(|(k, v)| (k.trim().to_string(), v))
+            .collect();
+        let normalized = crate::env_string::serialize_env_map(&config.environment_variables);
+        self.env_bulk_inputs.insert(modal.config_id, normalized);
         Task::none()
     }
 
-    fn handle_remove_environment_variable(&mut self, key: &str) -> Task<Message> {
-        if let Some(index) = self.selected_config_index
-            && let Some(config) = self.configurations.get_mut(index)
-        {
-            config.environment_variables.remove(key);
-        }
-
+    fn handle_cancel_env_modal(&mut self) -> Task<Message> {
+        self.env_modal = None;
         Task::none()
     }
 
-    fn handle_edit_environment_variable(&mut self, key: String) -> Task<Message> {
-        if let Some(index) = self.selected_config_index
-            && let Some(config) = self.configurations.get_mut(index)
-        {
-            let config_id = config.id;
-            if let Some(value) = config.environment_variables.get(&key) {
-                self.env_inputs
-                    .insert(config_id, (key.clone(), value.clone()));
-                self.editing_env_key.insert(config_id, key);
-            }
-        }
-
+    fn handle_env_modal_row_key_changed(&mut self, index: usize, key: String) -> Task<Message> {
+        let Some(modal) = self.env_modal.as_mut() else {
+            return Task::none();
+        };
+        Self::set_modal_row(&mut modal.entries, index, Some(key), None);
         Task::none()
     }
 
-    fn handle_update_environment_variable(&mut self) -> Task<Message> {
-        if let Some(index) = self.selected_config_index
-            && let Some(config) = self.configurations.get_mut(index)
-        {
-            let config_id = config.id;
-            if let Some(original_key) = self.editing_env_key.get(&config_id)
-                && let Some((new_key, new_value)) = self.env_inputs.get(&config_id)
-                && !new_key.is_empty()
-            {
-                config.environment_variables.remove(original_key);
-                config
-                    .environment_variables
-                    .insert(new_key.clone(), new_value.clone());
-                self.editing_env_key.remove(&config_id);
-                self.env_inputs
-                    .insert(config_id, (String::new(), String::new()));
-            }
-        }
-
+    fn handle_env_modal_row_value_changed(&mut self, index: usize, value: String) -> Task<Message> {
+        let Some(modal) = self.env_modal.as_mut() else {
+            return Task::none();
+        };
+        Self::set_modal_row(&mut modal.entries, index, None, Some(value));
         Task::none()
     }
 
-    fn handle_cancel_edit_environment_variable(&mut self) -> Task<Message> {
-        if let Some(index) = self.selected_config_index
-            && let Some(config) = self.configurations.get(index)
+    fn handle_env_modal_duplicate_entry(&mut self, index: usize) -> Task<Message> {
+        if let Some(modal) = self.env_modal.as_mut()
+            && let Some((key, value)) = modal.entries.get(index)
         {
-            let config_id = config.id;
-            self.editing_env_key.remove(&config_id);
-            self.env_inputs
-                .insert(config_id, (String::new(), String::new()));
+            // 동일 (key, value)를 원본 바로 다음 위치에 insert.
+            // 같은 키가 둘이 되어 자연스럽게 중복 경고가 떠 사용자에게 키 변경을 유도.
+            let cloned = (key.clone(), value.clone());
+            modal.entries.insert(index + 1, cloned);
         }
-
         Task::none()
+    }
+
+    fn handle_env_modal_remove_entry(&mut self, index: usize) -> Task<Message> {
+        let Some(modal) = self.env_modal.as_mut() else {
+            return Task::none();
+        };
+        if index >= modal.entries.len() {
+            return Task::none();
+        }
+        modal.entries.remove(index);
+        // remove 후 focused_cell이 row 수보다 커지지 않도록 clamp + 명시적 focus 이동.
+        // (위젯 id 재할당으로 stale focus가 다른 데이터에 머무는 것 방지)
+        let last_row = modal.entries.len(); // placeholder row index
+        if modal.focused_cell.row > last_row {
+            modal.focused_cell.row = last_row;
+        }
+        modal.focused_cell.kind = ModalCellKind::Key;
+        Self::focus_modal_cell_task(modal.focused_cell)
+    }
+
+    /// Tab/Shift+Tab 처리: focused_cell을 modal 내부에서만 cycle.
+    /// `(entries.len() + 1) * 2` 개 cell을 모듈로 순회한다 (+1은 placeholder row).
+    /// `total_cells`는 항상 ≥ 2 이므로 0-검사는 불필요.
+    fn handle_env_modal_focus_shift(&mut self, backward: bool) -> Task<Message> {
+        let Some(modal) = self.env_modal.as_mut() else {
+            return Task::none();
+        };
+        let total_cells = (modal.entries.len() + 1) * 2;
+        let current = modal.focused_cell.linear_index().min(total_cells - 1);
+        let next = if backward {
+            (current + total_cells - 1) % total_cells
+        } else {
+            (current + 1) % total_cells
+        };
+        modal.focused_cell = ModalCell::from_linear(next);
+        Self::focus_modal_cell_task(modal.focused_cell)
+    }
+
+    fn focus_modal_cell_task(cell: ModalCell) -> Task<Message> {
+        let id = match cell.kind {
+            ModalCellKind::Key => env_modal_key_id(cell.row),
+            ModalCellKind::Value => env_modal_value_id(cell.row),
+        };
+        iced::widget::operation::focus(id)
+    }
+
+    /// row index 위치에 key/value를 부분 업데이트. index가 entries 범위 밖이면
+    /// 빈 entry를 push하여 auto-grow.
+    fn set_modal_row(
+        entries: &mut Vec<(String, String)>,
+        index: usize,
+        key: Option<String>,
+        value: Option<String>,
+    ) {
+        while entries.len() <= index {
+            entries.push((String::new(), String::new()));
+        }
+        if let Some(k) = key {
+            entries[index].0 = k;
+        }
+        if let Some(v) = value {
+            entries[index].1 = v;
+        }
     }
 
     fn handle_move_editor_focus(backward: bool) -> Task<Message> {
@@ -2266,19 +2425,28 @@ impl RunConfigManager {
             .into()
     }
 
-    fn selected_config_inputs(&self) -> (&str, &str, Option<&str>) {
+    /// 환경변수 메인 input 텍스트 ref. `ensure_selected_env_bulk_input`이 사전에 채워뒀다고 가정.
+    fn env_bulk_input_text(&self) -> &str {
         self.selected_config_index
             .and_then(|idx| self.configurations.get(idx))
-            .map_or(("", "", None), |config| {
-                let (key, value) = self
-                    .env_inputs
-                    .get(&config.id)
-                    .map_or(("", ""), |(env_key, env_value)| {
-                        (env_key.as_str(), env_value.as_str())
-                    });
-                let editing_key = self.editing_env_key.get(&config.id).map(String::as_str);
-                (key, value, editing_key)
-            })
+            .and_then(|config| self.env_bulk_inputs.get(&config.id))
+            .map(String::as_str)
+            .unwrap_or("")
+    }
+
+    /// `selected` 구성의 `env_bulk_inputs` 항목이 비어있다면 직렬화된 값으로 채움.
+    /// `update` 끝에서 호출하여 view에서 항상 self의 String을 빌릴 수 있도록 보장.
+    fn ensure_selected_env_bulk_input(&mut self) {
+        let Some(idx) = self.selected_config_index else {
+            return;
+        };
+        let Some(config) = self.configurations.get(idx) else {
+            return;
+        };
+        let id = config.id;
+        self.env_bulk_inputs
+            .entry(id)
+            .or_insert_with(|| crate::env_string::serialize_env_map(&config.environment_variables));
     }
 
     fn sync_editor_select_state_for_selected_config(&mut self) {
@@ -2749,8 +2917,7 @@ impl RunConfigManager {
         tooltip(button, icon_tooltip(label), tooltip::Position::Top).into()
     }
 
-    fn view_configuration_screen<'a>(&'a self) -> Element<'a, Message> {
-        let (env_key, env_value, editing_key) = self.selected_config_inputs();
+    fn view_configuration_screen<'a>(&'a self, env_bulk_text: &'a str) -> Element<'a, Message> {
         let split_ratio = configuration_split_ratio(&self.configuration_layout);
         let name_max_width = configuration_name_max_width(self.window_size, split_ratio);
 
@@ -2781,9 +2948,7 @@ impl RunConfigManager {
                                 container(view_configuration_editor(
                                     &self.configurations,
                                     self.selected_config_index,
-                                    env_key,
-                                    env_value,
-                                    editing_key,
+                                    env_bulk_text,
                                     EditorLoadingState {
                                         file_dialog: FileDialogLoadingState {
                                             folder: self.file_dialog.is_loading_folder,
@@ -2828,7 +2993,7 @@ impl RunConfigManager {
                     header_actions,
                     body,
                 ))
-                .style(|_theme: &Theme| container::Style::default())
+                .style(move |_theme: &Theme| container::Style::default())
             },
         )
         .width(Length::Fill)
@@ -2958,6 +3123,7 @@ impl RunConfigManager {
         // as a practical guard so Tab does not affect the whole screen.
         let editor_focus_subscription = if matches!(self.current_view, ViewMode::Configuration)
             && self.configuration_ui.editor_focus_area_active
+            && self.env_modal.is_none()
         {
             event::listen_with(|event, status, _id| match event {
                 Event::Keyboard(keyboard::Event::KeyPressed {
@@ -2967,6 +3133,34 @@ impl RunConfigManager {
                 }) if matches!(status, event::Status::Ignored) => {
                     Some(Message::MoveEditorFocus(modifiers.shift()))
                 }
+                _ => None,
+            })
+        } else {
+            Subscription::none()
+        };
+
+        // 모달이 열려 있을 때만 키보드 처리: Tab/Shift+Tab → 모달 내부 cycle, ESC → Cancel.
+        // editor_focus_subscription는 모달 열림 시 비활성이라 Tab 메시지가 중복 발행되지 않는다.
+        // 모달 trap: iced 글로벌 focus_next 대신 우리가 직접 cell index를 cycle해 외부로 빠지지 않게.
+        let env_modal_keyboard_subscription = if self.env_modal.is_some() {
+            event::listen_with(|event, status, _id| match event {
+                Event::Keyboard(keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Named(keyboard::key::Named::Tab),
+                    modifiers,
+                    ..
+                }) if matches!(status, event::Status::Ignored) => {
+                    if modifiers.shift() {
+                        Some(Message::EnvModalFocusPrev)
+                    } else {
+                        Some(Message::EnvModalFocusNext)
+                    }
+                }
+                // ESC: text_input이 unfocus capture해도 우리는 modal 닫기를 항상 발화.
+                // status 가드 의도적으로 없음 — focus된 input 안에서도 ESC가 동작해야 한다.
+                Event::Keyboard(keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Named(keyboard::key::Named::Escape),
+                    ..
+                }) => Some(Message::CancelEnvModal),
                 _ => None,
             })
         } else {
@@ -2989,6 +3183,7 @@ impl RunConfigManager {
             release_subscription,
             configuration_release_subscription,
             editor_focus_subscription,
+            env_modal_keyboard_subscription,
             tab_name_edit_subscription,
             window::open_events().map(Message::WindowOpened),
             window::resize_events().map(|(id, size)| Message::WindowResized(id, size)),
@@ -3001,8 +3196,9 @@ impl RunConfigManager {
     /// # Returns
     /// 렌더링할 Element 트리
     pub fn view(&self) -> Element<'_, Message> {
+        let env_bulk_text = self.env_bulk_input_text();
         let content = match self.current_view {
-            ViewMode::Configuration => self.view_configuration_screen(),
+            ViewMode::Configuration => self.view_configuration_screen(env_bulk_text),
             ViewMode::Sessions => self.view_sessions_screen(),
         };
 
@@ -3023,17 +3219,23 @@ impl RunConfigManager {
             .height(Length::Fill)
             .style(window_chrome_style);
 
-        stack![
+        let mut layers = stack![
             chrome,
             self.view_window_resize_grips(),
             container(Space::new())
                 .width(Length::Fill)
                 .height(Length::Fill)
-                .style(window_border_overlay_style)
-        ]
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .into()
+                .style(window_border_overlay_style),
+        ];
+
+        if let Some(modal) = self.env_modal.as_ref() {
+            let props = EnvModalView {
+                entries: &modal.entries,
+            };
+            layers = layers.push(view_env_modal(props));
+        }
+
+        layers.width(Length::Fill).height(Length::Fill).into()
     }
 }
 

@@ -12,6 +12,7 @@ pub const ICON_DELETE: &[u8] = include_bytes!("../assets/mingcute--delete-2-fill
 pub const ICON_SAVE: &[u8] = include_bytes!("../assets/mingcute--save-2-line.svg");
 pub const ICON_CLOSE: &[u8] = include_bytes!("../assets/mingcute--close-fill.svg");
 pub const ICON_ADD: &[u8] = include_bytes!("../assets/mingcute--add-square-line.svg");
+pub const ICON_COPY: &[u8] = include_bytes!("../assets/mingcute--copy-2-line.svg");
 pub const ICON_CONFIGURATIONS: &[u8] = include_bytes!("../assets/app--configurations.svg");
 pub const ICON_SESSIONS: &[u8] = include_bytes!("../assets/app--sessions.svg");
 

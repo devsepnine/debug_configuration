@@ -102,21 +102,33 @@ pub enum Message {
     /// 폴더 선택 완료
     WorkingDirectorySelected(Result<String, String>),
 
-    // 환경 변수 관리 메시지
-    /// 환경 변수 키 입력 변경
-    EnvKeyChanged(String),
-    /// 환경 변수 값 입력 변경
-    EnvValueChanged(String),
-    /// 환경 변수 추가
-    AddEnvironmentVariable,
-    /// 환경 변수 제거
-    RemoveEnvironmentVariable(String),
-    /// 환경 변수 편집 시작
-    EditEnvironmentVariable(String),
-    /// 환경 변수 업데이트
-    UpdateEnvironmentVariable,
-    /// 환경 변수 편집 취소
-    CancelEditEnvironmentVariable,
+    // 환경 변수 관리 메시지 (메인 단일 input)
+    /// 메인 환경변수 input 텍스트 변경 (`KEY=value;...` raw text)
+    EnvBulkInputChanged(String),
+    /// 메인 환경변수 input Submit (Enter) - 파싱하여 저장
+    EnvBulkInputSubmitted,
+
+    // 환경 변수 모달 lifecycle
+    /// 환경변수 모달 열기 (현재 environment_variables를 staging으로 복사)
+    OpenEnvModal,
+    /// 환경변수 모달 OK - staging을 environment_variables에 반영
+    ConfirmEnvModal,
+    /// 환경변수 모달 Cancel - staging 폐기
+    CancelEnvModal,
+
+    // 환경 변수 모달 내부 (always-inline staging)
+    /// 모달 row의 키 입력 변경 (인덱스, 새 값). 인덱스가 범위 밖이면 새 row 추가.
+    EnvModalRowKeyChanged(usize, String),
+    /// 모달 row의 값 입력 변경 (인덱스, 새 값). 인덱스가 범위 밖이면 새 row 추가.
+    EnvModalRowValueChanged(usize, String),
+    /// 모달 row 복제 — 동일 (key, value)을 entries 끝에 새로 push (인덱스)
+    EnvModalDuplicateEntry(usize),
+    /// 모달 row 제거 (인덱스)
+    EnvModalRemoveEntry(usize),
+    /// 모달 내부 다음 cell로 focus (Tab) — modal trap cycle
+    EnvModalFocusNext,
+    /// 모달 내부 이전 cell로 focus (Shift+Tab) — modal trap cycle
+    EnvModalFocusPrev,
     /// Editor focus 이동 (`true`면 역방향)
     MoveEditorFocus(bool),
     /// Editor pane이 키보드 focus 이동 대상인지 갱신

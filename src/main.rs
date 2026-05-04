@@ -8,6 +8,7 @@
 /// - View: `app::RunConfigManager::view`
 mod ansi;
 mod app;
+mod env_string;
 mod messages;
 mod models;
 mod services;

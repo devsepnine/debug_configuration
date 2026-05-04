@@ -4,14 +4,16 @@ use crate::models::{
     RunConfiguration,
 };
 use crate::utils::{
-    ICON_ADD, ICON_CLOSE, ICON_DELETE, ICON_EDIT, ICON_FOLDER_OPEN, ICON_REFRESH, ICON_SAVE,
-    to_relative_path,
+    ICON_CLOSE, ICON_COPY, ICON_DELETE, ICON_EDIT, ICON_FOLDER_OPEN, ICON_REFRESH, to_relative_path,
 };
 use iced::widget::scrollable;
 use iced::{
     Alignment, Background, Border, Color, Element, Length, Padding, Theme,
     alignment::{Horizontal, Vertical},
-    widget::{Column, Space, button, column, combo_box, container, row, svg, text, text_input},
+    widget::{
+        Column, Space, button, center, column, combo_box, container, opaque, row, svg, text,
+        text_input,
+    },
 };
 use std::fmt::Display;
 
@@ -91,16 +93,9 @@ impl Default for EditorSelectState {
 /// # Arguments
 /// * `configurations` - 전체 구성 목록
 /// * `selected_config_index` - 현재 선택된 구성의 인덱스
-/// * `env_key_input` - 환경 변수 키 입력 필드 값
-/// * `env_value_input` - 환경 변수 값 입력 필드 값
-/// * `editing_env_key` - 현재 편집 중인 환경 변수 키
-/// * `is_loading_folder` - 폴더 선택 처리 중 여부
-/// * `is_loading_script_file` - 스크립트 파일 선택 처리 중 여부
-/// * `is_loading_interpreter` - 인터프리터 선택 처리 중 여부
-/// * `node_available_scripts` - Node package scripts 목록
-/// * `is_loading_node_scripts` - Node package scripts 로드 중 여부
-/// * `node_available_package_jsons` - 프로젝트에서 발견된 package.json 목록
-/// * `is_loading_project_directory` - 프로젝트 디렉토리 선택 처리 중 여부
+/// * `env_bulk_text` - 환경변수 메인 input에 표시할 텍스트 (`KEY=val;...`)
+/// * `loading` - 파일 다이얼로그 / 노드 로딩 상태
+/// * `select_state` - 콤보박스 상태
 /// * `available_node_runtimes` - 시스템에서 감지된 Node.js 런타임 목록
 ///
 /// # Note
@@ -109,9 +104,7 @@ impl Default for EditorSelectState {
 pub fn view_configuration_editor<'a>(
     configurations: &'a [RunConfiguration],
     selected_config_index: Option<usize>,
-    env_key_input: &'a str,
-    env_value_input: &'a str,
-    editing_env_key: Option<&'a str>,
+    env_bulk_text: &'a str,
     loading: EditorLoadingState,
     select_state: &'a EditorSelectState,
     available_node_runtimes: &'a [(String, String)],
@@ -184,10 +177,7 @@ pub fn view_configuration_editor<'a>(
     column![
         view_section_block("Basics", basics.into()),
         Space::new().height(16),
-        view_section_block(
-            "Environment",
-            view_environment_variables(config, env_key_input, env_value_input, editing_env_key),
-        ),
+        view_section_block("Environment", view_environment_bulk_input(env_bulk_text)),
     ]
     .width(Length::Fill)
     .padding(Padding::new(0.0).right(10.0).bottom(14.0))
@@ -363,18 +353,6 @@ fn flat_readonly_style(theme: &Theme) -> container::Style {
     }
 }
 
-fn empty_state_box(message: &str) -> iced::widget::Container<'_, Message> {
-    container(
-        text(message)
-            .size(13)
-            .align_x(Horizontal::Center)
-            .style(muted_text_style),
-    )
-    .padding([12, 10])
-    .width(Length::Fill)
-    .style(flat_readonly_style)
-}
-
 fn flat_icon_button_style(_theme: &Theme, status: button::Status) -> button::Style {
     let subtle = Color::from_rgba8(255, 255, 255, 0.05);
     let hover = Color::from_rgba8(255, 255, 255, 0.08);
@@ -473,119 +451,267 @@ fn selected_package_json(project_directory: &str, working_directory: &str) -> Op
     }
 }
 
-/// 환경 변수 섹션 렌더링
+/// 환경변수 메인 input (한 줄 + [편집] 버튼).
 ///
-/// 현재 설정된 환경 변수 목록과 새 환경 변수 추가 폼
-///
-/// # Arguments
-/// * `config` - 현재 구성
-/// * `env_key_input` - 환경 변수 키 입력 필드 값
-/// * `env_value_input` - 환경 변수 값 입력 필드 값
-fn view_environment_variables<'a>(
-    config: &'a RunConfiguration,
-    env_key_input: &'a str,
-    env_value_input: &'a str,
-    editing_key: Option<&'a str>,
-) -> Element<'a, Message> {
-    let mut env_list = Column::new().spacing(5);
-
-    for (key, value) in &config.environment_variables {
-        let env_row = if editing_key == Some(key.as_str()) {
-            view_editing_environment_row(env_key_input, env_value_input)
-        } else {
-            view_environment_display_row(key, value, editing_key.is_some())
-        };
-
-        env_list = env_list.push(env_row);
-    }
-
-    if config.environment_variables.is_empty() && editing_key.is_none() {
-        env_list = env_list.push(empty_state_box("No environment variables configured"));
-    }
-
-    let add_section = if editing_key.is_none() {
-        column![
-            Space::new().height(10),
-            text("Add variable").size(12).style(editor_label_style),
-            Space::new().height(5),
-            view_new_environment_row(env_key_input, env_value_input),
-        ]
-    } else {
-        column![]
-    };
-
-    column![env_list, add_section]
-        .spacing(8)
-        .width(Length::Fill)
-        .into()
-}
-
-fn view_editing_environment_row<'a>(
-    env_key_input: &'a str,
-    env_value_input: &'a str,
-) -> iced::widget::Row<'a, Message> {
+/// IntelliJ Run/Debug Configuration의 Environment 필드와 동일한 UX.
+/// 직접 타이핑 가능하며 Enter로 적용. [편집] 버튼 클릭 시 모달이 열림.
+fn view_environment_bulk_input(env_bulk_text: &str) -> Element<'_, Message> {
     row![
-        editor_input("Key", env_key_input)
-            .on_input(Message::EnvKeyChanged)
-            .width(Length::FillPortion(4)),
-        editor_input("Value", env_value_input)
-            .on_input(Message::EnvValueChanged)
-            .width(Length::FillPortion(6)),
-        icon_button(ICON_SAVE, Some(Message::UpdateEnvironmentVariable)),
-        icon_button(ICON_CLOSE, Some(Message::CancelEditEnvironmentVariable)),
+        editor_input("KEY1=value1;KEY2=value2;...", env_bulk_text)
+            .on_input(Message::EnvBulkInputChanged)
+            .on_submit(Message::EnvBulkInputSubmitted)
+            .width(Length::Fill),
+        icon_button(ICON_EDIT, Some(Message::OpenEnvModal)),
     ]
     .spacing(5)
     .align_y(Alignment::Center)
+    .width(Length::Fill)
+    .into()
 }
 
-fn view_environment_display_row<'a>(
+/// 환경변수 편집 모달 props.
+///
+/// always-inline 패턴 — 모든 row가 항상 input. view에서 마지막에 빈 row를
+/// 자동으로 한 줄 더 그려 auto-grow를 유도한다.
+pub struct EnvModalView<'a> {
+    pub entries: &'a [(String, String)],
+}
+
+/// 환경변수 편집 모달 (반투명 배경 + 중앙 다이얼로그).
+///
+/// iced 공식 modal 패턴(`opaque(center(opaque(dialog)).style(backdrop))`):
+/// - 바깥 `opaque`: backdrop 영역에서 발생한 모든 마우스 이벤트를 흡수해
+///   `Stack` 뒤쪽 레이어(메인 UI)로 통과시키지 않음.
+/// - 안쪽 `opaque`: dialog 영역 클릭이 backdrop으로 새지 않도록 격리.
+///
+/// 외부 클릭은 무시되며 명시적인 OK / Cancel / X 버튼으로만 닫힌다.
+pub fn view_env_modal<'a>(props: EnvModalView<'a>) -> Element<'a, Message> {
+    let header = row![
+        text("Environment Variables").size(15),
+        Space::new().width(Length::Fill),
+        icon_button(ICON_CLOSE, Some(Message::CancelEnvModal)),
+    ]
+    .align_y(Alignment::Center)
+    .width(Length::Fill);
+
+    let duplicates = duplicate_key_indices(props.entries);
+    let mut table = Column::new().spacing(5);
+    for (idx, (key, value)) in props.entries.iter().enumerate() {
+        let is_duplicate = duplicates.contains(&idx);
+        table = table.push(view_env_modal_row(
+            idx,
+            key,
+            value,
+            is_duplicate,
+            /* is_placeholder = */ false,
+        ));
+    }
+    // 항상 마지막에 빈 row 한 줄 더 — 사용자가 타이핑하면 handler가 entries에 push (auto-grow)
+    table = table.push(view_env_modal_row(
+        props.entries.len(),
+        "",
+        "",
+        false,
+        /* is_placeholder = */ true,
+    ));
+
+    let footer = row![
+        Space::new().width(Length::Fill),
+        button(text("Cancel").size(13))
+            .on_press(Message::CancelEnvModal)
+            .padding([6, 16])
+            .style(modal_secondary_button_style),
+        button(text("OK").size(13))
+            .on_press(Message::ConfirmEnvModal)
+            .padding([6, 18])
+            .style(modal_primary_button_style),
+    ]
+    .spacing(8)
+    .align_y(Alignment::Center);
+
+    let dialog_content = column![
+        header,
+        Space::new().height(10),
+        scrollable(table.padding(Padding::new(0.0).right(8.0)))
+            .height(Length::Fill)
+            .direction(scrollable::Direction::Vertical(
+                scrollable::Scrollbar::default()
+                    .width(4)
+                    .scroller_width(4.0)
+                    .spacing(2.0),
+            )),
+        Space::new().height(14),
+        footer,
+    ]
+    .width(Length::Fill)
+    .height(Length::Fill);
+
+    let dialog = container(dialog_content)
+        .padding(18)
+        .max_width(640)
+        .max_height(520)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .style(modal_dialog_style);
+
+    opaque(
+        center(opaque(dialog))
+            .padding(40)
+            .style(modal_backdrop_style),
+    )
+}
+
+/// staging entries 중 동일 키가 둘 이상 있는 row index 집합.
+/// trim 후 빈 키는 중복 검사에서 제외 (placeholder/입력 중인 row 보호).
+fn duplicate_key_indices(entries: &[(String, String)]) -> std::collections::HashSet<usize> {
+    use std::collections::HashMap;
+    let mut by_key: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (idx, (key, _)) in entries.iter().enumerate() {
+        let trimmed = key.trim();
+        if !trimmed.is_empty() {
+            by_key.entry(trimmed).or_default().push(idx);
+        }
+    }
+    by_key
+        .into_values()
+        .filter(|indices| indices.len() > 1)
+        .flatten()
+        .collect()
+}
+
+/// 단일 row: [Key input] [Value input] [Duplicate] [Delete].
+///
+/// `is_placeholder == true`이면 마지막 자동 추가 빈 row — Duplicate/Delete 비활성.
+/// `is_duplicate == true`이면 Key/Value input에 경고 테두리 (같은 키 검출 시).
+/// Duplicate 버튼: 동일 (key, value)를 entries 끝에 push해 사본 생성.
+fn view_env_modal_row<'a>(
+    index: usize,
     key: &'a str,
     value: &'a str,
-    is_another_editing: bool,
+    is_duplicate: bool,
+    is_placeholder: bool,
 ) -> iced::widget::Row<'a, Message> {
-    let edit_message =
-        (!is_another_editing).then(|| Message::EditEnvironmentVariable(key.to_owned()));
-    let remove_message =
-        (!is_another_editing).then(|| Message::RemoveEnvironmentVariable(key.to_owned()));
+    let style_fn: fn(&Theme, text_input::Status) -> text_input::Style = if is_duplicate {
+        text_input_warn_style
+    } else {
+        text_input::default
+    };
+
+    let key_input = text_input("Key", key)
+        .id(env_modal_key_id(index))
+        .on_input(move |s| Message::EnvModalRowKeyChanged(index, s))
+        .padding(8)
+        .size(13)
+        .width(Length::FillPortion(4))
+        .style(style_fn);
+
+    let value_input = text_input("Value", value)
+        .id(env_modal_value_id(index))
+        .on_input(move |s| Message::EnvModalRowValueChanged(index, s))
+        .padding(8)
+        .size(13)
+        .width(Length::FillPortion(6))
+        .style(style_fn);
+
+    let duplicate_msg = (!is_placeholder).then_some(Message::EnvModalDuplicateEntry(index));
+    let delete_msg = (!is_placeholder).then_some(Message::EnvModalRemoveEntry(index));
 
     row![
-        view_environment_value(key).width(Length::FillPortion(4)),
-        view_environment_value(value).width(Length::FillPortion(6)),
-        icon_button(ICON_EDIT, edit_message),
-        icon_button(ICON_DELETE, remove_message),
+        key_input,
+        value_input,
+        icon_button(ICON_COPY, duplicate_msg),
+        icon_button(ICON_DELETE, delete_msg),
     ]
     .spacing(5)
     .align_y(Alignment::Center)
 }
 
-fn view_environment_value(value: &str) -> iced::widget::Container<'_, Message> {
-    container(
-        scrollable(text(value).size(13)).direction(scrollable::Direction::Horizontal(
-            scrollable::Scrollbar::new()
-                .width(4.0)
-                .spacing(2.0)
-                .scroller_width(4),
-        )),
-    )
-    .padding(8)
-    .style(flat_readonly_style)
+/// 모달 row의 key input에 부여하는 widget id (Tab focus 추적용).
+pub fn env_modal_key_id(index: usize) -> iced::advanced::widget::Id {
+    iced::advanced::widget::Id::from(format!("env-modal-key-{index}"))
 }
 
-fn view_new_environment_row<'a>(
-    env_key_input: &'a str,
-    env_value_input: &'a str,
-) -> iced::widget::Row<'a, Message> {
-    row![
-        editor_input("Key", env_key_input)
-            .on_input(Message::EnvKeyChanged)
-            .width(Length::FillPortion(4)),
-        editor_input("Value", env_value_input)
-            .on_input(Message::EnvValueChanged)
-            .width(Length::FillPortion(6)),
-        icon_button(ICON_ADD, Some(Message::AddEnvironmentVariable)),
-    ]
-    .spacing(4)
-    .align_y(Alignment::Center)
+/// 모달 row의 value input에 부여하는 widget id.
+pub fn env_modal_value_id(index: usize) -> iced::advanced::widget::Id {
+    iced::advanced::widget::Id::from(format!("env-modal-value-{index}"))
+}
+
+fn text_input_warn_style(theme: &Theme, status: text_input::Status) -> text_input::Style {
+    let base = text_input::default(theme, status);
+    text_input::Style {
+        border: Border {
+            color: Color::from_rgb(0.95, 0.65, 0.20),
+            width: 1.0,
+            ..base.border
+        },
+        ..base
+    }
+}
+
+fn modal_backdrop_style(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(Color::from_rgba(0.0, 0.0, 0.0, 0.5))),
+        ..Default::default()
+    }
+}
+
+fn modal_dialog_style(theme: &Theme) -> container::Style {
+    let palette = theme.extended_palette();
+    container::Style {
+        background: Some(Background::Color(palette.background.weak.color)),
+        border: Border {
+            radius: 8.0.into(),
+            width: 1.0,
+            color: Color {
+                a: 0.18,
+                ..palette.background.base.text
+            },
+        },
+        ..Default::default()
+    }
+}
+
+fn modal_primary_button_style(theme: &Theme, status: button::Status) -> button::Style {
+    let palette = theme.extended_palette();
+    let base = palette.primary.base;
+    let bg = match status {
+        button::Status::Hovered => palette.primary.strong.color,
+        button::Status::Pressed => palette.primary.weak.color,
+        _ => base.color,
+    };
+    button::Style {
+        background: Some(Background::Color(bg)),
+        text_color: base.text,
+        border: Border {
+            radius: 4.0.into(),
+            ..Default::default()
+        },
+        ..button::Style::default()
+    }
+}
+
+fn modal_secondary_button_style(theme: &Theme, status: button::Status) -> button::Style {
+    let palette = theme.extended_palette();
+    let bg = match status {
+        button::Status::Hovered => Color {
+            a: 0.10,
+            ..palette.background.base.text
+        },
+        _ => Color::TRANSPARENT,
+    };
+    button::Style {
+        background: Some(Background::Color(bg)),
+        text_color: palette.background.base.text,
+        border: Border {
+            radius: 4.0.into(),
+            width: 1.0,
+            color: Color {
+                a: 0.20,
+                ..palette.background.base.text
+            },
+        },
+        ..button::Style::default()
+    }
 }
 
 fn icon_button(
