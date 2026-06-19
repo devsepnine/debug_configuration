@@ -1,5 +1,6 @@
 use serde_json::Value;
 use std::path::{Path, PathBuf};
+use unicode_width::UnicodeWidthChar;
 
 /// SVG 아이콘을 바이너리에 embed
 ///
@@ -18,6 +19,73 @@ pub const ICON_SESSIONS: &[u8] = include_bytes!("../assets/app--sessions.svg");
 
 // Shared sentinels
 pub const DIALOG_CANCELLED: &str = "cancelled";
+
+/// D2Coding 모노스페이스 폰트의 단일 글자(half-width) advance 너비(픽셀)를 계산.
+///
+/// D2Coding은 고정폭(라틴 half-width) 폰트이므로 라틴 글자 advance가 모두 동일하다.
+/// 표준 너비로 'M' glyph의 advance/units_per_em 비율을 측정하며, 이 값은 폰트 고정이므로
+/// 최초 1회만 파싱하여 `OnceLock`에 캐싱한다(리사이즈마다 재파싱 방지).
+/// 폰트 파싱/측정 실패 시 `font_size * 0.6`로 fallback. 반환값은 항상 1.0 이상.
+pub fn monospace_char_width(font_size: f32) -> f32 {
+    use std::sync::OnceLock;
+
+    /// 'M' advance / units_per_em — 폰트 불변 비율
+    static ADVANCE_RATIO: OnceLock<f32> = OnceLock::new();
+
+    let ratio = *ADVANCE_RATIO.get_or_init(|| {
+        use ttf_parser::Face;
+
+        const FALLBACK_RATIO: f32 = 0.6;
+
+        let Ok(face) = Face::parse(crate::D2CODING_FONT, 0) else {
+            return FALLBACK_RATIO;
+        };
+        let Some(glyph_id) = face.glyph_index('M') else {
+            return FALLBACK_RATIO;
+        };
+        let advance_width = f32::from(face.glyph_hor_advance(glyph_id).unwrap_or(0));
+        let units_per_em = f32::from(face.units_per_em());
+
+        if units_per_em == 0.0 || advance_width == 0.0 {
+            return FALLBACK_RATIO;
+        }
+
+        advance_width / units_per_em
+    });
+
+    (ratio * font_size).max(1.0)
+}
+
+/// 텍스트를 `max_width` 컬럼 이내로 자르고, 잘릴 경우 말줄임표("...")를 붙인다.
+///
+/// `max_width`는 half-width 컬럼 수 단위다. 한글 등 full-width 문자는 2컬럼을 소비하며,
+/// 이는 D2Coding에서 full-width glyph가 half-width의 정확히 2배 너비인 것과 일치한다.
+pub fn truncate_text(name: &str, max_width: usize) -> String {
+    const ELLIPSIS_WIDTH: usize = 3;
+
+    if name
+        .chars()
+        .map(|ch| ch.width().unwrap_or(1))
+        .sum::<usize>()
+        <= max_width
+    {
+        return name.to_owned();
+    }
+
+    let mut truncated = String::new();
+    let mut current_width = 0;
+
+    for ch in name.chars() {
+        let ch_width = ch.width().unwrap_or(1);
+        if current_width + ch_width + ELLIPSIS_WIDTH > max_width {
+            break;
+        }
+        truncated.push(ch);
+        current_width += ch_width;
+    }
+
+    format!("{truncated}...")
+}
 
 // Configuration List
 pub const ICON_PLAY: &[u8] = include_bytes!("../assets/mingcute--play-fill.svg");

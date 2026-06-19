@@ -21,7 +21,7 @@ use iced::{Color, Element, Font, Size, Subscription, Task, Theme, theme, window}
 use messages::Message;
 
 /// D2 Coding 폰트 임베드
-const D2CODING_FONT: &[u8] = include_bytes!("../fonts/D2Coding.ttf");
+pub(crate) const D2CODING_FONT: &[u8] = include_bytes!("../fonts/D2Coding.ttf");
 
 /// D2 Coding 폰트 정의
 pub const D2CODING: Font = Font::with_name("D2Coding");

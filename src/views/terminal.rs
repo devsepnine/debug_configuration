@@ -11,9 +11,6 @@ use uuid::Uuid;
 /// D2 Coding 폰트 사용
 const FONT: iced::Font = crate::D2CODING;
 
-/// D2 Coding 폰트 데이터
-const D2CODING_FONT_DATA: &[u8] = include_bytes!("../../fonts/D2Coding.ttf");
-
 // ============================================================================
 // Constants
 // ============================================================================
@@ -39,7 +36,7 @@ fn get_char_width() -> f32 {
     // 간단한 캐싱: 한 번 계산된 값 재사용
     use std::sync::OnceLock;
     static CHAR_WIDTH: OnceLock<f32> = OnceLock::new();
-    *CHAR_WIDTH.get_or_init(|| TerminalCanvas::calculate_char_width(FONT_SIZE))
+    *CHAR_WIDTH.get_or_init(|| crate::utils::monospace_char_width(FONT_SIZE))
 }
 
 /// 스크롤바 너비 (픽셀)
@@ -308,41 +305,6 @@ impl TerminalCanvas {
         chunks
     }
 
-    // ============================================================================
-    // 폰트 메트릭
-    // ============================================================================
-
-    /// D2 Coding 폰트의 정확한 문자 너비 계산
-    ///
-    /// ttf-parser를 사용하여 폰트 파일에서 직접 glyph 너비를 읽어 픽셀 단위로 변환
-    ///
-    /// # Arguments
-    /// * `font_size` - 폰트 크기 (픽셀)
-    ///
-    /// # Returns
-    /// 실제 문자 너비 (픽셀)
-    fn calculate_char_width(font_size: f32) -> f32 {
-        use ttf_parser::{Face, GlyphId};
-
-        // D2 Coding 폰트 파싱
-        let Ok(face) = Face::parse(D2CODING_FONT_DATA, 0) else {
-            // 파싱 실패 시 기본값 사용 (FONT_SIZE * 0.6)
-            return font_size * 0.6;
-        };
-
-        // 'M' 문자의 glyph ID 찾기 (모노스페이스 폰트의 표준 너비)
-        let glyph_id = face.glyph_index('M').unwrap_or(GlyphId(0));
-
-        // glyph advance width 가져오기 (폰트 유닛)
-        let advance_width = f32::from(face.glyph_hor_advance(glyph_id).unwrap_or(0));
-
-        // 폰트 유닛을 픽셀로 변환
-        // pixels = (advance_width / units_per_em) * font_size
-        let units_per_em = f32::from(face.units_per_em());
-
-        (advance_width / units_per_em) * font_size
-    }
-
     /// 화면 너비에 맞게 줄바꿈했을 때의 총 렌더링 줄 수 계산
     ///
     /// # Arguments
@@ -518,7 +480,7 @@ impl canvas::Program<Message> for TerminalCanvas {
         let mut frame = canvas::Frame::new(renderer, bounds.size());
 
         // D2 Coding 폰트의 정확한 문자 너비 계산
-        let char_width = Self::calculate_char_width(FONT_SIZE);
+        let char_width = crate::utils::monospace_char_width(FONT_SIZE);
 
         let available_width = bounds.width - (HORIZONTAL_PADDING * 2.0);
         let max_chars = Self::calculate_max_chars(available_width, char_width);

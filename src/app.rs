@@ -145,35 +145,70 @@ fn configuration_split_ratio(state: &pane_grid::State<ConfigurationScreenPane>) 
 fn configuration_name_max_width(window_size: Size, split_ratio: f32) -> usize {
     const ROOT_HORIZONTAL_PADDING: f32 = 20.0;
     const PANE_SPACING: f32 = 12.0;
-    const AVERAGE_CHARACTER_WIDTH: f32 = 7.4;
-    const ITEM_HORIZONTAL_PADDING: f32 = 8.0;
-    const SELECTION_BAR_WIDTH: f32 = 2.0;
-    const MOVE_BUTTON_COLUMN_WIDTH: f32 = 12.0;
-    const ITEM_GAP_WIDTH: f32 = 14.0;
-    const ACTION_BUTTONS_WIDTH: f32 = 54.0;
-    const SUMMARY_HORIZONTAL_PADDING: f32 = 16.0;
-    const TYPE_BADGE_WIDTH: f32 = 44.0;
-    const BADGE_NAME_GAP: f32 = 8.0;
+    // 이름 텍스트 폰트 크기 (themed_name_text와 일치해야 함)
+    const NAME_FONT_SIZE: f32 = 14.0;
 
-    let list_reserved_width = ITEM_HORIZONTAL_PADDING
+    // 리스트 아이템에서 이름 텍스트를 제외한 고정 요소들의 실제 너비 합.
+    // 값은 widgets::configuration_list의 실제 위젯 레이아웃과 일치한다.
+    const ITEM_AREA_PADDING: f32 = 8.0; // item container padding [2, 4] 좌우
+    const CONTENT_ROW_SPACING: f32 = 16.0; // content_row spacing(4) × 갭 4개
+    const SELECTION_BAR_WIDTH: f32 = 2.0; // selection_bar 고정 폭
+    const ACTION_BUTTONS_WIDTH: f32 = 72.0; // action button 24px × 3개 (Run/Clone/Delete)
+    const SUMMARY_HORIZONTAL_PADDING: f32 = 16.0; // summary container padding [2, 8] 좌우
+    const TYPE_BADGE_WIDTH: f32 = 44.0; // 타입 배지 최대 폭 (보수적)
+    const BADGE_NAME_GAP: f32 = 8.0; // 배지-이름 사이 Space
+    const SCROLLBAR_WIDTH: f32 = 4.0; // 세로 스크롤바 폭
+
+    let list_reserved_width = ITEM_AREA_PADDING
+        + CONTENT_ROW_SPACING
         + SELECTION_BAR_WIDTH
-        + MOVE_BUTTON_COLUMN_WIDTH
-        + ITEM_GAP_WIDTH
         + ACTION_BUTTONS_WIDTH
         + SUMMARY_HORIZONTAL_PADDING
         + TYPE_BADGE_WIDTH
-        + BADGE_NAME_GAP;
+        + BADGE_NAME_GAP
+        + SCROLLBAR_WIDTH;
 
+    // 이름 텍스트는 D2Coding 모노스페이스로 렌더되므로 측정 폭 = 실제 렌더 폭.
+    // 가변폭 평균 추정과 달리 우측 공백 없이 정확히 잘린다.
+    let char_width = crate::utils::monospace_char_width(NAME_FONT_SIZE);
     let content_width = (window_size.width - ROOT_HORIZONTAL_PADDING).max(600.0);
     let left_pane_width = ((content_width - PANE_SPACING) * split_ratio).max(260.0);
     let title_width = (left_pane_width - list_reserved_width).max(72.0);
 
-    (title_width / AVERAGE_CHARACTER_WIDTH)
-        .floor()
-        .to_string()
-        .parse::<usize>()
-        .unwrap_or(12)
-        .clamp(8, 48)
+    // title_width(>=72)와 char_width(>=1)가 모두 양수이므로 결과는 항상 양수.
+    // 넓은 화면에서는 긴 이름을 더 많이 표시하도록 상한을 두지 않는다.
+    (title_width / char_width).floor() as usize
+}
+
+/// 세션 리스트 항목에서 이름이 차지할 수 있는 최대 너비(half-width 컬럼 수).
+///
+/// 세션 패널은 고정 폭(260px)이므로 윈도우 크기와 무관하다.
+/// 값은 view_session_list_panel / view_session_list_item의 실제 위젯 레이아웃과 일치한다.
+fn session_name_max_width() -> usize {
+    const PANEL_WIDTH: f32 = 260.0;
+    // 이름 텍스트 폰트 크기 (view_session_list_item과 일치해야 함)
+    const NAME_FONT_SIZE: f32 = 12.0;
+
+    const PANEL_PADDING: f32 = 12.0; // panel container padding [8, 6] 좌우
+    const LIST_PADDING: f32 = 12.0; // list column padding [8, 6] 좌우
+    const ITEM_PADDING: f32 = 16.0; // item container padding [8, 8] 좌우
+    const CONTENT_ROW_SPACING: f32 = 16.0; // item_content row spacing(8) × 갭 2개
+    const STATUS_DOT_WIDTH: f32 = 7.0; // 실행 상태 점
+    const ACTION_BUTTONS_WIDTH: f32 = 51.0; // action button 24px × 2개 + spacing(3)
+    const SCROLLBAR_WIDTH: f32 = 6.0; // 세로 스크롤바 width 4 + spacing 2
+
+    let reserved = PANEL_PADDING
+        + LIST_PADDING
+        + ITEM_PADDING
+        + CONTENT_ROW_SPACING
+        + STATUS_DOT_WIDTH
+        + ACTION_BUTTONS_WIDTH
+        + SCROLLBAR_WIDTH;
+
+    let char_width = crate::utils::monospace_char_width(NAME_FONT_SIZE);
+    let title_width = (PANEL_WIDTH - reserved).max(48.0);
+
+    (title_width / char_width).floor() as usize
 }
 
 /// 애플리케이션의 메인 상태를 관리하는 구조체
@@ -2843,6 +2878,7 @@ impl RunConfigManager {
                     .style(session_empty_state_style),
             );
         } else {
+            let name_max_width = session_name_max_width();
             for (index, session) in self.sessions.iter().enumerate() {
                 let is_open_in_workspace =
                     current_tab.is_some_and(|tab| tab.contains_session(session.id));
@@ -2853,6 +2889,7 @@ impl RunConfigManager {
                     session,
                     is_open_in_workspace,
                     is_hovered,
+                    name_max_width,
                 ));
             }
         }
@@ -2879,19 +2916,42 @@ impl RunConfigManager {
         session: &RunSession,
         is_open_in_workspace: bool,
         is_hovered: bool,
+        name_max_width: usize,
     ) -> Element<'_, Message> {
-        let title = text(&session.config_name)
-            .size(12)
+        let display_name = crate::utils::truncate_text(&session.config_name, name_max_width);
+
+        // 툴팁 박스 폭을 이름 영역 폭과 맞춰 좌측 가장자리를 이름 시작점에 정렬한다.
+        // title 텍스트의 size(12)와 동일한 폰트 크기로 폭을 계산하고 툴팁도 같은 크기로 렌더한다.
+        const NAME_FONT_SIZE: f32 = 12.0;
+        let tooltip_width = name_max_width as f32 * crate::utils::monospace_char_width(NAME_FONT_SIZE);
+
+        let title = text(display_name)
+            .font(crate::D2CODING)
+            .size(NAME_FONT_SIZE)
             .wrapping(text::Wrapping::None);
+
+        let title_area: Element<'_, Message> = container(title)
+            .width(Length::Fill)
+            .center_y(Length::Shrink)
+            .into();
+
+        let title_with_tooltip = tooltip(
+            title_area,
+            crate::widgets::configuration_list::view_name_tooltip(
+                &session.config_name,
+                tooltip_width,
+                NAME_FONT_SIZE,
+            ),
+            tooltip::Position::Top,
+        )
+        .gap(4);
 
         let item_content = row![
             container(Space::new())
                 .width(7)
                 .height(7)
                 .style(move |theme: &Theme| session_list_status_dot_style(theme, session)),
-            container(title)
-                .width(Length::Fill)
-                .center_y(Length::Shrink),
+            title_with_tooltip,
             row![
                 Self::view_session_action_button(
                     "Stop session",

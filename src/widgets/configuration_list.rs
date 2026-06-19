@@ -1,16 +1,15 @@
 use crate::messages::{ConfigurationDropPosition, Message};
 use crate::models::{ConfigurationType, RunConfiguration};
-use crate::utils::{ICON_COPY, ICON_DELETE, ICON_PLAY};
+use crate::utils::{ICON_COPY, ICON_DELETE, ICON_PLAY, truncate_text};
 use iced::{
     Alignment::{self},
-    Background, Border, Color, Element, Length, Padding, Theme,
+    Background, Border, Color, Element, Length, Padding, Shadow, Theme, Vector,
     alignment::Horizontal,
     widget::text::Wrapping,
     widget::{
         Column, Space, button, column, container, mouse_area, row, scrollable, svg, text, tooltip,
     },
 };
-use unicode_width::UnicodeWidthChar;
 
 const LIST_ITEM_CONTENT_HEIGHT: f32 = 32.0;
 const LIST_ITEM_HEIGHT: f32 = 36.0;
@@ -266,13 +265,29 @@ fn view_configuration_summary(
 ) -> Element<'_, Message> {
     let display_name = truncate_text(&config.name, name_max_width);
 
-    let summary = container(
+    // 툴팁 박스 폭을 이름 영역 폭과 맞춰, 중앙 정렬 overlay의 좌측 가장자리가
+    // 이름 시작점과 정렬되도록 한다 (iced tooltip은 anchor 중앙 정렬만 지원).
+    // themed_name_text의 size(14)와 동일한 폰트 크기로 폭을 계산해야 정확하다.
+    const NAME_FONT_SIZE: f32 = 14.0;
+    let tooltip_width = name_max_width as f32 * crate::utils::monospace_char_width(NAME_FONT_SIZE);
+
+    let name_area: Element<'_, Message> = container(themed_name_text(display_name, is_selected))
+        .width(Length::Fill)
+        .center_y(Length::Fill)
+        .into();
+
+    let name_with_tooltip = tooltip(
+        name_area,
+        view_name_tooltip(&config.name, tooltip_width, NAME_FONT_SIZE),
+        tooltip::Position::Top,
+    )
+    .gap(4);
+
+    container(
         row![
             container(type_label(config.config_type.clone(), is_selected)).center_y(Length::Fill),
             Space::new().width(8),
-            container(themed_name_text(display_name, is_selected))
-                .width(Length::Fill)
-                .center_y(Length::Fill),
+            name_with_tooltip,
         ]
         .align_y(Alignment::Center)
         .width(Length::Fill),
@@ -280,41 +295,8 @@ fn view_configuration_summary(
     .width(Length::Fill)
     .height(24)
     .padding([2, 8])
-    .style(move |theme| summary_style(theme, is_selected, is_dragging));
-
-    tooltip(
-        summary,
-        view_name_tooltip(&config.name),
-        tooltip::Position::Top,
-    )
+    .style(move |theme| summary_style(theme, is_selected, is_dragging))
     .into()
-}
-
-fn truncate_text(name: &str, max_width: usize) -> String {
-    const ELLIPSIS_WIDTH: usize = 3;
-
-    if name
-        .chars()
-        .map(|ch| ch.width().unwrap_or(1))
-        .sum::<usize>()
-        <= max_width
-    {
-        return name.to_owned();
-    }
-
-    let mut truncated = String::new();
-    let mut current_width = 0;
-
-    for ch in name.chars() {
-        let ch_width = ch.width().unwrap_or(1);
-        if current_width + ch_width + ELLIPSIS_WIDTH > max_width {
-            break;
-        }
-        truncated.push(ch);
-        current_width += ch_width;
-    }
-
-    format!("{truncated}...")
 }
 
 fn type_label(
@@ -352,10 +334,34 @@ fn type_label(
         })
 }
 
-fn view_name_tooltip(name: &str) -> iced::widget::Container<'_, Message> {
-    container(text(name).size(14))
-        .padding(8)
-        .style(name_tooltip_style)
+/// 이름 전체를 보여주는 hover 툴팁. `box_width`는 anchor 이름 영역 폭과 맞춰
+/// 중앙 정렬 overlay의 좌측 가장자리가 이름 시작점과 정렬되게 한다.
+/// 구성 리스트와 세션 리스트가 공유한다.
+pub(crate) fn view_name_tooltip(
+    name: &str,
+    box_width: f32,
+    font_size: f32,
+) -> iced::widget::Container<'_, Message> {
+    // 툴팁 텍스트 시작점을 anchor(이름)의 시작점과 정렬한다.
+    // iced tooltip은 anchor 중앙 정렬만 지원하므로, 박스 폭 W에 대해
+    // 텍스트 시작 x = box.x + PADDING = (anchor.center - W/2) + PADDING.
+    // 이를 anchor.x(= anchor.center - anchor.width/2)와 같게 두면 W = anchor.width + 2*PADDING.
+    // box_width가 anchor(이름 영역) 폭이므로 좌우 padding 합을 더한다.
+    const PADDING: f32 = 8.0;
+    let outer_width = box_width.max(48.0) + 2.0 * PADDING;
+
+    container(
+        text(name)
+            .font(crate::D2CODING)
+            .size(font_size)
+            .align_x(Horizontal::Left)
+            .width(Length::Fill)
+            // 공백 없는 긴 이름도 박스를 벗어나지 않도록 단어 우선, 안 되면 글자 단위로 줄바꿈
+            .wrapping(Wrapping::WordOrGlyph),
+    )
+    .width(Length::Fixed(outer_width))
+    .padding(PADDING)
+    .style(name_tooltip_style)
 }
 
 fn action_button(
@@ -410,6 +416,7 @@ fn selection_bar(
 
 fn themed_name_text(label: String, is_selected: bool) -> iced::widget::Text<'static, Theme> {
     text(label)
+        .font(crate::D2CODING)
         .align_x(Horizontal::Left)
         .width(Length::Fill)
         .size(14)
@@ -438,14 +445,24 @@ fn name_tooltip_style(theme: &Theme) -> container::Style {
     let palette = theme.extended_palette();
 
     container::Style {
-        background: Some(iced::Background::Color(palette.background.base.color)),
+        text_color: Some(palette.background.base.text),
+        // 뒷배경(base)과 구분되도록 더 밝은 surface 색 + 그림자로 떠 있는 느낌을 준다.
+        background: Some(Background::Color(palette.background.strong.color)),
         border: Border {
             width: 1.0,
             color: Color {
-                a: 0.10,
+                a: 0.5,
                 ..palette.background.strong.color
             },
             radius: 4.0.into(),
+        },
+        shadow: Shadow {
+            color: Color {
+                a: 0.45,
+                ..Color::BLACK
+            },
+            offset: Vector::new(0.0, 2.0),
+            blur_radius: 8.0,
         },
         ..Default::default()
     }
