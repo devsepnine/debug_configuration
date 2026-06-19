@@ -34,13 +34,11 @@ pub fn parse_env_string(input: &str) -> Vec<(String, String)> {
 
 /// `HashMap`을 환경변수 문자열로 직렬화. 키는 알파벳 정렬.
 pub fn serialize_env_map(map: &HashMap<String, String>) -> String {
-    let mut keys: Vec<&String> = map.keys().collect();
-    keys.sort();
-    keys.iter()
-        .map(|k| {
-            let value = map.get(*k).map(String::as_str).unwrap_or("");
-            format!("{}={}", k, escape(value))
-        })
+    let mut entries: Vec<(&String, &String)> = map.iter().collect();
+    entries.sort_by(|a, b| a.0.cmp(b.0));
+    entries
+        .iter()
+        .map(|(k, v)| format!("{k}={}", escape(v)))
         .collect::<Vec<_>>()
         .join(";")
 }

@@ -13,31 +13,59 @@ pub struct AppSettings {
     pub configuration_split_ratio: Option<f32>,
 }
 
-/// 앱 설정 파일 경로
-fn get_settings_path() -> PathBuf {
-    let mut path = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-    path.push(".run_config_settings.json");
-    path
+/// 앱 설정 파일 경로. 홈 디렉터리를 찾을 수 없으면 `None`을 반환해 fail-closed한다.
+/// (CWD에 설정을 쓰면 공유/공격자 쓰기 가능 위치에 남을 수 있으므로 현재 디렉터리 폴백 금지.)
+fn settings_path() -> Option<PathBuf> {
+    dirs::home_dir().map(|mut path| {
+        path.push(".run_config_settings.json");
+        path
+    })
 }
 
-/// 앱 설정 로드
+/// 앱 설정 로드. 파일 부재는 조용히 기본값, 읽기/파싱 실패는 로그 후 기본값
+/// (손상된 설정을 조용히 삼키지 않도록 진단 출력).
 pub fn load_settings() -> AppSettings {
-    let path = get_settings_path();
+    let Some(path) = settings_path() else {
+        return AppSettings::default();
+    };
     if !path.exists() {
         return AppSettings::default();
     }
 
-    std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|content| serde_json::from_str(&content).ok())
-        .unwrap_or_default()
+    match std::fs::read_to_string(&path) {
+        Ok(content) => match serde_json::from_str(&content) {
+            Ok(settings) => settings,
+            Err(e) => {
+                eprintln!(
+                    "[Settings] Failed to parse {}: {e}; using defaults",
+                    path.display()
+                );
+                AppSettings::default()
+            }
+        },
+        Err(e) => {
+            eprintln!(
+                "[Settings] Failed to read {}: {e}; using defaults",
+                path.display()
+            );
+            AppSettings::default()
+        }
+    }
 }
 
-/// 앱 설정 저장
+/// 앱 설정 저장. 직렬화/쓰기 실패는 조용히 무시하지 않고 로그로 남긴다.
 pub fn save_settings(settings: &AppSettings) {
-    let path = get_settings_path();
-    if let Ok(json) = serde_json::to_string_pretty(settings) {
-        let _ = std::fs::write(path, json);
+    let Some(path) = settings_path() else {
+        eprintln!("[Settings] No home directory; skipping settings persistence");
+        return;
+    };
+    match serde_json::to_string_pretty(settings) {
+        Ok(json) => {
+            if let Err(e) = std::fs::write(&path, json) {
+                eprintln!("[Settings] Failed to write {}: {e}", path.display());
+            }
+        }
+        Err(e) => eprintln!("[Settings] Failed to serialize settings: {e}"),
     }
 }
 

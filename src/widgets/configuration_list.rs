@@ -285,7 +285,7 @@ fn view_configuration_summary(
 
     container(
         row![
-            container(type_label(config.config_type.clone(), is_selected)).center_y(Length::Fill),
+            container(type_label(config.config_type(), is_selected)).center_y(Length::Fill),
             Space::new().width(8),
             name_with_tooltip,
         ]

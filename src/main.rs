@@ -29,10 +29,13 @@ pub const D2CODING: Font = Font::with_name("D2Coding");
 /// 애플리케이션 진입점
 fn main() -> iced::Result {
     // 시그널 핸들러 등록: Ctrl+C, SIGINT, SIGTERM 캐치
-    // 시그널 수신 시 std::process::exit(0) 호출 → Drop trait 실행 → 프로세스 정리
+    // std::process::exit(0)는 Drop을 실행하지 않으므로(스택 unwind 없음), 시그널 핸들러가
+    // 직접 자식 프로세스를 정리해야 한다. RunConfigManager에는 접근할 수 없으므로 전역 PID
+    // 레지스트리를 통해 실행 중인 모든 프로세스 트리를 강제 종료한 뒤 종료한다.
     ctrlc::set_handler(move || {
         eprintln!("\n[Signal] Termination signal received (Ctrl+C / SIGTERM)");
-        eprintln!("[Signal] Initiating graceful shutdown...");
+        eprintln!("[Signal] Killing child processes and exiting...");
+        services::kill_all_running_processes();
         std::process::exit(0);
     })
     .expect("Failed to set signal handler");

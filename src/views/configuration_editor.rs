@@ -159,13 +159,13 @@ pub fn view_configuration_editor<'a>(
     let mut basics = column![
         view_name_row(&config.name),
         Space::new().height(12),
-        view_type_row(&config.config_type, select_state),
+        view_type_row(config.config_type(), select_state),
         Space::new().height(12),
         type_specific_fields,
     ]
     .width(Length::Fill);
 
-    if !matches!(config.config_type, ConfigurationType::Node) {
+    if !matches!(config.config_type(), ConfigurationType::Node) {
         basics = basics
             .push(Space::new().height(12))
             .push(view_working_directory_row(
@@ -291,7 +291,7 @@ fn editor_input<'a>(placeholder: &'a str, value: &'a str) -> iced::widget::TextI
 fn editor_combo_box<'a, T, MessageFn>(
     state: &'a combo_box::State<T>,
     placeholder: &'a str,
-    selected: Option<&'a T>,
+    selected: Option<&T>,
     on_selected: MessageFn,
 ) -> iced::widget::ComboBox<'a, T, Message, Theme>
 where
@@ -386,16 +386,16 @@ fn view_name_row(name: &str) -> iced::widget::Row<'_, Message> {
     )
 }
 
-fn view_type_row<'a>(
-    config_type: &'a ConfigurationType,
-    select_state: &'a EditorSelectState,
-) -> iced::widget::Row<'a, Message> {
+fn view_type_row(
+    config_type: ConfigurationType,
+    select_state: &EditorSelectState,
+) -> iced::widget::Row<'_, Message> {
     view_editor_row(
         "Type:",
         editor_combo_box(
             &select_state.config_type,
             "Select type",
-            Some(config_type),
+            Some(&config_type),
             Message::TypeChanged,
         )
         .into(),

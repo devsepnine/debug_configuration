@@ -226,21 +226,6 @@ impl LayoutTree {
     }
 }
 
-/// 드롭 존 위치 - 탭 드래그 시 마우스 위치에 따른 분할 방향 결정
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DropZone {
-    /// 상단 영역 - 세로 분할 (위쪽에 새 Pane)
-    Top,
-    /// 하단 영역 - 세로 분할 (아래쪽에 새 Pane)
-    Bottom,
-    /// 좌측 영역 - 가로 분할 (왼쪽에 새 Pane)
-    Left,
-    /// 우측 영역 - 가로 분할 (오른쪽에 새 Pane)
-    Right,
-    /// 중앙 영역 - 탭으로 합치기 (다른 Pane) / 취소 (같은 Pane)
-    Center,
-}
-
 /// Pane - 단일 세션을 표시하는 단위 (Termius 스타일)
 #[derive(Clone, Debug)]
 pub struct Pane {

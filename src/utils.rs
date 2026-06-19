@@ -224,14 +224,27 @@ fn find_package_jsons_recursive(dir: &Path, depth: usize, max_depth: usize) -> V
 
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
+            // entry.file_type()는 심볼릭 링크를 따라가지 않는다(불필요한 stat도 절약).
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+
+            // 심볼릭 링크 디렉터리는 따라가지 않는다: 순환 링크나 외부 대용량 트리(예: '/')로의
+            // 링크가 느린/의도치 않은 스캔을 유발하는 것을 방지.
+            if file_type.is_symlink() {
+                continue;
+            }
+
             let path = entry.path();
 
             // package.json 파일 발견
-            if path.is_file() && path.file_name().is_some_and(|n| n == "package.json") {
-                results.push(path);
+            if file_type.is_file() {
+                if path.file_name().is_some_and(|n| n == "package.json") {
+                    results.push(path);
+                }
             }
             // 하위 디렉토리 재귀 탐색 (제외 목록 확인)
-            else if path.is_dir() {
+            else if file_type.is_dir() {
                 let dir_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
 
                 // 숨김 폴더 또는 제외 목록에 있는 폴더는 스킵
@@ -411,18 +424,71 @@ fn collect_nvm_dir(
 /// # Returns
 /// * 상대 경로 문자열 (예: "./package.json", "packages/app1/package.json")
 pub fn to_relative_path(absolute_path: &Path, project_dir: &Path) -> String {
-    absolute_path
+    let relative = absolute_path
         .strip_prefix(project_dir)
         .ok()
-        .and_then(|p| p.to_str())
-        .map_or_else(
-            || absolute_path.to_string_lossy().to_string(),
-            |path| {
-                if path.is_empty() {
-                    String::from("./package.json")
-                } else {
-                    path.replace('\\', "/")
-                }
-            },
-        )
+        .and_then(|p| p.to_str());
+
+    let raw = match relative {
+        // project_dir == absolute_path (스스로의 package.json)
+        Some("") => return String::from("./package.json"),
+        Some(path) => path.to_string(),
+        // strip_prefix 실패 (다른 드라이브 등): 절대 경로 그대로
+        None => absolute_path.to_string_lossy().to_string(),
+    };
+
+    // 성공/실패 경로 모두 동일하게 구분자 정규화 (Windows 백슬래시 → 슬래시)
+    raw.replace('\\', "/")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncate_text_keeps_short_strings() {
+        assert_eq!(truncate_text("", 10), "");
+        assert_eq!(truncate_text("hello", 10), "hello");
+        assert_eq!(truncate_text("hello", 5), "hello"); // 정확히 max_width면 말줄임 없음
+    }
+
+    #[test]
+    fn truncate_text_appends_ellipsis_reserving_three_columns() {
+        // "hello world"(11컬럼) > 8 → content는 max_width-3=5컬럼까지 → "hello..."
+        assert_eq!(truncate_text("hello world", 8), "hello...");
+    }
+
+    #[test]
+    fn truncate_text_accounts_for_full_width_columns() {
+        // 한글은 2컬럼: "가나다" = 6컬럼
+        assert_eq!(truncate_text("가나다", 10), "가나다");
+        // max 5: "가"(2) 유지, "나" 추가 시 2+2+3=7>5 → "가..."
+        assert_eq!(truncate_text("가나다", 5), "가...");
+    }
+
+    #[test]
+    fn truncate_text_below_ellipsis_width_yields_ellipsis_only() {
+        // max_width < ELLIPSIS_WIDTH(3): 첫 글자부터 break → "..."
+        assert_eq!(truncate_text("hello", 2), "...");
+    }
+
+    #[test]
+    fn to_relative_path_child_uses_forward_slashes() {
+        let project = Path::new("/proj");
+        let abs = project.join("packages").join("app").join("package.json");
+        assert_eq!(to_relative_path(&abs, project), "packages/app/package.json");
+    }
+
+    #[test]
+    fn to_relative_path_self_returns_dot_package_json() {
+        let project = Path::new("/proj");
+        assert_eq!(to_relative_path(project, project), "./package.json");
+    }
+
+    #[test]
+    fn to_relative_path_outside_returns_normalized_absolute() {
+        let project = Path::new("/proj");
+        let abs = Path::new("/other/app/package.json");
+        assert_eq!(to_relative_path(abs, project), "/other/app/package.json");
+    }
 }

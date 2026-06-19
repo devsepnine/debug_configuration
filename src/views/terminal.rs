@@ -159,15 +159,16 @@ impl TerminalCanvas {
 
         // RFC 3986 기반 URL 패턴
         // 금지 문자: whitespace, < > " { } | \ ^ ` (RFC 3986 Section 2.4)
-        let url_pattern =
-            regex::Regex::new(r#"https?://[^\s<>"{}|\\^`]+|localhost:\d+[^\s<>"{}|\\^`]*"#)
-                .unwrap();
+        // Regex 컴파일은 비용이 크므로 최초 1회만 컴파일하여 재사용 (매 view()마다 재컴파일 방지).
+        static URL_PATTERN: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+            regex::Regex::new(r#"https?://[^\s<>"{}|\\^`]+|localhost:\d+[^\s<>"{}|\\^`]*"#).unwrap()
+        });
 
         for (line_idx, segments) in lines.iter().enumerate() {
             // 세그먼트들을 하나의 문자열로 결합
             let line: String = segments.iter().map(|s| s.text.as_str()).collect();
 
-            for mat in url_pattern.find_iter(&line) {
+            for mat in URL_PATTERN.find_iter(&line) {
                 let raw_url = mat.as_str();
 
                 // Trailing punctuation 제거
@@ -852,9 +853,6 @@ impl TerminalCanvas {
         let mut rendered_lines = 0; // 실제 렌더링 카운터 추가
 
         for (line_idx, segments_vec) in self.lines.iter().enumerate() {
-            // 세그먼트들을 문자열로 결합
-            let line: String = segments_vec.iter().map(|s| s.text.as_str()).collect();
-            let line_len = line.chars().count();
             let wrapped_count = Self::calculate_wrapped_count(segments_vec, max_chars);
 
             // 가시성 체크: 완전히 위에 있으면 스킵 (render_lines와 동일)
@@ -867,6 +865,10 @@ impl TerminalCanvas {
             if current_wrapped_line > target_start_line + visible_lines {
                 break;
             }
+
+            // 가시 영역 라인만 문자열로 결합 (스킵된 윗부분 라인은 할당하지 않음)
+            let line: String = segments_vec.iter().map(|s| s.text.as_str()).collect();
+            let line_len = line.chars().count();
 
             // 빈 줄 처리 (render_empty_line과 동일)
             if line_len == 0 {
@@ -1064,9 +1066,6 @@ impl TerminalCanvas {
         let mut rendered_lines = 0;
 
         for (line_idx, segments) in self.lines.iter().enumerate() {
-            // 세그먼트들을 문자열로 결합하여 문자 수 계산
-            let line_text: String = segments.iter().map(|s| s.text.as_str()).collect();
-            let char_count = line_text.chars().count();
             let wrapped_count = Self::calculate_wrapped_count(segments, max_chars);
 
             // 가시성 체크: 완전히 위에 있으면 스킵
@@ -1080,8 +1079,8 @@ impl TerminalCanvas {
                 break;
             }
 
-            // 라인 렌더링
-            if char_count == 0 {
+            // 라인 렌더링 (빈 줄 여부는 String 결합 없이 세그먼트 직접 검사)
+            if segments.iter().all(|s| s.text.is_empty()) {
                 Self::render_empty_line(
                     frame,
                     current_wrapped_line,

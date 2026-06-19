@@ -1,20 +1,18 @@
 use crate::messages::{ConfigurationDropPosition, Message, ViewMode};
 use crate::models::{
-    ConfigTypeData, ConfigurationType, DropZone, ExecuteMode, ExecuteModeType, LayoutId,
-    PackageManager, RunConfiguration, RunSession, WorkspaceTab,
+    ConfigTypeData, ConfigurationType, ExecuteMode, ExecuteModeType, LayoutId, PackageManager,
+    RunConfiguration, RunSession, WorkspaceTab,
 };
 use crate::services::{
-    AppSettings, load_from_path, load_settings, open_configurations, run_configuration_stream,
-    save_configurations, save_settings,
+    AppSettings, load_from_path, load_settings, open_configurations, register_running_pid,
+    run_configuration_stream, save_configurations, save_settings, unregister_running_pid,
 };
 use crate::utils::{DIALOG_CANCELLED, ICON_DELETE, ICON_STOP};
-use crate::views::shared::{
-    IconButtonState, chrome_border_color, icon_button_foreground, icon_button_style, icon_tooltip,
-};
+use crate::views::shared::icon_tooltip;
 use crate::views::{
     EditorLoadingState, EditorSelectState, EnvModalView, FileDialogLoadingState, NodeLoadingState,
-    env_modal_key_id, env_modal_value_id, view_configuration_editor, view_configuration_list,
-    view_env_modal, view_main_tabs, view_pane_layout, view_toolbar, view_workspace_tab_bar,
+    view_configuration_editor, view_configuration_list, view_env_modal, view_main_tabs,
+    view_pane_layout, view_toolbar, view_workspace_tab_bar,
 };
 use crate::widgets::pane_grid;
 use iced::{
@@ -31,6 +29,20 @@ use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::time::{Instant, SystemTime};
 use uuid::Uuid;
+
+mod chrome;
+mod env_modal;
+
+use env_modal::EnvModalState;
+
+use chrome::{
+    SessionActionKind, empty_workspace_content_style, session_action_button_style,
+    session_action_icon_style, session_empty_state_style, session_list_item_container_style,
+    session_list_panel_style, session_list_status_dot_style, status_bar_style,
+    status_bar_top_border_style, window_border_overlay_style, window_chrome_style, window_radius,
+    workspace_content_island_style, workspace_content_surface_style,
+    workspace_tab_bar_island_style,
+};
 
 #[derive(Default)]
 struct FileDialogState {
@@ -52,11 +64,7 @@ struct DragState {
     pending_configuration_origin: Option<iced::Point>,
     dragging_configuration_index: Option<usize>,
     hovered_configuration_target: Option<(usize, ConfigurationDropPosition)>,
-    tab_dragging: Option<(Uuid, pane_grid::Pane)>,
-    hovered_pane: Option<pane_grid::Pane>,
-    last_hovered_pane: Option<pane_grid::Pane>,
-    hovered_drop_zone: Option<(pane_grid::Pane, DropZone)>,
-    hovered_outer_zone: Option<DropZone>,
+    /// 탭 바 hover 추적 (탭 이름 편집 외부클릭 판정에 사용)
     hovered_tab_index: Option<usize>,
     cursor_position: Option<iced::Point>,
     dragging_pane_id: Option<pane_grid::Pane>,
@@ -73,66 +81,10 @@ struct ConfigurationUiState {
     editor_focus_area_active: bool,
 }
 
-/// 환경변수 편집 모달의 staging 상태 (always-inline 패턴).
-///
-/// 모든 row가 항상 편집 가능. 모달 OK 시 entries를 `environment_variables`에 commit
-/// (빈 키 row 제거 + HashMap 변환으로 자동 dedupe). Cancel 시 폐기.
-pub struct EnvModalState {
-    /// 어떤 구성의 모달인지
-    pub config_id: Uuid,
-    /// staging entries (입력 순서 유지). 빈 row는 view에서 자동 표시되며
-    /// 사용자가 빈 row에 타이핑하기 시작하면 entries 끝에 push됨.
-    pub entries: Vec<(String, String)>,
-    /// Tab cycle 추적용 — 현재 focus 가진 cell. 마우스 클릭으로 외부 변경된 경우
-    /// 다음 Tab까지는 stale일 수 있으나 cycle 자체는 항상 모달 내부에 머무름.
-    pub focused_cell: ModalCell,
-}
-
-/// 모달 내부의 한 input cell 위치 (row index + key/value 구분).
-#[derive(Debug, Clone, Copy)]
-pub struct ModalCell {
-    pub row: usize,
-    pub kind: ModalCellKind,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub enum ModalCellKind {
-    Key,
-    Value,
-}
-
-impl ModalCell {
-    /// row * 2 + (Key=0, Value=1). cycle 모듈로 연산용.
-    pub fn linear_index(self) -> usize {
-        self.row * 2
-            + match self.kind {
-                ModalCellKind::Key => 0,
-                ModalCellKind::Value => 1,
-            }
-    }
-
-    /// linear_index의 역변환.
-    pub fn from_linear(linear: usize) -> Self {
-        let row = linear / 2;
-        let kind = if linear.is_multiple_of(2) {
-            ModalCellKind::Key
-        } else {
-            ModalCellKind::Value
-        };
-        Self { row, kind }
-    }
-}
-
 #[derive(Debug, Clone, Copy)]
 enum ConfigurationScreenPane {
     Configurations,
     Editor,
-}
-
-#[derive(Clone, Copy)]
-enum SessionActionKind {
-    Stop,
-    Remove,
 }
 
 fn configuration_split_ratio(state: &pane_grid::State<ConfigurationScreenPane>) -> f32 {
@@ -211,6 +163,77 @@ fn session_name_max_width() -> usize {
     (title_width / char_width).floor() as usize
 }
 
+/// 복제 구성의 유니크한 이름 생성. `{base} (copy)` → `{base} (copy 2)` → ... 순으로
+/// `existing_names`와 충돌하지 않는 첫 이름을 반환한다.
+fn unique_clone_name(base_name: &str, existing_names: &[&str]) -> String {
+    let mut candidate = format!("{base_name} (copy)");
+    let mut suffix = 2;
+    while existing_names.iter().any(|name| *name == candidate) {
+        candidate = format!("{base_name} (copy {suffix})");
+        suffix += 1;
+    }
+    candidate
+}
+
+/// 네이티브 파일/폴더 선택 다이얼로그를 여는 Task 생성 (4개 browse 핸들러 공통).
+/// 취소 시 `DIALOG_CANCELLED` 센티넬을 Err로 반환한다.
+fn pick_path_task(
+    title: &'static str,
+    filter: Option<(&'static str, &'static [&'static str])>,
+    folder: bool,
+    on_done: fn(Result<String, String>) -> Message,
+) -> Task<Message> {
+    Task::perform(
+        async move {
+            let mut dialog = AsyncFileDialog::new().set_title(title);
+            if let Some((name, extensions)) = filter {
+                dialog = dialog.add_filter(name, extensions);
+            }
+            let handle = if folder {
+                dialog.pick_folder().await
+            } else {
+                dialog.pick_file().await
+            };
+            match handle {
+                Some(handle) => Ok(handle.path().to_string_lossy().to_string()),
+                None => Err(String::from(DIALOG_CANCELLED)),
+            }
+        },
+        on_done,
+    )
+}
+
+/// 다이얼로그 결과 에러를 일관된 상태 메시지로 변환. 취소는 `{noun} cancelled`,
+/// 그 외는 `{noun} failed: {error}`.
+fn cancellable_status(error: &str, noun: &str) -> String {
+    if error == DIALOG_CANCELLED {
+        format!("{noun} cancelled")
+    } else {
+        format!("{noun} failed: {error}")
+    }
+}
+
+/// Node 구성에서 (`config_id`, `project_directory`, `working_directory`)를 추출.
+/// Node 타입이 아니거나 `project_directory`가 비어 있으면 `None`.
+fn node_paths(config: &RunConfiguration) -> Option<(Uuid, String, String)> {
+    if let ConfigTypeData::Node {
+        project_directory, ..
+    } = &config.type_data
+    {
+        if project_directory.is_empty() {
+            None
+        } else {
+            Some((
+                config.id,
+                project_directory.clone(),
+                config.working_directory.clone(),
+            ))
+        }
+    } else {
+        None
+    }
+}
+
 /// 애플리케이션의 메인 상태를 관리하는 구조체
 /// Elm Architecture의 Model에 해당
 pub struct RunConfigManager {
@@ -242,9 +265,7 @@ pub struct RunConfigManager {
 
     /// 실행 중인 세션 목록
     sessions: Vec<RunSession>,
-    /// 현재 선택된 세션의 인덱스
-    selected_session_index: Option<usize>,
-    /// 세션 리스트에서 hover 중인 항목
+    /// 세션 리스트에서 hover 중인 항목 (표시용 인덱스)
     hovered_session_index: Option<usize>,
 
     /// 워크스페이스 탭 목록 (각 탭은 독립적인 `pane_grid` 레이아웃을 가짐)
@@ -289,9 +310,8 @@ impl RunConfigManager {
             node_available_package_jsons: HashMap::new(),
             available_node_runtimes: vec![("Default (system)".to_string(), "node".to_string())],
             sessions: vec![],
-            selected_session_index: None,
             hovered_session_index: None,
-            workspace_tabs: vec![WorkspaceTab::empty(String::from("Workspace"))],
+            workspace_tabs: vec![WorkspaceTab::empty(String::from("Workspace 1"))],
             selected_tab_index: 0,
             configuration_layout: pane_grid::State::with_configuration(
                 pane_grid::Configuration::Split {
@@ -436,12 +456,6 @@ impl RunConfigManager {
             | Message::ClosePane(_)
             | Message::TogglePaneMaximize(_)
             | Message::TabBarHovered(_)
-            | Message::PaneHovered(_)
-            | Message::PaneUnhovered(_)
-            | Message::DropZoneHovered(_, _)
-            | Message::DropZoneUnhovered
-            | Message::OuterDropZoneHovered(_)
-            | Message::OuterDropZoneUnhovered
             | Message::MouseReleased
             | Message::WindowOpened(_)
             | Message::WindowResized(_, _)
@@ -547,11 +561,11 @@ impl RunConfigManager {
             Message::RunCompleted(session_id, result) => {
                 self.handle_run_completed(session_id, result)
             }
-            Message::RerunSession(session_index) => self.handle_rerun_session(session_index),
-            Message::StopSession(session_index) => self.handle_stop_session(session_index),
-            Message::RemoveSession(session_index) => self.handle_remove_session(session_index),
-            Message::OpenSessionInWorkspace(session_index) => {
-                self.handle_open_session_in_workspace(session_index)
+            Message::RerunSession(session_id) => self.handle_rerun_session(session_id),
+            Message::StopSession(session_id) => self.handle_stop_session(session_id),
+            Message::RemoveSession(session_id) => self.handle_remove_session(session_id),
+            Message::OpenSessionInWorkspace(session_id) => {
+                self.handle_open_session_in_workspace(session_id)
             }
             Message::SessionListItemHovered(session_index) => {
                 self.hovered_session_index = session_index;
@@ -589,12 +603,6 @@ impl RunConfigManager {
             Message::ClosePane(pane_id) => self.handle_close_pane(pane_id),
             Message::TogglePaneMaximize(pane_id) => self.handle_toggle_pane_maximize(pane_id),
             Message::TabBarHovered(tab_index) => self.handle_tab_bar_hovered(tab_index),
-            Message::PaneHovered(pane_id) => self.handle_pane_hovered(pane_id),
-            Message::PaneUnhovered(pane_id) => self.handle_pane_unhovered(pane_id),
-            Message::DropZoneHovered(pane_id, zone) => self.handle_drop_zone_hovered(pane_id, zone),
-            Message::DropZoneUnhovered => self.handle_drop_zone_unhovered(),
-            Message::OuterDropZoneHovered(zone) => self.handle_outer_drop_zone_hovered(zone),
-            Message::OuterDropZoneUnhovered => self.handle_outer_drop_zone_unhovered(),
             Message::MouseReleased => self.handle_mouse_released(),
             Message::WindowOpened(id) => self.handle_window_opened(id),
             Message::WindowResized(id, size) => self.handle_window_resized(id, size),
@@ -716,14 +724,16 @@ impl RunConfigManager {
     }
 
     fn finish_editing_tab_name(&mut self) -> Task<Message> {
-        if let Some((tab_index, new_name)) = self.tab_ui.editing_tab_name.take()
-            && let Some(tab) = self.workspace_tabs.get_mut(tab_index)
-        {
-            tab.name = if new_name.trim().is_empty() {
-                String::from("Workspace")
+        if let Some((tab_index, new_name)) = self.tab_ui.editing_tab_name.take() {
+            // 빈 이름은 충돌하지 않는 번호 이름으로 대체 (자기 탭은 제외해 원래 번호 재사용)
+            let resolved = if new_name.trim().is_empty() {
+                self.next_workspace_name(Some(tab_index))
             } else {
                 new_name
             };
+            if let Some(tab) = self.workspace_tabs.get_mut(tab_index) {
+                tab.name = resolved;
+            }
         }
 
         Task::none()
@@ -779,30 +789,10 @@ impl RunConfigManager {
     fn select_configuration(&mut self, index: usize) {
         self.selected_config_index = Some(index);
 
-        let load_data = self.configurations.get(index).and_then(|config| {
-            if let ConfigTypeData::Node {
-                project_directory, ..
-            } = &config.type_data
-            {
-                if project_directory.is_empty() {
-                    None
-                } else {
-                    Some((
-                        config.id,
-                        project_directory.clone(),
-                        config.working_directory.clone(),
-                    ))
-                }
-            } else {
-                None
-            }
-        });
-
-        if let Some((config_id, project_dir, working_dir)) = load_data {
-            self.load_node_package_jsons(config_id, &project_dir);
-            if !working_dir.is_empty() {
-                self.load_node_scripts(config_id, &working_dir);
-            }
+        if let Some((config_id, project_dir, working_dir)) =
+            self.configurations.get(index).and_then(node_paths)
+        {
+            self.load_node_metadata(config_id, &project_dir, &working_dir);
         }
 
         self.sync_editor_select_state_for_selected_config();
@@ -825,6 +815,9 @@ impl RunConfigManager {
             let config_id = self.configurations[idx].id;
             self.configurations.remove(idx);
             self.env_bulk_inputs.remove(&config_id);
+            // 구성별 Node 캐시도 함께 제거 (UUID는 재사용되지 않으므로 누수 방지).
+            self.node_available_scripts.remove(&config_id);
+            self.node_available_package_jsons.remove(&config_id);
             if let Some(modal) = &self.env_modal
                 && modal.config_id == config_id
             {
@@ -858,13 +851,12 @@ impl RunConfigManager {
             clone.id = Uuid::new_v4();
 
             // 동일 이름 중복을 피해 유니크한 이름 생성 (무한 " (copy)" 누적 방지)
-            let mut candidate = format!("{base_name} (copy)");
-            let mut suffix = 2;
-            while self.configurations.iter().any(|c| c.name == candidate) {
-                candidate = format!("{base_name} (copy {suffix})");
-                suffix += 1;
-            }
-            clone.name = candidate;
+            let existing_names: Vec<&str> = self
+                .configurations
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect();
+            clone.name = unique_clone_name(&base_name, &existing_names);
 
             // 원본에 스캔되어 있던 Node 스크립트/package.json 캐시를 그대로 전파
             let new_id = clone.id;
@@ -899,7 +891,6 @@ impl RunConfigManager {
             let cancel_flag = session.cancel_flag.clone();
 
             self.sessions.push(session);
-            self.selected_session_index = Some(self.sessions.len() - 1);
 
             self.ensure_workspace_tab();
             if let Some(tab) = self.workspace_tabs.get_mut(self.selected_tab_index) {
@@ -1017,7 +1008,6 @@ impl RunConfigManager {
             );
 
             if let Some(config) = self.configurations.get_mut(index) {
-                config.config_type = config_type.clone();
                 config.type_data = match config_type {
                     ConfigurationType::Application => ConfigTypeData::Application {
                         command: String::new(),
@@ -1049,34 +1039,33 @@ impl RunConfigManager {
     }
 
     fn handle_command_changed(&mut self, command: String) -> Task<Message> {
-        if let Some(config) = self.get_selected_config_mut()
-            && let ConfigTypeData::Application { command: cmd, .. } = &mut config.type_data
+        if let Some(app) = self
+            .selected_type_data_mut()
+            .and_then(ConfigTypeData::application_mut)
         {
-            *cmd = command;
+            *app.command = command;
         }
 
         Task::none()
     }
 
     fn handle_arguments_changed(&mut self, arguments: String) -> Task<Message> {
-        if let Some(config) = self.get_selected_config_mut()
-            && let ConfigTypeData::Application {
-                arguments: args, ..
-            } = &mut config.type_data
+        if let Some(app) = self
+            .selected_type_data_mut()
+            .and_then(ConfigTypeData::application_mut)
         {
-            *args = arguments;
+            *app.arguments = arguments;
         }
 
         Task::none()
     }
 
     fn handle_script_path_changed(&mut self, value: String) -> Task<Message> {
-        if let Some(config) = self.get_selected_config_mut()
-            && let ConfigTypeData::ShellScript {
-                execute_mode: ExecuteMode::ScriptFile { script_path, .. },
-            } = &mut config.type_data
+        if let Some(sf) = self
+            .selected_type_data_mut()
+            .and_then(ConfigTypeData::script_file_mut)
         {
-            *script_path = value;
+            *sf.script_path = value;
         }
 
         Task::none()
@@ -1084,22 +1073,13 @@ impl RunConfigManager {
 
     fn handle_browse_script_path(&mut self) -> Task<Message> {
         self.file_dialog.is_loading_script_file = true;
-
-        Task::perform(
-            async {
-                match AsyncFileDialog::new()
-                    .set_title("Select Script File")
-                    .add_filter(
-                        "Script Files",
-                        &["sh", "bash", "py", "js", "rb", "ps1", "bat", "cmd"],
-                    )
-                    .pick_file()
-                    .await
-                {
-                    Some(handle) => Ok(handle.path().to_string_lossy().to_string()),
-                    None => Err(String::from(DIALOG_CANCELLED)),
-                }
-            },
+        pick_path_task(
+            "Select Script File",
+            Some((
+                "Script Files",
+                &["sh", "bash", "py", "js", "rb", "ps1", "bat", "cmd"],
+            )),
+            false,
             Message::ScriptPathSelected,
         )
     }
@@ -1109,21 +1089,16 @@ impl RunConfigManager {
 
         match result {
             Ok(path) => {
-                if let Some(config) = self.get_selected_config_mut()
-                    && let ConfigTypeData::ShellScript {
-                        execute_mode: ExecuteMode::ScriptFile { script_path, .. },
-                    } = &mut config.type_data
+                if let Some(sf) = self
+                    .selected_type_data_mut()
+                    .and_then(ConfigTypeData::script_file_mut)
                 {
-                    script_path.clone_from(&path);
+                    sf.script_path.clone_from(&path);
                 }
                 self.status_message = format!("Script file selected: {path}");
             }
             Err(error) => {
-                self.status_message = if error == DIALOG_CANCELLED {
-                    String::from("Script file selection cancelled")
-                } else {
-                    format!("Script file selection failed: {error}")
-                };
+                self.status_message = cancellable_status(&error, "Script file selection");
             }
         }
 
@@ -1131,27 +1106,22 @@ impl RunConfigManager {
     }
 
     fn handle_script_options_changed(&mut self, value: String) -> Task<Message> {
-        if let Some(config) = self.get_selected_config_mut()
-            && let ConfigTypeData::ShellScript {
-                execute_mode: ExecuteMode::ScriptFile { script_options, .. },
-            } = &mut config.type_data
+        if let Some(sf) = self
+            .selected_type_data_mut()
+            .and_then(ConfigTypeData::script_file_mut)
         {
-            *script_options = value;
+            *sf.script_options = value;
         }
 
         Task::none()
     }
 
     fn handle_interpreter_path_changed(&mut self, value: String) -> Task<Message> {
-        if let Some(config) = self.get_selected_config_mut()
-            && let ConfigTypeData::ShellScript {
-                execute_mode:
-                    ExecuteMode::ScriptFile {
-                        interpreter_path, ..
-                    },
-            } = &mut config.type_data
+        if let Some(sf) = self
+            .selected_type_data_mut()
+            .and_then(ConfigTypeData::script_file_mut)
         {
-            *interpreter_path = if value.is_empty() { None } else { Some(value) };
+            *sf.interpreter_path = if value.is_empty() { None } else { Some(value) };
         }
 
         Task::none()
@@ -1159,18 +1129,10 @@ impl RunConfigManager {
 
     fn handle_browse_interpreter_path(&mut self) -> Task<Message> {
         self.file_dialog.is_loading_interpreter = true;
-
-        Task::perform(
-            async {
-                match AsyncFileDialog::new()
-                    .set_title("Select Interpreter")
-                    .pick_file()
-                    .await
-                {
-                    Some(handle) => Ok(handle.path().to_string_lossy().to_string()),
-                    None => Err(String::from(DIALOG_CANCELLED)),
-                }
-            },
+        pick_path_task(
+            "Select Interpreter",
+            None,
+            false,
             Message::InterpreterPathSelected,
         )
     }
@@ -1183,24 +1145,16 @@ impl RunConfigManager {
 
         match result {
             Ok(path) => {
-                if let Some(config) = self.get_selected_config_mut()
-                    && let ConfigTypeData::ShellScript {
-                        execute_mode:
-                            ExecuteMode::ScriptFile {
-                                interpreter_path, ..
-                            },
-                    } = &mut config.type_data
+                if let Some(sf) = self
+                    .selected_type_data_mut()
+                    .and_then(ConfigTypeData::script_file_mut)
                 {
-                    *interpreter_path = Some(path.clone());
+                    *sf.interpreter_path = Some(path.clone());
                 }
                 self.status_message = format!("Interpreter selected: {path}");
             }
             Err(error) => {
-                self.status_message = if error == DIALOG_CANCELLED {
-                    String::from("Interpreter selection cancelled")
-                } else {
-                    format!("Interpreter selection failed: {error}")
-                };
+                self.status_message = cancellable_status(&error, "Interpreter selection");
             }
         }
 
@@ -1208,26 +1162,20 @@ impl RunConfigManager {
     }
 
     fn handle_interpreter_options_changed(&mut self, value: String) -> Task<Message> {
-        if let Some(config) = self.get_selected_config_mut()
-            && let ConfigTypeData::ShellScript {
-                execute_mode:
-                    ExecuteMode::ScriptFile {
-                        interpreter_options,
-                        ..
-                    },
-            } = &mut config.type_data
+        if let Some(sf) = self
+            .selected_type_data_mut()
+            .and_then(ConfigTypeData::script_file_mut)
         {
-            *interpreter_options = if value.is_empty() { None } else { Some(value) };
+            *sf.interpreter_options = if value.is_empty() { None } else { Some(value) };
         }
 
         Task::none()
     }
 
     fn handle_script_text_changed(&mut self, value: String) -> Task<Message> {
-        if let Some(config) = self.get_selected_config_mut()
-            && let ConfigTypeData::ShellScript {
-                execute_mode: ExecuteMode::ScriptText { script_text },
-            } = &mut config.type_data
+        if let Some(script_text) = self
+            .selected_type_data_mut()
+            .and_then(ConfigTypeData::script_text_mut)
         {
             *script_text = value;
         }
@@ -1238,18 +1186,10 @@ impl RunConfigManager {
     fn handle_browse_working_directory(&mut self) -> Task<Message> {
         self.file_dialog.is_loading_folder = true;
         self.status_message = String::from("Opening folder dialog...");
-
-        Task::perform(
-            async {
-                match AsyncFileDialog::new()
-                    .set_title("Select Working Directory")
-                    .pick_folder()
-                    .await
-                {
-                    Some(handle) => Ok(handle.path().to_string_lossy().to_string()),
-                    None => Err(String::from(DIALOG_CANCELLED)),
-                }
-            },
+        pick_path_task(
+            "Select Working Directory",
+            None,
+            true,
             Message::WorkingDirectorySelected,
         )
     }
@@ -1268,7 +1208,7 @@ impl RunConfigManager {
                     .map_or((Uuid::new_v4(), false), |config| {
                         (
                             config.id,
-                            matches!(config.config_type, ConfigurationType::Node),
+                            matches!(config.config_type(), ConfigurationType::Node),
                         )
                     });
 
@@ -1285,11 +1225,7 @@ impl RunConfigManager {
                 self.status_message = format!("Working directory set: {path}");
             }
             Err(error) => {
-                self.status_message = if error == DIALOG_CANCELLED {
-                    String::from("Directory selection cancelled")
-                } else {
-                    format!("Directory selection failed: {error}")
-                };
+                self.status_message = cancellable_status(&error, "Directory selection");
             }
         }
 
@@ -1299,18 +1235,10 @@ impl RunConfigManager {
     fn handle_browse_project_directory(&mut self) -> Task<Message> {
         self.node_ui.is_loading_project_directory = true;
         self.status_message = String::from("Opening project directory selection...");
-
-        Task::perform(
-            async {
-                match AsyncFileDialog::new()
-                    .set_title("Select Project Directory")
-                    .pick_folder()
-                    .await
-                {
-                    Some(handle) => Ok(handle.path().to_string_lossy().to_string()),
-                    None => Err(String::from(DIALOG_CANCELLED)),
-                }
-            },
+        pick_path_task(
+            "Select Project Directory",
+            None,
+            true,
             Message::ProjectDirectorySelected,
         )
     }
@@ -1361,7 +1289,7 @@ impl RunConfigManager {
                 );
             }
             Err(error) => {
-                self.status_message = format!("Directory selection cancelled: {error}");
+                self.status_message = cancellable_status(&error, "Project directory selection");
             }
         }
 
@@ -1454,12 +1382,11 @@ impl RunConfigManager {
             .map(|(_, path)| path.clone())
             .unwrap_or(label);
 
-        if let Some(config) = self.get_selected_config_mut()
-            && let ConfigTypeData::Node {
-                node_runtime_path, ..
-            } = &mut config.type_data
+        if let Some(node) = self
+            .selected_type_data_mut()
+            .and_then(ConfigTypeData::node_mut)
         {
-            *node_runtime_path = if actual_path == "node" {
+            *node.node_runtime_path = if actual_path == "node" {
                 None
             } else {
                 Some(actual_path)
@@ -1477,29 +1404,24 @@ impl RunConfigManager {
     }
 
     fn handle_package_manager_changed(&mut self, package_manager: PackageManager) -> Task<Message> {
-        if let Some(config) = self.get_selected_config_mut()
-            && let ConfigTypeData::Node {
-                package_manager: selected_package_manager,
-                ..
-            } = &mut config.type_data
+        if let Some(node) = self
+            .selected_type_data_mut()
+            .and_then(ConfigTypeData::node_mut)
         {
-            *selected_package_manager = package_manager;
+            *node.package_manager = package_manager;
         }
 
         Task::none()
     }
 
     fn handle_node_command_changed(&mut self, cmd: crate::models::NodeCommand) -> Task<Message> {
-        if let Some(config) = self.get_selected_config_mut()
-            && let ConfigTypeData::Node {
-                command,
-                script_name,
-                ..
-            } = &mut config.type_data
+        if let Some(node) = self
+            .selected_type_data_mut()
+            .and_then(ConfigTypeData::node_mut)
         {
-            *command = cmd;
+            *node.command = cmd;
             if !cmd.requires_script() {
-                *script_name = None;
+                *node.script_name = None;
             }
         }
 
@@ -1507,30 +1429,38 @@ impl RunConfigManager {
     }
 
     fn handle_node_script_name_changed(&mut self, name: String) -> Task<Message> {
-        if let Some(config) = self.get_selected_config_mut()
-            && let ConfigTypeData::Node { script_name, .. } = &mut config.type_data
+        if let Some(node) = self
+            .selected_type_data_mut()
+            .and_then(ConfigTypeData::node_mut)
         {
-            *script_name = Some(name);
+            // 빈 문자열은 None으로 정규화해 `npm run ""` 같은 빈 인자 생성을 방지.
+            *node.script_name = if name.trim().is_empty() {
+                None
+            } else {
+                Some(name)
+            };
         }
 
         Task::none()
     }
 
     fn handle_node_arguments_changed(&mut self, value: String) -> Task<Message> {
-        if let Some(config) = self.get_selected_config_mut()
-            && let ConfigTypeData::Node { arguments, .. } = &mut config.type_data
+        if let Some(node) = self
+            .selected_type_data_mut()
+            .and_then(ConfigTypeData::node_mut)
         {
-            *arguments = value;
+            *node.arguments = value;
         }
 
         Task::none()
     }
 
     fn handle_node_options_changed(&mut self, value: String) -> Task<Message> {
-        if let Some(config) = self.get_selected_config_mut()
-            && let ConfigTypeData::Node { node_options, .. } = &mut config.type_data
+        if let Some(node) = self
+            .selected_type_data_mut()
+            .and_then(ConfigTypeData::node_mut)
         {
-            *node_options = value;
+            *node.node_options = value;
         }
 
         Task::none()
@@ -1554,7 +1484,7 @@ impl RunConfigManager {
             .map_or((Uuid::new_v4(), false), |config| {
                 (
                     config.id,
-                    matches!(config.config_type, ConfigurationType::Node),
+                    matches!(config.config_type(), ConfigurationType::Node),
                 )
             });
 
@@ -1579,6 +1509,8 @@ impl RunConfigManager {
             Ok(configs) => {
                 self.configurations = configs;
                 self.env_bulk_inputs.clear();
+                self.node_available_scripts.clear();
+                self.node_available_package_jsons.clear();
                 self.env_modal = None;
                 self.status_message = if let Some(path) = &self.last_file_path {
                     format!("Loaded: {}", path.display())
@@ -1617,11 +1549,7 @@ impl RunConfigManager {
                 self.status_message = format!("Saved: {}", path.display());
             }
             Err(error) => {
-                self.status_message = if error == DIALOG_CANCELLED {
-                    String::from("Save canceled")
-                } else {
-                    format!("Save failed: {error}")
-                };
+                self.status_message = cancellable_status(&error, "Save");
             }
         }
 
@@ -1641,6 +1569,8 @@ impl RunConfigManager {
             Ok((configs, path)) => {
                 self.configurations = configs;
                 self.env_bulk_inputs.clear();
+                self.node_available_scripts.clear();
+                self.node_available_package_jsons.clear();
                 self.env_modal = None;
                 self.selected_config_index = (!self.configurations.is_empty()).then_some(0);
                 self.load_node_metadata_for_current_configurations();
@@ -1650,11 +1580,7 @@ impl RunConfigManager {
                 self.status_message = format!("Opened: {}", path.display());
             }
             Err(error) => {
-                self.status_message = if error == DIALOG_CANCELLED {
-                    String::from("Open canceled")
-                } else {
-                    format!("Open failed: {error}")
-                };
+                self.status_message = cancellable_status(&error, "Open");
             }
         }
 
@@ -1663,227 +1589,18 @@ impl RunConfigManager {
 
     fn load_node_metadata_for_current_configurations(&mut self) {
         for (config_id, project_dir, working_dir) in self.collect_node_config_paths() {
-            self.load_node_package_jsons(config_id, &project_dir);
-            if !working_dir.is_empty() {
-                self.load_node_scripts(config_id, &working_dir);
-            }
+            self.load_node_metadata(config_id, &project_dir, &working_dir);
         }
     }
 
     fn collect_node_config_paths(&self) -> Vec<(Uuid, String, String)> {
-        self.configurations
-            .iter()
-            .filter_map(|config| {
-                if let ConfigTypeData::Node {
-                    project_directory, ..
-                } = &config.type_data
-                {
-                    if project_directory.is_empty() {
-                        None
-                    } else {
-                        Some((
-                            config.id,
-                            project_directory.clone(),
-                            config.working_directory.clone(),
-                        ))
-                    }
-                } else {
-                    None
-                }
-            })
-            .collect()
+        self.configurations.iter().filter_map(node_paths).collect()
     }
 
     fn selected_config_id(&self) -> Option<Uuid> {
         self.selected_config_index
             .and_then(|idx| self.configurations.get(idx))
             .map(|config| config.id)
-    }
-
-    fn handle_env_bulk_input_changed(&mut self, text: String) -> Task<Message> {
-        if let Some(config_id) = self.selected_config_id() {
-            self.env_bulk_inputs.insert(config_id, text);
-        }
-        Task::none()
-    }
-
-    fn handle_env_bulk_input_submitted(&mut self) -> Task<Message> {
-        let Some(index) = self.selected_config_index else {
-            return Task::none();
-        };
-        let Some(config) = self.configurations.get_mut(index) else {
-            return Task::none();
-        };
-        let config_id = config.id;
-        let raw = self
-            .env_bulk_inputs
-            .get(&config_id)
-            .cloned()
-            .unwrap_or_default();
-        let entries = crate::env_string::parse_env_string(&raw);
-        config.environment_variables = entries.into_iter().collect();
-        // raw text는 정렬된 형태로 normalize하여 표시 일관성 유지
-        let normalized = crate::env_string::serialize_env_map(&config.environment_variables);
-        self.env_bulk_inputs.insert(config_id, normalized);
-        Task::none()
-    }
-
-    fn handle_open_env_modal(&mut self) -> Task<Message> {
-        let Some(index) = self.selected_config_index else {
-            return Task::none();
-        };
-        let Some(config) = self.configurations.get(index) else {
-            return Task::none();
-        };
-        let config_id = config.id;
-        // 사용자가 메인 input에 타이핑 후 Enter 누르지 않은 raw text가 남아 있으면
-        // 그 결과를 staging으로 사용 (데이터 손실 방지). 일치하면 environment_variables 그대로.
-        let serialized = crate::env_string::serialize_env_map(&config.environment_variables);
-        let raw = self
-            .env_bulk_inputs
-            .get(&config_id)
-            .cloned()
-            .unwrap_or_default();
-        let mut entries: Vec<(String, String)> = if raw == serialized {
-            config
-                .environment_variables
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect()
-        } else {
-            crate::env_string::parse_env_string(&raw)
-        };
-        entries.sort_by(|a, b| a.0.cmp(&b.0));
-        self.env_modal = Some(EnvModalState {
-            config_id,
-            entries,
-            focused_cell: ModalCell {
-                row: 0,
-                kind: ModalCellKind::Key,
-            },
-        });
-        // 모달 열림과 동시에 첫 row(idx=0)의 key input에 focus.
-        // entries가 비었어도 placeholder row가 idx=0이라 동일하게 동작.
-        iced::widget::operation::focus(env_modal_key_id(0))
-    }
-
-    fn handle_confirm_env_modal(&mut self) -> Task<Message> {
-        let Some(modal) = self.env_modal.take() else {
-            return Task::none();
-        };
-        let Some(config) = self
-            .configurations
-            .iter_mut()
-            .find(|c| c.id == modal.config_id)
-        else {
-            return Task::none();
-        };
-        // 빈 키 row 제거 + HashMap 변환으로 중복 키 자동 dedupe (마지막 값 우선)
-        config.environment_variables = modal
-            .entries
-            .into_iter()
-            .filter(|(k, _)| !k.trim().is_empty())
-            .map(|(k, v)| (k.trim().to_string(), v))
-            .collect();
-        let normalized = crate::env_string::serialize_env_map(&config.environment_variables);
-        self.env_bulk_inputs.insert(modal.config_id, normalized);
-        Task::none()
-    }
-
-    fn handle_cancel_env_modal(&mut self) -> Task<Message> {
-        self.env_modal = None;
-        Task::none()
-    }
-
-    fn handle_env_modal_row_key_changed(&mut self, index: usize, key: String) -> Task<Message> {
-        let Some(modal) = self.env_modal.as_mut() else {
-            return Task::none();
-        };
-        Self::set_modal_row(&mut modal.entries, index, Some(key), None);
-        Task::none()
-    }
-
-    fn handle_env_modal_row_value_changed(&mut self, index: usize, value: String) -> Task<Message> {
-        let Some(modal) = self.env_modal.as_mut() else {
-            return Task::none();
-        };
-        Self::set_modal_row(&mut modal.entries, index, None, Some(value));
-        Task::none()
-    }
-
-    fn handle_env_modal_duplicate_entry(&mut self, index: usize) -> Task<Message> {
-        if let Some(modal) = self.env_modal.as_mut()
-            && let Some((key, value)) = modal.entries.get(index)
-        {
-            // 동일 (key, value)를 원본 바로 다음 위치에 insert.
-            // 같은 키가 둘이 되어 자연스럽게 중복 경고가 떠 사용자에게 키 변경을 유도.
-            let cloned = (key.clone(), value.clone());
-            modal.entries.insert(index + 1, cloned);
-        }
-        Task::none()
-    }
-
-    fn handle_env_modal_remove_entry(&mut self, index: usize) -> Task<Message> {
-        let Some(modal) = self.env_modal.as_mut() else {
-            return Task::none();
-        };
-        if index >= modal.entries.len() {
-            return Task::none();
-        }
-        modal.entries.remove(index);
-        // remove 후 focused_cell이 row 수보다 커지지 않도록 clamp + 명시적 focus 이동.
-        // (위젯 id 재할당으로 stale focus가 다른 데이터에 머무는 것 방지)
-        let last_row = modal.entries.len(); // placeholder row index
-        if modal.focused_cell.row > last_row {
-            modal.focused_cell.row = last_row;
-        }
-        modal.focused_cell.kind = ModalCellKind::Key;
-        Self::focus_modal_cell_task(modal.focused_cell)
-    }
-
-    /// Tab/Shift+Tab 처리: focused_cell을 modal 내부에서만 cycle.
-    /// `(entries.len() + 1) * 2` 개 cell을 모듈로 순회한다 (+1은 placeholder row).
-    /// `total_cells`는 항상 ≥ 2 이므로 0-검사는 불필요.
-    fn handle_env_modal_focus_shift(&mut self, backward: bool) -> Task<Message> {
-        let Some(modal) = self.env_modal.as_mut() else {
-            return Task::none();
-        };
-        let total_cells = (modal.entries.len() + 1) * 2;
-        let current = modal.focused_cell.linear_index().min(total_cells - 1);
-        let next = if backward {
-            (current + total_cells - 1) % total_cells
-        } else {
-            (current + 1) % total_cells
-        };
-        modal.focused_cell = ModalCell::from_linear(next);
-        Self::focus_modal_cell_task(modal.focused_cell)
-    }
-
-    fn focus_modal_cell_task(cell: ModalCell) -> Task<Message> {
-        let id = match cell.kind {
-            ModalCellKind::Key => env_modal_key_id(cell.row),
-            ModalCellKind::Value => env_modal_value_id(cell.row),
-        };
-        iced::widget::operation::focus(id)
-    }
-
-    /// row index 위치에 key/value를 부분 업데이트. index가 entries 범위 밖이면
-    /// 빈 entry를 push하여 auto-grow.
-    fn set_modal_row(
-        entries: &mut Vec<(String, String)>,
-        index: usize,
-        key: Option<String>,
-        value: Option<String>,
-    ) {
-        while entries.len() <= index {
-            entries.push((String::new(), String::new()));
-        }
-        if let Some(k) = key {
-            entries[index].0 = k;
-        }
-        if let Some(v) = value {
-            entries[index].1 = v;
-        }
     }
 
     fn handle_move_editor_focus(backward: bool) -> Task<Message> {
@@ -1903,11 +1620,10 @@ impl RunConfigManager {
     }
 
     fn handle_process_started(&mut self, session_id: Uuid, pid: u32) -> Task<Message> {
-        if let Some(session) = self
-            .sessions
-            .iter_mut()
-            .find(|session| session.id == session_id)
-        {
+        // 시그널 핸들러(Ctrl+C)가 정리할 수 있도록 전역 레지스트리에 등록.
+        register_running_pid(pid);
+
+        if let Some(session) = self.session_by_id_mut(session_id) {
             session.process_pid = Some(pid);
             eprintln!("[Process] Started {} (PID: {})", session.config_name, pid);
         }
@@ -1916,11 +1632,7 @@ impl RunConfigManager {
     }
 
     fn handle_output_received(&mut self, session_id: Uuid, output: &str) -> Task<Message> {
-        if let Some(session) = self
-            .sessions
-            .iter_mut()
-            .find(|session| session.id == session_id)
-        {
+        if let Some(session) = self.session_by_id_mut(session_id) {
             for line in output.lines() {
                 session.add_output_line(line);
             }
@@ -1938,12 +1650,12 @@ impl RunConfigManager {
         session_id: Uuid,
         result: Result<i32, String>,
     ) -> Task<Message> {
-        if let Some(session) = self
-            .sessions
-            .iter_mut()
-            .find(|session| session.id == session_id)
-        {
+        if let Some(session) = self.session_by_id_mut(session_id) {
             session.is_running = false;
+            // PID 추적 해제 + 세션에서도 제거 (Windows PID 재사용으로 인한 오인 kill 방지).
+            if let Some(pid) = session.process_pid.take() {
+                unregister_running_pid(pid);
+            }
             match result {
                 Ok(code) => {
                     session.exit_code = Some(code);
@@ -1967,11 +1679,7 @@ impl RunConfigManager {
     }
 
     fn handle_session_scroll_changed(&mut self, session_id: Uuid, progress: f32) -> Task<Message> {
-        if let Some(session) = self
-            .sessions
-            .iter_mut()
-            .find(|session| session.id == session_id)
-        {
+        if let Some(session) = self.session_by_id_mut(session_id) {
             let clamped_progress = progress.clamp(0.0, 1.0);
             session.scroll_progress = clamped_progress;
             session.auto_scroll = clamped_progress >= 0.99;
@@ -1981,11 +1689,7 @@ impl RunConfigManager {
     }
 
     fn handle_toggle_auto_scroll(&mut self, session_id: Uuid) -> Task<Message> {
-        if let Some(session) = self
-            .sessions
-            .iter_mut()
-            .find(|session| session.id == session_id)
-        {
+        if let Some(session) = self.session_by_id_mut(session_id) {
             session.auto_scroll = !session.auto_scroll;
             if session.auto_scroll {
                 session.scroll_progress = 1.0;
@@ -2034,12 +1738,6 @@ impl RunConfigManager {
         Task::none()
     }
 
-    fn estimated_tab_drop_width(tab_name: &str) -> f32 {
-        let char_count = u16::try_from(tab_name.chars().count()).unwrap_or(u16::MAX);
-        let name_width = f32::from(char_count) * 8.0;
-        name_width.max(60.0) + 40.0
-    }
-
     fn handle_cursor_moved(&mut self, position: iced::Point) -> Task<Message> {
         self.drag.cursor_position = Some(position);
 
@@ -2069,71 +1767,7 @@ impl RunConfigManager {
     }
 
     fn handle_tab_bar_hovered(&mut self, tab_index: Option<usize>) -> Task<Message> {
-        eprintln!(
-            "[DnD] TabBarHovered: {:?}, tab_dragging={:?}",
-            tab_index,
-            self.drag.tab_dragging.is_some()
-        );
         self.drag.hovered_tab_index = tab_index;
-        Task::none()
-    }
-
-    fn handle_pane_hovered(&mut self, pane_id: pane_grid::Pane) -> Task<Message> {
-        eprintln!("[DnD] PaneHovered: pane={pane_id:?}");
-        self.drag.hovered_pane = Some(pane_id);
-
-        if self.drag.tab_dragging.is_some() {
-            self.drag.last_hovered_pane = Some(pane_id);
-        }
-
-        Task::none()
-    }
-
-    fn handle_pane_unhovered(&mut self, pane_id: pane_grid::Pane) -> Task<Message> {
-        eprintln!("[DnD] PaneUnhovered: pane={pane_id:?}");
-        if self.drag.hovered_pane == Some(pane_id) {
-            self.drag.hovered_pane = None;
-        }
-
-        Task::none()
-    }
-
-    fn handle_drop_zone_hovered(
-        &mut self,
-        pane_id: pane_grid::Pane,
-        zone: DropZone,
-    ) -> Task<Message> {
-        eprintln!(
-            "[DnD] DropZoneHovered: pane={pane_id:?}, zone={zone:?}, outer_active={:?}",
-            self.drag.hovered_outer_zone
-        );
-
-        if self.drag.hovered_outer_zone.is_none() {
-            self.drag.hovered_drop_zone = Some((pane_id, zone));
-            eprintln!("[DnD]   -> 내부 드랍존 설정됨");
-        } else {
-            eprintln!("[DnD]   -> 외부 활성화 상태, 내부 무시됨");
-        }
-
-        Task::none()
-    }
-
-    fn handle_drop_zone_unhovered(&mut self) -> Task<Message> {
-        eprintln!("[DnD] DropZoneUnhovered");
-        self.drag.hovered_drop_zone = None;
-        Task::none()
-    }
-
-    fn handle_outer_drop_zone_hovered(&mut self, zone: DropZone) -> Task<Message> {
-        eprintln!("[DnD] OuterDropZoneHovered: zone={zone:?}");
-        self.drag.hovered_outer_zone = Some(zone);
-        self.drag.hovered_drop_zone = None;
-        Task::none()
-    }
-
-    fn handle_outer_drop_zone_unhovered(&mut self) -> Task<Message> {
-        eprintln!("[DnD] OuterDropZoneUnhovered");
-        self.drag.hovered_outer_zone = None;
         Task::none()
     }
 
@@ -2163,20 +1797,13 @@ impl RunConfigManager {
         if self.drag.pending_configuration_index.take().is_some() {
             self.drag.pending_configuration_origin = None;
             self.drag.hovered_configuration_target = None;
-            return Task::none();
         }
-
-        self.drag.hovered_drop_zone = None;
-        self.drag.hovered_outer_zone = None;
-        self.drag.last_hovered_pane = None;
-        self.drag.hovered_tab_index = None;
-        self.drag.tab_dragging = None;
 
         Task::none()
     }
 
-    fn handle_rerun_session(&mut self, session_index: usize) -> Task<Message> {
-        if let Some(session) = self.sessions.get_mut(session_index) {
+    fn handle_rerun_session(&mut self, session_id: Uuid) -> Task<Message> {
+        if let Some(session) = self.sessions.iter_mut().find(|s| s.id == session_id) {
             if session.is_running {
                 session.cancel_flag.store(true, Ordering::Relaxed);
                 self.status_message = String::from("Stopping session for restart...");
@@ -2191,6 +1818,11 @@ impl RunConfigManager {
                 session.clear_output();
                 session.is_running = true;
                 session.exit_code = None;
+                // 이전 실행의 PID는 더 이상 이 세션에 속하지 않는다. 새 프로세스가 PID를
+                // 보고하기 전 stale PID가 kill되지 않도록 추적을 해제하고 슬롯을 비운다.
+                if let Some(old_pid) = session.process_pid.take() {
+                    unregister_running_pid(old_pid);
+                }
                 session.started_at = SystemTime::now();
                 session.cancel_flag =
                     std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -2219,7 +1851,6 @@ impl RunConfigManager {
                     }
                 }
 
-                self.selected_session_index = Some(session_index);
                 self.status_message = format!("Rerunning: {}", config.name);
 
                 let config = config.clone();
@@ -2236,8 +1867,8 @@ impl RunConfigManager {
         Task::none()
     }
 
-    fn handle_stop_session(&mut self, session_index: usize) -> Task<Message> {
-        if let Some(session) = self.sessions.get_mut(session_index)
+    fn handle_stop_session(&mut self, session_id: Uuid) -> Task<Message> {
+        if let Some(session) = self.sessions.iter_mut().find(|s| s.id == session_id)
             && session.is_running
         {
             session.cancel_flag.store(true, Ordering::Relaxed);
@@ -2247,33 +1878,34 @@ impl RunConfigManager {
         Task::none()
     }
 
-    fn handle_remove_session(&mut self, session_index: usize) -> Task<Message> {
-        let Some(session) = self.sessions.get(session_index) else {
+    fn handle_remove_session(&mut self, session_id: Uuid) -> Task<Message> {
+        let Some(removed_pos) = self.sessions.iter().position(|s| s.id == session_id) else {
             return Task::none();
         };
 
-        let session_id = session.id;
-        if session.is_running {
+        let session = &self.sessions[removed_pos];
+        let running_pid = if session.is_running {
             session.cancel_flag.store(true, Ordering::Relaxed);
+            session.process_pid
+        } else {
+            None
+        };
+        // 세션 제거 후에는 RunCompleted가 매칭되지 않아 PID가 해제되지 않으므로 여기서 해제.
+        // 실제 종료는 cancel_flag → terminate_and_reap(SIGKILL 에스컬레이션)가 처리한다.
+        if let Some(pid) = running_pid {
+            unregister_running_pid(pid);
         }
 
-        self.sessions.remove(session_index);
+        self.sessions.remove(removed_pos);
         for tab in &mut self.workspace_tabs {
             tab.remove_session(session_id);
         }
 
-        self.selected_session_index = match self.selected_session_index {
-            Some(_) if self.sessions.is_empty() => None,
-            Some(selected) if selected == session_index => {
-                Some(session_index.min(self.sessions.len().saturating_sub(1)))
-            }
-            Some(selected) if selected > session_index => Some(selected - 1),
-            other => other,
-        };
+        // hovered_session_index는 표시용 인덱스(뷰에서 사용)이므로 제거 위치에 맞춰 보정.
         self.hovered_session_index = match self.hovered_session_index {
             Some(_) if self.sessions.is_empty() => None,
-            Some(hovered) if hovered == session_index => None,
-            Some(hovered) if hovered > session_index => Some(hovered - 1),
+            Some(hovered) if hovered == removed_pos => None,
+            Some(hovered) if hovered > removed_pos => Some(hovered - 1),
             other => other,
         };
         self.status_message = String::from("Session removed");
@@ -2281,12 +1913,11 @@ impl RunConfigManager {
         Task::none()
     }
 
-    fn handle_open_session_in_workspace(&mut self, session_index: usize) -> Task<Message> {
-        let Some(session_id) = self.sessions.get(session_index).map(|session| session.id) else {
+    fn handle_open_session_in_workspace(&mut self, session_id: Uuid) -> Task<Message> {
+        if !self.sessions.iter().any(|session| session.id == session_id) {
             return Task::none();
-        };
+        }
 
-        self.selected_session_index = Some(session_index);
         self.ensure_workspace_tab();
 
         let opened = self
@@ -2303,9 +1934,28 @@ impl RunConfigManager {
         Task::none()
     }
 
+    /// 기존 탭과 충돌하지 않는 `Workspace N` 형식의 이름 생성 (가장 작은 빈 번호).
+    /// `exclude`로 지정한 인덱스의 탭은 점유 검사에서 제외한다 — 이름을 비워 확정할 때
+    /// 그 탭이 원래 쓰던 번호를 그대로 되찾도록 하기 위함.
+    fn next_workspace_name(&self, exclude: Option<usize>) -> String {
+        let mut n = 1;
+        loop {
+            let candidate = format!("Workspace {n}");
+            let taken = self
+                .workspace_tabs
+                .iter()
+                .enumerate()
+                .any(|(i, tab)| Some(i) != exclude && tab.name == candidate);
+            if !taken {
+                return candidate;
+            }
+            n += 1;
+        }
+    }
+
     fn handle_add_workspace_tab(&mut self) -> Task<Message> {
-        self.workspace_tabs
-            .push(WorkspaceTab::empty(String::from("Workspace")));
+        let name = self.next_workspace_name(None);
+        self.workspace_tabs.push(WorkspaceTab::empty(name));
         self.selected_tab_index = self.workspace_tabs.len() - 1;
         self.tab_ui.editing_tab_name = None;
         self.status_message = String::from("Workspace added");
@@ -2320,6 +1970,7 @@ impl RunConfigManager {
         if self.workspace_tabs.len() == 1 {
             if let Some(tab) = self.workspace_tabs.get_mut(0) {
                 tab.clear();
+                tab.name = String::from("Workspace 1");
             }
             self.selected_tab_index = 0;
             self.tab_ui.editing_tab_name = None;
@@ -2378,8 +2029,8 @@ impl RunConfigManager {
 
     fn ensure_workspace_tab(&mut self) {
         if self.workspace_tabs.is_empty() {
-            self.workspace_tabs
-                .push(WorkspaceTab::empty(String::from("Workspace")));
+            let name = self.next_workspace_name(None);
+            self.workspace_tabs.push(WorkspaceTab::empty(name));
             self.selected_tab_index = 0;
         } else if self.selected_tab_index >= self.workspace_tabs.len() {
             self.selected_tab_index = self.workspace_tabs.len() - 1;
@@ -2392,10 +2043,31 @@ impl RunConfigManager {
             .and_then(|idx| self.configurations.get_mut(idx))
     }
 
+    /// 현재 선택된 구성의 `type_data` 가변 참조. 타입별 필드 세터의 공통 진입점.
+    fn selected_type_data_mut(&mut self) -> Option<&mut ConfigTypeData> {
+        self.get_selected_config_mut()
+            .map(|config| &mut config.type_data)
+    }
+
     /// 현재 선택된 구성의 불변 참조 가져오기
     fn get_selected_config(&self) -> Option<&RunConfiguration> {
         self.selected_config_index
             .and_then(|idx| self.configurations.get(idx))
+    }
+
+    /// 세션 ID로 가변 세션 조회 (id 기반 핸들러 공통).
+    fn session_by_id_mut(&mut self, session_id: Uuid) -> Option<&mut RunSession> {
+        self.sessions
+            .iter_mut()
+            .find(|session| session.id == session_id)
+    }
+
+    /// Node 구성의 package.json 목록과 스크립트를 함께 로드.
+    fn load_node_metadata(&mut self, config_id: Uuid, project_dir: &str, working_dir: &str) {
+        self.load_node_package_jsons(config_id, project_dir);
+        if !working_dir.is_empty() {
+            self.load_node_scripts(config_id, working_dir);
+        }
     }
 
     /// Node `package.json` 목록 로드 (`project_directory`에서)
@@ -2436,70 +2108,6 @@ impl RunConfigManager {
         }
 
         self.sync_editor_select_state_for_selected_config();
-    }
-
-    /// 탭 바 드롭 오버레이 렌더링 (드래그 중에만 표시)
-    /// 각 탭 위치에 투명한 드롭 존을 배치
-    fn view_tab_bar_drop_overlay(&self) -> Element<'_, Message> {
-        let tab_count = self.workspace_tabs.len();
-        let hovered_tab = self.drag.hovered_tab_index;
-        let highlight_color = Color::from_rgba(0.3, 0.6, 1.0, 0.4); // 파란색 하이라이트
-        let normal_color = Color::TRANSPARENT;
-
-        // 탭 바 높이 (workspace_tabs.rs의 탭 높이와 맞춤)
-        let tab_bar_height: f32 = 40.0;
-
-        // 각 탭에 대한 드롭 존 생성
-        let mut tab_zones = row![].spacing(2).padding(4).align_y(Alignment::Center);
-
-        for tab_index in 0..tab_count {
-            let is_hovered = hovered_tab == Some(tab_index);
-            let is_current = tab_index == self.selected_tab_index;
-
-            // 현재 탭이 아닌 경우에만 하이라이트 표시
-            let bg_color = if is_hovered && !is_current {
-                highlight_color
-            } else {
-                normal_color
-            };
-
-            // 각 탭의 드롭 존 (탭 이름 길이에 따라 동적, 대략적인 너비 사용)
-            let tab_name = &self.workspace_tabs[tab_index].name;
-            let estimated_width = Self::estimated_tab_drop_width(tab_name);
-
-            let zone = mouse_area(
-                container(Space::new())
-                    .style(move |_theme: &Theme| container::Style {
-                        background: Some(iced::Background::Color(bg_color)),
-                        border: Border {
-                            radius: 4.0.into(),
-                            ..Default::default()
-                        },
-                        ..Default::default()
-                    })
-                    .width(Length::Fixed(estimated_width))
-                    .height(Length::Fixed(28.0)),
-            )
-            .on_enter(Message::TabBarHovered(Some(tab_index)))
-            .on_exit(Message::TabBarHovered(None));
-
-            tab_zones = tab_zones.push(zone);
-        }
-
-        // 새 탭 버튼 영역 (드롭하면 새 탭 생성)
-        // (추후 구현 가능)
-
-        // 탭 바 영역 전체를 감싸는 컨테이너 (디버그: 반투명 배경)
-        container(tab_zones)
-            .width(Length::Fill)
-            .height(Length::Fixed(tab_bar_height))
-            .style(|_theme: &Theme| container::Style {
-                background: Some(iced::Background::Color(Color::from_rgba(
-                    1.0, 0.0, 0.0, 0.2,
-                ))),
-                ..Default::default()
-            })
-            .into()
     }
 
     /// 환경변수 메인 input 텍스트 ref. `ensure_selected_env_bulk_input`이 사전에 채워뒀다고 가정.
@@ -2923,7 +2531,8 @@ impl RunConfigManager {
         // 툴팁 박스 폭을 이름 영역 폭과 맞춰 좌측 가장자리를 이름 시작점에 정렬한다.
         // title 텍스트의 size(12)와 동일한 폰트 크기로 폭을 계산하고 툴팁도 같은 크기로 렌더한다.
         const NAME_FONT_SIZE: f32 = 12.0;
-        let tooltip_width = name_max_width as f32 * crate::utils::monospace_char_width(NAME_FONT_SIZE);
+        let tooltip_width =
+            name_max_width as f32 * crate::utils::monospace_char_width(NAME_FONT_SIZE);
 
         let title = text(display_name)
             .font(crate::D2CODING)
@@ -2956,14 +2565,16 @@ impl RunConfigManager {
                 Self::view_session_action_button(
                     "Stop session",
                     ICON_STOP,
-                    session.is_running.then_some(Message::StopSession(index)),
+                    session
+                        .is_running
+                        .then_some(Message::StopSession(session.id)),
                     SessionActionKind::Stop,
                     session.is_running,
                 ),
                 Self::view_session_action_button(
                     "Remove session",
                     ICON_DELETE,
-                    Some(Message::RemoveSession(index)),
+                    Some(Message::RemoveSession(session.id)),
                     SessionActionKind::Remove,
                     true,
                 ),
@@ -2985,7 +2596,7 @@ impl RunConfigManager {
             .interaction(mouse::Interaction::Pointer)
             .on_enter(Message::SessionListItemHovered(Some(index)))
             .on_exit(Message::SessionListItemHovered(None))
-            .on_press(Message::OpenSessionInWorkspace(index))
+            .on_press(Message::OpenSessionInWorkspace(session.id))
             .into()
     }
 
@@ -3129,11 +2740,6 @@ impl RunConfigManager {
                 current_tab.pane_layout.maximized(),
                 self.drag.is_dragging_pane,
                 self.drag.dragging_pane_id,
-                self.drag.tab_dragging,
-                self.drag.hovered_pane,
-                self.drag.hovered_drop_zone,
-                self.drag.hovered_outer_zone,
-                self.workspace_tabs.len(),
             )
         };
 
@@ -3162,18 +2768,7 @@ impl RunConfigManager {
         .height(Length::Fill)
         .into();
 
-        let session_content: Element<'_, Message> = if self.drag.tab_dragging.is_some() {
-            let tab_bar_overlay = self.view_tab_bar_drop_overlay();
-
-            stack![tab_pane_area, tab_bar_overlay]
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .into()
-        } else {
-            tab_pane_area
-        };
-
-        let content = row![self.view_session_list_panel(), session_content]
+        let content = row![self.view_session_list_panel(), tab_pane_area]
             .spacing(10)
             .height(Length::Fill);
 
@@ -3189,17 +2784,6 @@ impl RunConfigManager {
             event::listen_with(|event, _status, _id| match event {
                 Event::Mouse(mouse::Event::CursorMoved { position }) => {
                     Some(Message::CursorMoved(position))
-                }
-                _ => None,
-            })
-        } else {
-            Subscription::none()
-        };
-
-        let release_subscription = if self.drag.tab_dragging.is_some() {
-            event::listen_with(|event, _status, _id| match event {
-                Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
-                    Some(Message::MouseReleased)
                 }
                 _ => None,
             })
@@ -3282,7 +2866,6 @@ impl RunConfigManager {
 
         Subscription::batch([
             cursor_subscription,
-            release_subscription,
             configuration_release_subscription,
             editor_focus_subscription,
             env_modal_keyboard_subscription,
@@ -3338,250 +2921,6 @@ impl RunConfigManager {
         }
 
         layers.width(Length::Fill).height(Length::Fill).into()
-    }
-}
-
-fn window_chrome_style(theme: &Theme) -> container::Style {
-    container::Style {
-        background: Some(Background::Color(
-            theme.extended_palette().background.base.color,
-        )),
-        border: Border {
-            width: 0.0,
-            color: Color::TRANSPARENT,
-            radius: window_radius().into(),
-        },
-        ..container::Style::default()
-    }
-}
-
-fn window_border_overlay_style(theme: &Theme) -> container::Style {
-    container::Style {
-        background: None,
-        border: Border {
-            width: 1.0,
-            color: chrome_border_color(theme),
-            radius: window_radius().into(),
-        },
-        ..container::Style::default()
-    }
-}
-
-fn window_radius() -> f32 {
-    if cfg!(target_os = "windows") {
-        8.0
-    } else {
-        10.0
-    }
-}
-
-fn status_bar_style(theme: &Theme) -> container::Style {
-    container::Style {
-        background: Some(Background::Color(Color {
-            a: 0.32,
-            ..theme.extended_palette().background.base.color
-        })),
-        border: Border {
-            width: 0.0,
-            color: Color::TRANSPARENT,
-            radius: border::Radius::default().bottom(window_radius()),
-        },
-        ..container::Style::default()
-    }
-}
-
-fn status_bar_top_border_style(theme: &Theme) -> container::Style {
-    container::Style {
-        background: Some(Background::Color(chrome_border_color(theme))),
-        ..container::Style::default()
-    }
-}
-
-fn session_list_panel_style(theme: &Theme) -> container::Style {
-    let palette = theme.extended_palette();
-
-    container::Style {
-        background: Some(Background::Color(Color {
-            a: 0.56,
-            ..palette.background.base.color
-        })),
-        border: Border {
-            width: 1.0,
-            color: chrome_border_color(theme),
-            radius: 8.0.into(),
-        },
-        ..container::Style::default()
-    }
-}
-
-fn workspace_tab_bar_island_style(theme: &Theme) -> container::Style {
-    container::Style {
-        background: None,
-        border: Border {
-            width: 1.0,
-            color: chrome_border_color(theme),
-            radius: 8.0.into(),
-        },
-        ..container::Style::default()
-    }
-}
-
-fn workspace_content_island_style(theme: &Theme) -> container::Style {
-    let _ = theme;
-
-    container::Style {
-        background: None,
-        border: Border {
-            width: 0.0,
-            color: Color::TRANSPARENT,
-            radius: 8.0.into(),
-        },
-        ..container::Style::default()
-    }
-}
-
-fn workspace_content_surface_style(theme: &Theme) -> container::Style {
-    let _ = theme;
-
-    container::Style {
-        background: None,
-        border: Border {
-            width: 0.0,
-            color: Color::TRANSPARENT,
-            radius: 8.0.into(),
-        },
-        ..container::Style::default()
-    }
-}
-
-fn empty_workspace_content_style(theme: &Theme) -> container::Style {
-    let palette = theme.extended_palette();
-
-    container::Style {
-        background: Some(Background::Color(Color {
-            a: 0.03,
-            ..palette.background.base.text
-        })),
-        text_color: Some(Color {
-            a: 0.64,
-            ..palette.background.base.text
-        }),
-        border: Border {
-            width: 1.0,
-            color: Color {
-                a: 0.08,
-                ..palette.background.base.text
-            },
-            radius: 8.0.into(),
-        },
-        ..container::Style::default()
-    }
-}
-
-fn session_empty_state_style(theme: &Theme) -> container::Style {
-    container::Style {
-        background: Some(Background::Color(Color {
-            a: 0.04,
-            ..theme.extended_palette().background.base.text
-        })),
-        border: Border {
-            width: 1.0,
-            color: Color {
-                a: 0.08,
-                ..theme.extended_palette().background.base.text
-            },
-            radius: 6.0.into(),
-        },
-        ..container::Style::default()
-    }
-}
-
-fn session_list_item_container_style(
-    theme: &Theme,
-    is_open_in_workspace: bool,
-    is_hovered: bool,
-) -> container::Style {
-    let palette = theme.extended_palette();
-    let background = if is_open_in_workspace {
-        Some(Color {
-            a: 0.14,
-            ..palette.primary.base.color
-        })
-    } else if is_hovered {
-        Some(Color {
-            a: 0.07,
-            ..palette.background.base.text
-        })
-    } else {
-        None
-    };
-    let border_alpha = if is_hovered { 0.08 } else { 0.0 };
-
-    container::Style {
-        background: background.map(Background::Color),
-        text_color: Some(palette.background.base.text),
-        border: Border {
-            width: 1.0,
-            color: Color {
-                a: border_alpha,
-                ..palette.background.base.text
-            },
-            radius: 7.0.into(),
-        },
-        ..container::Style::default()
-    }
-}
-
-fn session_action_button_style(
-    theme: &Theme,
-    status: button::Status,
-    _kind: SessionActionKind,
-    is_active: bool,
-) -> button::Style {
-    let state = if is_active {
-        IconButtonState::Active
-    } else {
-        IconButtonState::Inactive
-    };
-
-    icon_button_style(theme, status, state, 6.0)
-}
-
-fn session_action_icon_style(
-    theme: &Theme,
-    _kind: SessionActionKind,
-    is_active: bool,
-) -> svg::Style {
-    svg::Style {
-        color: Some(if is_active {
-            icon_button_foreground(theme, IconButtonState::Active)
-        } else {
-            icon_button_foreground(theme, IconButtonState::Inactive)
-        }),
-    }
-}
-
-fn session_list_status_dot_style(theme: &Theme, session: &RunSession) -> container::Style {
-    let palette = theme.extended_palette();
-    let (color, alpha) = if session.is_running {
-        (palette.success.base.color, 0.92)
-    } else if let Some(code) = session.exit_code {
-        if code == 0 {
-            (palette.background.base.text, 0.42)
-        } else {
-            (palette.danger.base.color, 0.88)
-        }
-    } else {
-        (palette.background.base.text, 0.24)
-    };
-
-    container::Style {
-        background: Some(Background::Color(Color { a: alpha, ..color })),
-        border: Border {
-            radius: 999.0.into(),
-            ..Border::default()
-        },
-        ..container::Style::default()
     }
 }
 
@@ -3671,5 +3010,198 @@ impl Drop for RunConfigManager {
         }
 
         eprintln!("[Shutdown] Cleanup completed.");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::RunConfiguration;
+
+    fn manager_with_configs(names: &[&str]) -> RunConfigManager {
+        let (mut app, _task) = RunConfigManager::new();
+        app.configurations = names
+            .iter()
+            .map(|name| RunConfiguration {
+                name: (*name).to_string(),
+                ..RunConfiguration::default()
+            })
+            .collect();
+        app.selected_config_index = None;
+        app
+    }
+
+    fn names(app: &RunConfigManager) -> Vec<String> {
+        app.configurations.iter().map(|c| c.name.clone()).collect()
+    }
+
+    #[test]
+    fn unique_clone_name_appends_copy_then_escalates() {
+        assert_eq!(unique_clone_name("App", &["App"]), "App (copy)");
+        assert_eq!(
+            unique_clone_name("App", &["App", "App (copy)"]),
+            "App (copy 2)"
+        );
+        assert_eq!(
+            unique_clone_name("App", &["App", "App (copy)", "App (copy 2)"]),
+            "App (copy 3)"
+        );
+    }
+
+    #[test]
+    fn unique_clone_name_of_a_copy_does_not_collide() {
+        assert_eq!(
+            unique_clone_name("X (copy)", &["X (copy)"]),
+            "X (copy) (copy)"
+        );
+    }
+
+    #[test]
+    fn configuration_drop_index_self_and_adjacent_are_noops() {
+        use ConfigurationDropPosition::{After, Before};
+        // 자기 자신/인접 위치에 드롭하면 from 그대로 (no-op)
+        assert_eq!(RunConfigManager::configuration_drop_index(2, 2, Before), 2);
+        assert_eq!(RunConfigManager::configuration_drop_index(2, 3, Before), 2);
+        assert_eq!(RunConfigManager::configuration_drop_index(2, 2, After), 2);
+    }
+
+    #[test]
+    fn configuration_drop_index_maps_position_to_insertion() {
+        use ConfigurationDropPosition::{After, Before};
+        assert_eq!(RunConfigManager::configuration_drop_index(2, 5, Before), 5);
+        assert_eq!(RunConfigManager::configuration_drop_index(2, 5, After), 6);
+        assert_eq!(RunConfigManager::configuration_drop_index(2, 0, Before), 0);
+    }
+
+    #[test]
+    fn move_configuration_down_reorders_and_tracks_selection() {
+        let mut app = manager_with_configs(&["A", "B", "C", "D"]);
+        app.selected_config_index = Some(0); // 이동되는 항목 선택
+        let final_index = app.move_configuration_to(0, 2);
+        assert_eq!(names(&app), vec!["B", "A", "C", "D"]);
+        assert_eq!(final_index, 1);
+        assert_eq!(app.selected_config_index, Some(1));
+    }
+
+    #[test]
+    fn move_configuration_up_reorders() {
+        let mut app = manager_with_configs(&["A", "B", "C", "D"]);
+        let final_index = app.move_configuration_to(3, 1);
+        assert_eq!(names(&app), vec!["A", "D", "B", "C"]);
+        assert_eq!(final_index, 1);
+    }
+
+    #[test]
+    fn move_configuration_noop_when_from_equals_to() {
+        let mut app = manager_with_configs(&["A", "B", "C"]);
+        let final_index = app.move_configuration_to(1, 1);
+        assert_eq!(names(&app), vec!["A", "B", "C"]);
+        assert_eq!(final_index, 1);
+    }
+
+    #[test]
+    fn move_configuration_shifts_selection_when_crossing() {
+        // selected가 이동 구간을 가로지를 때 인덱스 보정
+        let mut app = manager_with_configs(&["A", "B", "C", "D"]);
+        app.selected_config_index = Some(1); // B 선택
+        app.move_configuration_to(0, 3); // A를 뒤로 이동: from<selected<=target → -1
+        assert_eq!(app.selected_config_index, Some(0));
+    }
+
+    #[test]
+    fn delete_middle_keeps_index_pointing_to_next() {
+        let mut app = manager_with_configs(&["A", "B", "C"]);
+        app.selected_config_index = Some(1);
+        let _ = app.handle_delete_configuration(Some(1));
+        assert_eq!(names(&app), vec!["A", "C"]);
+        assert_eq!(app.selected_config_index, Some(1)); // 이제 C를 가리킴
+    }
+
+    #[test]
+    fn delete_last_clamps_selection() {
+        let mut app = manager_with_configs(&["A", "B"]);
+        app.selected_config_index = Some(1);
+        let _ = app.handle_delete_configuration(Some(1));
+        assert_eq!(names(&app), vec!["A"]);
+        assert_eq!(app.selected_config_index, Some(0));
+    }
+
+    #[test]
+    fn delete_only_config_clears_selection() {
+        let mut app = manager_with_configs(&["A"]);
+        app.selected_config_index = Some(0);
+        let _ = app.handle_delete_configuration(Some(0));
+        assert!(app.configurations.is_empty());
+        assert_eq!(app.selected_config_index, None);
+    }
+
+    fn manager_with_sessions(names: &[&str]) -> (RunConfigManager, Vec<Uuid>) {
+        let (mut app, _task) = RunConfigManager::new();
+        app.sessions = names
+            .iter()
+            .map(|n| RunSession::new((*n).to_string()))
+            .collect();
+        let ids = app.sessions.iter().map(|s| s.id).collect();
+        (app, ids)
+    }
+
+    #[test]
+    fn remove_session_by_id_removes_the_correct_session() {
+        let (mut app, ids) = manager_with_sessions(&["a", "b", "c"]);
+        let _ = app.handle_remove_session(ids[1]);
+        assert_eq!(app.sessions.len(), 2);
+        assert_eq!(app.sessions[0].id, ids[0]);
+        assert_eq!(app.sessions[1].id, ids[2]);
+        assert!(app.sessions.iter().all(|s| s.id != ids[1]));
+    }
+
+    #[test]
+    fn remove_session_unknown_id_is_noop() {
+        let (mut app, _ids) = manager_with_sessions(&["a"]);
+        let _ = app.handle_remove_session(Uuid::new_v4());
+        assert_eq!(app.sessions.len(), 1);
+    }
+
+    #[test]
+    fn remove_session_shifts_hovered_index() {
+        let (mut app, ids) = manager_with_sessions(&["a", "b", "c"]);
+        app.hovered_session_index = Some(2); // "c" hover 중
+        let _ = app.handle_remove_session(ids[0]); // 앞 항목 제거 → hover 인덱스 -1
+        assert_eq!(app.hovered_session_index, Some(1));
+    }
+
+    #[test]
+    fn stop_session_by_id_sets_cancel_flag() {
+        let (mut app, ids) = manager_with_sessions(&["a", "b"]);
+        assert!(!app.sessions[1].cancel_flag.load(Ordering::Relaxed));
+        let _ = app.handle_stop_session(ids[1]);
+        assert!(app.sessions[1].cancel_flag.load(Ordering::Relaxed));
+        // 다른 세션은 영향 없음
+        assert!(!app.sessions[0].cancel_flag.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn next_workspace_name_numbers_and_fills_gaps() {
+        let (mut app, _task) = RunConfigManager::new(); // 초기 탭 "Workspace 1"
+        assert_eq!(app.next_workspace_name(None), "Workspace 2");
+
+        app.workspace_tabs
+            .push(WorkspaceTab::empty(String::from("Workspace 2")));
+        assert_eq!(app.next_workspace_name(None), "Workspace 3");
+
+        // 중간 번호를 비우면 가장 작은 빈 번호를 재사용
+        app.workspace_tabs[0].name = String::from("Renamed");
+        assert_eq!(app.next_workspace_name(None), "Workspace 1");
+    }
+
+    #[test]
+    fn next_workspace_name_excludes_self_so_renamed_tab_reclaims_its_number() {
+        let (mut app, _task) = RunConfigManager::new(); // ["Workspace 1"]
+        app.workspace_tabs
+            .push(WorkspaceTab::empty(String::from("Workspace 2")));
+        // 인덱스 1("Workspace 2")을 제외하면 그 번호가 비어 보여 자기 번호를 재사용
+        assert_eq!(app.next_workspace_name(Some(1)), "Workspace 2");
+        // 제외하지 않으면 다음 빈 번호
+        assert_eq!(app.next_workspace_name(None), "Workspace 3");
     }
 }

@@ -1,5 +1,5 @@
 use crate::models::{
-    ConfigurationType, DropZone, ExecuteModeType, NodeCommand, PackageManager, RunConfiguration,
+    ConfigurationType, ExecuteModeType, NodeCommand, PackageManager, RunConfiguration,
 };
 use crate::widgets::pane_grid;
 use iced::window;
@@ -156,16 +156,16 @@ pub enum Message {
     /// 프로세스 실행 완료 (세션 ID, 종료 코드 또는 에러 메시지)
     RunCompleted(Uuid, Result<i32, String>),
 
-    // 세션 관리 메시지
-    /// 세션 재실행 (`session_index`)
-    RerunSession(usize),
-    /// 실행 중인 세션 중지 (`session_index`)
-    StopSession(usize),
-    /// 세션 종료 및 제거 (`session_index`)
-    RemoveSession(usize),
-    /// 세션을 현재 워크스페이스에서 열기/focus (`session_index`)
-    OpenSessionInWorkspace(usize),
-    /// 세션 리스트 항목 hover 상태 변경
+    // 세션 관리 메시지 (세션은 안정적인 `Uuid`로 식별 — stale 인덱스 방지)
+    /// 세션 재실행 (`session_id`)
+    RerunSession(Uuid),
+    /// 실행 중인 세션 중지 (`session_id`)
+    StopSession(Uuid),
+    /// 세션 종료 및 제거 (`session_id`)
+    RemoveSession(Uuid),
+    /// 세션을 현재 워크스페이스에서 열기/focus (`session_id`)
+    OpenSessionInWorkspace(Uuid),
+    /// 세션 리스트 항목 hover 상태 변경 (표시용 인덱스)
     SessionListItemHovered(Option<usize>),
 
     // 워크스페이스 탭 관리 메시지
@@ -212,20 +212,7 @@ pub enum Message {
     /// URL을 기본 브라우저로 열기
     OpenUrl(String),
 
-    // 탭 드래그 앤 드롭
-    /// Pane 위에 마우스 진입 (드래그 중 hover 추적용)
-    PaneHovered(pane_grid::Pane),
-    /// Pane에서 마우스 이탈
-    PaneUnhovered(pane_grid::Pane),
-    /// 드롭 존 위에 마우스 진입 (`pane_id`, `zone`)
-    DropZoneHovered(pane_grid::Pane, DropZone),
-    /// 드롭 존에서 마우스 이탈
-    DropZoneUnhovered,
-    /// 외부 드롭 존 위에 마우스 진입 (`pane_grid` 바깥 가장자리)
-    OuterDropZoneHovered(DropZone),
-    /// 외부 드롭 존에서 마우스 이탈
-    OuterDropZoneUnhovered,
-    /// 마우스 릴리즈 (드래그 중이면 드롭 완료)
+    /// 마우스 릴리즈 (구성 리스트 드래그 중이면 드롭 완료)
     MouseReleased,
     /// 커서 이동 (`pane_grid` 드래그 중 위치 추적)
     CursorMoved(iced::Point),
