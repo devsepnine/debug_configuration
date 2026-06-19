@@ -28,6 +28,8 @@ pub enum Message {
     AddConfiguration,
     /// 지정된 구성 삭제
     DeleteConfiguration(Option<usize>),
+    /// 지정된 구성 복제 (옵션을 그대로 복사한 새 구성 생성)
+    CloneConfiguration(Option<usize>),
     /// 지정된 구성 실행
     RunConfiguration(Option<usize>),
     /// 구성 리스트 드래그 시작

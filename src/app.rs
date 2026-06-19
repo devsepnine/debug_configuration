@@ -323,6 +323,7 @@ impl RunConfigManager {
             }
             Message::AddConfiguration
             | Message::DeleteConfiguration(_)
+            | Message::CloneConfiguration(_)
             | Message::RunConfiguration(_)
             | Message::StartConfigurationDrag(_)
             | Message::ConfigurationDragHovered(_, _)
@@ -422,6 +423,7 @@ impl RunConfigManager {
         match message {
             Message::AddConfiguration => self.handle_add_configuration(),
             Message::DeleteConfiguration(index_opt) => self.handle_delete_configuration(index_opt),
+            Message::CloneConfiguration(index_opt) => self.handle_clone_configuration(index_opt),
             Message::RunConfiguration(index_opt) => self.handle_run_configuration(index_opt),
             Message::StartConfigurationDrag(index) => self.handle_start_configuration_drag(index),
             Message::ConfigurationDragHovered(index, position) => {
@@ -803,6 +805,46 @@ impl RunConfigManager {
             };
             self.sync_editor_select_state_for_selected_config();
             self.status_message = String::from("Configuration deleted");
+        }
+
+        Task::none()
+    }
+
+    fn handle_clone_configuration(&mut self, index_opt: Option<usize>) -> Task<Message> {
+        let index = index_opt.or(self.selected_config_index);
+
+        if let Some(idx) = index
+            && idx < self.configurations.len()
+        {
+            let source_id = self.configurations[idx].id;
+            let base_name = self.configurations[idx].name.clone();
+
+            let mut clone = self.configurations[idx].clone();
+            clone.id = Uuid::new_v4();
+
+            // 동일 이름 중복을 피해 유니크한 이름 생성 (무한 " (copy)" 누적 방지)
+            let mut candidate = format!("{base_name} (copy)");
+            let mut suffix = 2;
+            while self.configurations.iter().any(|c| c.name == candidate) {
+                candidate = format!("{base_name} (copy {suffix})");
+                suffix += 1;
+            }
+            clone.name = candidate;
+
+            // 원본에 스캔되어 있던 Node 스크립트/package.json 캐시를 그대로 전파
+            let new_id = clone.id;
+            if let Some(scripts) = self.node_available_scripts.get(&source_id).cloned() {
+                self.node_available_scripts.insert(new_id, scripts);
+            }
+            if let Some(pkgs) = self.node_available_package_jsons.get(&source_id).cloned() {
+                self.node_available_package_jsons.insert(new_id, pkgs);
+            }
+
+            let new_idx = idx + 1;
+            self.configurations.insert(new_idx, clone);
+            self.selected_config_index = Some(new_idx);
+            self.sync_editor_select_state_for_selected_config();
+            self.status_message = String::from("Configuration cloned");
         }
 
         Task::none()

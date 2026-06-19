@@ -1,6 +1,6 @@
 use crate::messages::{ConfigurationDropPosition, Message};
 use crate::models::{ConfigurationType, RunConfiguration};
-use crate::utils::{ICON_DELETE, ICON_PLAY};
+use crate::utils::{ICON_COPY, ICON_DELETE, ICON_PLAY};
 use iced::{
     Alignment::{self},
     Background, Border, Color, Element, Length, Padding, Theme,
@@ -93,6 +93,12 @@ fn view_configuration_item(
             16,
             24,
             Message::RunConfiguration(Some(item_state.index)),
+        ),
+        action_button(
+            ICON_COPY,
+            16,
+            24,
+            Message::CloneConfiguration(Some(item_state.index)),
         ),
         action_button(
             ICON_DELETE,
