@@ -33,6 +33,9 @@ pub struct SearchState {
     pub filter: bool,
     /// 현재 매치 순번 (매치 목록 기준 0-based; 매치가 있을 때만 의미)
     pub current: usize,
+    /// 매치 라인의 `output_lines` 위치 인덱스 캐시. 매 프레임 재스캔을 피하려고
+    /// 검색어/출력이 바뀔 때만 `refresh_search_matches`로 갱신한다(뷰는 읽기만).
+    pub matches: Vec<usize>,
 }
 
 /// 실행 세션을 나타내는 구조체
@@ -108,6 +111,25 @@ impl RunSession {
             auto_scroll: true,    // 기본값: 자동 스크롤 활성화
             process_pid: None,
             search: None,
+        }
+    }
+
+    /// 검색 매치 캐시(`search.matches`)를 현재 출력/검색어로 갱신하고 `current`를
+    /// 범위 내로 클램프한다. 출력 추가/검색어 변경 등 상태 변화 시 `update()`에서
+    /// 호출한다. 검색바가 닫혀 있으면(`search` None) no-op.
+    pub fn refresh_search_matches(&mut self) {
+        let Some(query) = self.search.as_ref().map(|s| s.query.clone()) else {
+            return;
+        };
+        let matches = self.search_match_indices(&query);
+        if let Some(search) = self.search.as_mut() {
+            let len = matches.len();
+            search.matches = matches;
+            search.current = if len == 0 {
+                0
+            } else {
+                search.current.min(len - 1)
+            };
         }
     }
 

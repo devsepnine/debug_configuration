@@ -1592,12 +1592,9 @@ fn prepare_lines(session: &RunSession) -> (Vec<Vec<crate::ansi::TextSegment>>, V
     let active = search.is_some() && !query.is_empty();
     let filter = search.is_some_and(|s| s.filter);
 
-    // 매치 위치 인덱스 + 현재 매치 인덱스 (검색 활성 시에만).
-    let matches: Vec<usize> = if active {
-        session.search_match_indices(query)
-    } else {
-        Vec::new()
-    };
+    // 매치 위치 인덱스는 app의 update에서 갱신된 캐시(search.matches)를 읽는다
+    // (매 프레임 재스캔 방지). 빈 검색어면 캐시도 비어 있다.
+    let matches: &[usize] = search.map_or(&[], |s| s.matches.as_slice());
     let match_set: HashSet<usize> = matches.iter().copied().collect();
     let current_output_idx: Option<usize> = if matches.is_empty() {
         None

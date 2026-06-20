@@ -5,14 +5,15 @@ use crate::utils::{
     ICON_REFRESH, ICON_SEARCH, ICON_STOP,
 };
 use crate::views::shared::{
-    IconButtonState, icon_button_foreground, icon_button_style, session_search_input_id,
+    IconButtonState, icon_button_foreground, icon_button_style, icon_tooltip,
+    session_search_input_id,
 };
 use crate::views::terminal::view_terminal_for_session;
 use crate::widgets::pane_grid;
 use iced::widget::Space;
 use iced::{
     Alignment, Background, Border, Color, Element, Length, Theme, border,
-    widget::{button, column, container, row, svg, text, text_input},
+    widget::{button, column, container, row, svg, text, text_input, tooltip},
 };
 
 const CONTROL_ICON_SIZE: f32 = 14.0;
@@ -398,7 +399,8 @@ fn view_session_search_bar(session: &RunSession) -> Element<'_, Message> {
         .expect("view_session_search_bar requires search state");
     let session_id = session.id;
 
-    let total = session.search_match_indices(&search.query).len();
+    // 캐시된 매치 수 사용 (매 프레임 재스캔 방지; app의 update에서 갱신됨).
+    let total = search.matches.len();
     let count_text = if search.query.is_empty() {
         String::new()
     } else if total == 0 {
@@ -433,21 +435,25 @@ fn view_session_search_bar(session: &RunSession) -> Element<'_, Message> {
     let controls = row![
         glyph_button(
             "<",
+            "Previous match",
             Message::SessionSearchPrev(session_id),
             IconButtonState::Active
         ),
         glyph_button(
             ">",
+            "Next match (Enter)",
             Message::SessionSearchNext(session_id),
             IconButtonState::Active
         ),
         glyph_button(
             "filter",
+            "Show only matching lines",
             Message::ToggleSessionSearchFilter(session_id),
             filter_state
         ),
         glyph_button(
             "x",
+            "Close search (Esc)",
             Message::CloseSessionSearch(session_id),
             IconButtonState::Active
         ),
@@ -471,20 +477,24 @@ fn view_session_search_bar(session: &RunSession) -> Element<'_, Message> {
     .into()
 }
 
-/// 검색바용 작은 텍스트/글리프 버튼 (컨트롤과 동일한 토글 스타일 재사용).
+/// 검색바용 작은 텍스트/글리프 버튼 (컨트롤과 동일한 토글 스타일 + 툴팁).
 fn glyph_button(
     label: &str,
+    tip: &'static str,
     message: Message,
     state: IconButtonState,
-) -> iced::widget::Button<'static, Message> {
+) -> Element<'static, Message> {
     let content = container(text(label.to_string()).size(12))
         .center_x(Length::Shrink)
         .center_y(Length::Fill);
-    button(content)
+    let btn = button(content)
         .padding([2, 7])
         .height(CONTROL_BUTTON_SIZE)
         .style(move |theme: &Theme, status| icon_button_style(theme, status, state, 4.0))
-        .on_press(message)
+        .on_press(message);
+    tooltip(btn, icon_tooltip(tip), tooltip::Position::Top)
+        .gap(4)
+        .into()
 }
 
 fn session_title(

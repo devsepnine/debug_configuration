@@ -1887,6 +1887,11 @@ impl RunConfigManager {
             if session.auto_scroll {
                 session.scroll_progress = 1.0;
             }
+
+            // 출력이 바뀌었으니 검색 매치 캐시 갱신 (검색바 열려 있을 때만).
+            if session.search.is_some() {
+                session.refresh_search_matches();
+            }
         }
 
         Task::none()
@@ -1927,6 +1932,14 @@ impl RunConfigManager {
             }
         }
 
+        // 완료 라인("exited with code")이 추가됐으니 검색 매치 캐시 갱신.
+        // (status_message 대입과 borrow가 겹치지 않도록 별도 lookup으로 수행)
+        if let Some(session) = self.session_by_id_mut(session_id)
+            && session.search.is_some()
+        {
+            session.refresh_search_matches();
+        }
+
         Task::none()
     }
 
@@ -1962,10 +1975,11 @@ impl RunConfigManager {
     }
 
     fn handle_open_session_search(&mut self, session_id: Uuid) -> Task<Message> {
-        if let Some(session) = self.session_by_id_mut(session_id)
-            && session.search.is_none()
-        {
-            session.search = Some(SearchState::default());
+        if let Some(session) = self.session_by_id_mut(session_id) {
+            if session.search.is_none() {
+                session.search = Some(SearchState::default());
+            }
+            session.refresh_search_matches();
         }
         // 검색바 입력에 포커스 (다음 view에서 위젯이 존재)
         iced::widget::operation::focus(crate::views::shared::session_search_input_id(session_id))
@@ -1979,11 +1993,12 @@ impl RunConfigManager {
     }
 
     fn handle_session_search_changed(&mut self, session_id: Uuid, query: String) -> Task<Message> {
-        if let Some(session) = self.session_by_id_mut(session_id)
-            && let Some(search) = session.search.as_mut()
-        {
-            search.query = query;
-            search.current = 0; // 검색어 변경 시 첫 매치부터
+        if let Some(session) = self.session_by_id_mut(session_id) {
+            if let Some(search) = session.search.as_mut() {
+                search.query = query;
+                search.current = 0; // 검색어 변경 시 첫 매치부터
+            }
+            session.refresh_search_matches();
         }
         Task::none()
     }
@@ -1992,6 +2007,8 @@ impl RunConfigManager {
         if let Some(session) = self.session_by_id_mut(session_id)
             && let Some(search) = session.search.as_mut()
         {
+            // 필터 토글은 매치 집합을 바꾸지 않으므로 refresh_search_matches 불필요;
+            // 표시만 바뀌므로 current만 첫 매치로 리셋한다.
             search.filter = !search.filter;
             search.current = 0;
         }
@@ -1999,23 +2016,19 @@ impl RunConfigManager {
     }
 
     /// 다음/이전 매치로 이동(`direction`: +1 다음, -1 이전)하고 해당 라인으로 스크롤.
+    /// 매치는 캐시(`search.matches`)를 사용한다 (키 입력 시점엔 출력 변화가 없어 신선).
     fn handle_session_search_step(&mut self, session_id: Uuid, direction: i32) -> Task<Message> {
         let Some(session) = self.session_by_id_mut(session_id) else {
             return Task::none();
         };
-        let Some(query) = session.search.as_ref().map(|s| s.query.clone()) else {
-            return Task::none();
-        };
-        let matches = session.search_match_indices(&query);
-        if matches.is_empty() {
+        let len = session.search.as_ref().map_or(0, |s| s.matches.len());
+        if len == 0 {
             return Task::none();
         }
-        let len = matches.len();
         let new_current = {
             let Some(search) = session.search.as_mut() else {
                 return Task::none();
             };
-            // 라이브 출력으로 매치 수가 줄었을 수 있으니 스텝 전에 범위로 클램프.
             let base = search.current.min(len - 1);
             search.current = if direction >= 0 {
                 (base + 1) % len
@@ -2026,8 +2039,14 @@ impl RunConfigManager {
         };
         // 매치 라인의 상대 위치로 스크롤하고 자동 스크롤은 해제.
         // 0..=N-1 인덱스를 0.0..=1.0(1.0=맨 아래)로 매핑 (마지막 라인이 정확히 1.0).
+        let Some(line) = session
+            .search
+            .as_ref()
+            .and_then(|s| s.matches.get(new_current).copied())
+        else {
+            return Task::none();
+        };
         let denom = session.output_lines.len().saturating_sub(1).max(1);
-        let line = matches[new_current];
         session.scroll_progress = (line as f32 / denom as f32).clamp(0.0, 1.0);
         session.auto_scroll = false;
         Task::none()
@@ -2173,6 +2192,8 @@ impl RunConfigManager {
                 let new_id = Uuid::new_v4();
                 session.id = new_id;
                 session.clear_output();
+                // 출력이 비워졌으니 검색 매치 캐시도 비운다 (stale 인덱스 방지).
+                session.refresh_search_matches();
                 session.is_running = true;
                 session.exit_code = None;
                 session.finished_at = None;
@@ -3355,19 +3376,29 @@ impl RunConfigManager {
             _ => None,
         });
 
-        // 세션 화면에서 Ctrl/Cmd+F = 검색 열기, ESC = 검색 닫기. 대상 세션은 핸들러가
-        // 해석한다(클로저는 fn 포인터라 self 접근 불가). 모달이 열려 있으면 비활성화해
-        // 모달 ESC 처리와 충돌하지 않게 한다.
-        let session_search_subscription =
-            if matches!(self.current_view, ViewMode::Sessions) && self.env_modal.is_none() {
+        // 세션 화면에서 Ctrl/Cmd+F = 검색 열기. 모달이 열려 있으면 비활성화. 대상
+        // 세션은 핸들러가 해석한다(클로저는 fn 포인터라 self 접근 불가).
+        let sessions_active =
+            matches!(self.current_view, ViewMode::Sessions) && self.env_modal.is_none();
+        let search_open_subscription = if sessions_active {
+            event::listen_with(|event, _status, _id| match event {
+                Event::Keyboard(keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Character(ref c),
+                    modifiers,
+                    ..
+                }) if modifiers.command() && c.as_str() == "f" => {
+                    Some(Message::OpenSearchInActivePane)
+                }
+                _ => None,
+            })
+        } else {
+            Subscription::none()
+        };
+        // ESC = 검색 닫기. 실제로 검색바가 열려 있을 때만 활성화해 다른 ESC 용도와
+        // 충돌하지 않게 한다 (검색이 없으면 ESC를 가로채지 않음).
+        let search_close_subscription =
+            if sessions_active && self.sessions.iter().any(|s| s.search.is_some()) {
                 event::listen_with(|event, _status, _id| match event {
-                    Event::Keyboard(keyboard::Event::KeyPressed {
-                        key: keyboard::Key::Character(ref c),
-                        modifiers,
-                        ..
-                    }) if modifiers.command() && c.as_str() == "f" => {
-                        Some(Message::OpenSearchInActivePane)
-                    }
                     Event::Keyboard(keyboard::Event::KeyPressed {
                         key: keyboard::Key::Named(keyboard::key::Named::Escape),
                         ..
@@ -3385,7 +3416,8 @@ impl RunConfigManager {
             env_modal_keyboard_subscription,
             tab_name_edit_subscription,
             window_focus_subscription,
-            session_search_subscription,
+            search_open_subscription,
+            search_close_subscription,
             window::open_events().map(Message::WindowOpened),
             window::resize_events().map(|(id, size)| Message::WindowResized(id, size)),
         ])
@@ -3763,6 +3795,65 @@ mod tests {
             members.is_empty(),
             "deleted ids must be stripped from members"
         );
+    }
+
+    #[test]
+    fn search_step_cycles_matches_and_scrolls_to_match() {
+        let (mut app, ids) = manager_with_sessions(&["s"]);
+        let sid = ids[0];
+        {
+            let session = &mut app.sessions[0];
+            session.add_output_line("alpha"); // 0
+            session.add_output_line("beta error"); // 1 (match)
+            session.add_output_line("gamma"); // 2
+            session.add_output_line("delta error"); // 3 (match)
+        }
+        let _ = app.handle_open_session_search(sid);
+        let _ = app.handle_session_search_changed(sid, "error".to_string());
+
+        let search = app.sessions[0].search.as_ref().unwrap();
+        assert_eq!(search.matches, vec![1, 3]);
+        assert_eq!(search.current, 0);
+
+        // next: current 0->1, scroll to match line 3 (3 / (4-1) = 1.0), auto_scroll off
+        let _ = app.handle_session_search_step(sid, 1);
+        assert_eq!(app.sessions[0].search.as_ref().unwrap().current, 1);
+        assert!((app.sessions[0].scroll_progress - 1.0).abs() < 1e-6);
+        assert!(!app.sessions[0].auto_scroll);
+
+        // next wraps 1->0, prev wraps 0->1
+        let _ = app.handle_session_search_step(sid, 1);
+        assert_eq!(app.sessions[0].search.as_ref().unwrap().current, 0);
+        let _ = app.handle_session_search_step(sid, -1);
+        assert_eq!(app.sessions[0].search.as_ref().unwrap().current, 1);
+    }
+
+    #[test]
+    fn search_current_clamps_when_matches_shrink() {
+        let (mut app, ids) = manager_with_sessions(&["s"]);
+        let sid = ids[0];
+        {
+            let session = &mut app.sessions[0];
+            session.add_output_line("e1 error");
+            session.add_output_line("e2 error");
+            session.add_output_line("e3 error");
+        }
+        let _ = app.handle_open_session_search(sid);
+        let _ = app.handle_session_search_changed(sid, "error".to_string());
+        let _ = app.handle_session_search_step(sid, 1); // ->1
+        let _ = app.handle_session_search_step(sid, 1); // ->2 (last)
+        assert_eq!(app.sessions[0].search.as_ref().unwrap().current, 2);
+
+        // 매치가 줄면 current가 범위로 클램프되어야 한다.
+        {
+            let session = &mut app.sessions[0];
+            session.clear_output();
+            session.add_output_line("only error");
+            session.refresh_search_matches();
+        }
+        let search = app.sessions[0].search.as_ref().unwrap();
+        assert_eq!(search.matches, vec![0]);
+        assert_eq!(search.current, 0);
     }
 
     fn manager_with_named_sessions(names: &[&str]) -> RunConfigManager {
