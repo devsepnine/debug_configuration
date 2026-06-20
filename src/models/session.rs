@@ -1,4 +1,5 @@
 use crate::ansi::TextSegment;
+use std::collections::VecDeque;
 use std::sync::{Arc, atomic::AtomicBool};
 use std::time::{Duration, SystemTime};
 use uuid::Uuid;
@@ -33,7 +34,7 @@ pub struct RunSession {
     pub started_at: SystemTime,
     /// 프로세스의 표준 출력/에러 라인 목록 (ID와 함께 저장하여 키 기반 렌더링)
     /// 각 라인은 색상 정보가 포함된 텍스트 세그먼트 벡터로 저장됨
-    pub output_lines: Vec<(usize, Vec<TextSegment>)>,
+    pub output_lines: VecDeque<(usize, Vec<TextSegment>)>,
     /// 다음 라인에 할당할 ID (증가만 하여 제거되어도 키 안정성 보장)
     next_line_id: usize,
     /// 프로세스 실행 여부
@@ -82,7 +83,7 @@ impl RunSession {
             id: Uuid::new_v4(),
             config_name,
             started_at: SystemTime::now(),
-            output_lines: Vec::new(),
+            output_lines: VecDeque::new(),
             next_line_id: 0,
             is_running: true,
             exit_code: None,
@@ -103,9 +104,11 @@ impl RunSession {
 
         // \n으로 분리하여 각 줄을 별도로 추가
         for single_line in line.split('\n') {
-            // 라인 제한 초과 시 오래된 라인 제거 (FIFO)
+            // 라인 제한 초과 시 오래된 라인 제거 (FIFO).
+            // VecDeque이므로 앞에서 제거가 O(1) — 출력 폭주 시 Vec::remove(0)의
+            // O(n) 시프트 비용을 제거한다.
             if self.output_lines.len() >= MAX_OUTPUT_LINES {
-                self.output_lines.remove(0);
+                self.output_lines.pop_front();
             }
 
             // ANSI 색상 코드를 파싱하여 텍스트 세그먼트로 변환
@@ -114,7 +117,7 @@ impl RunSession {
             // 고유 ID와 함께 새 라인 추가
             let line_id = self.next_line_id;
             self.next_line_id += 1;
-            self.output_lines.push((line_id, segments));
+            self.output_lines.push_back((line_id, segments));
         }
     }
 
