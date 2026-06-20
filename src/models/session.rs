@@ -1,7 +1,20 @@
 use crate::ansi::TextSegment;
 use std::sync::{Arc, atomic::AtomicBool};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 use uuid::Uuid;
+
+/// 세션의 현재 상태 (배지 표시용).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionStatusKind {
+    /// 실행 중
+    Running,
+    /// 정상 종료 (exit 0)
+    Succeeded,
+    /// 비정상 종료 (exit code != 0)
+    Failed(i32),
+    /// 사용자가 중지 (종료 코드 없음)
+    Stopped,
+}
 
 /// 터미널 출력 버퍼의 최대 라인 수
 /// 이 제한을 초과하면 오래된 라인이 자동으로 제거됨
@@ -27,6 +40,8 @@ pub struct RunSession {
     pub is_running: bool,
     /// 프로세스 종료 코드 (종료되지 않았으면 None)
     pub exit_code: Option<i32>,
+    /// 프로세스 종료 시각 (실행 중이면 None) — 소요 시간 계산용
+    pub finished_at: Option<SystemTime>,
     /// 프로세스 취소를 위한 플래그 (멀티스레드 안전)
     pub cancel_flag: Arc<AtomicBool>,
     /// 스크롤 위치 (0.0 = 맨 위, 1.0 = 맨 아래)
@@ -48,6 +63,7 @@ impl std::fmt::Debug for RunSession {
             .field("next_line_id", &self.next_line_id)
             .field("is_running", &self.is_running)
             .field("exit_code", &self.exit_code)
+            .field("finished_at", &self.finished_at)
             .field("cancel_flag", &"<AtomicBool>")
             .field("scroll_progress", &self.scroll_progress)
             .field("auto_scroll", &self.auto_scroll)
@@ -70,6 +86,7 @@ impl RunSession {
             next_line_id: 0,
             is_running: true,
             exit_code: None,
+            finished_at: None,
             cancel_flag: Arc::new(AtomicBool::new(false)),
             scroll_progress: 1.0, // 기본값: 맨 아래
             auto_scroll: true,    // 기본값: 자동 스크롤 활성화
@@ -104,6 +121,51 @@ impl RunSession {
     /// 출력 버퍼 초기화
     pub fn clear_output(&mut self) {
         self.output_lines.clear();
+    }
+
+    /// 현재 세션 상태(배지용)를 판별.
+    pub fn status_kind(&self) -> SessionStatusKind {
+        if self.is_running {
+            SessionStatusKind::Running
+        } else {
+            match self.exit_code {
+                Some(0) => SessionStatusKind::Succeeded,
+                Some(code) => SessionStatusKind::Failed(code),
+                None => SessionStatusKind::Stopped,
+            }
+        }
+    }
+
+    /// 완료된 세션의 실행 소요 시간 (실행 중이거나 종료 시각이 없으면 None).
+    pub fn run_duration(&self) -> Option<Duration> {
+        self.finished_at
+            .and_then(|finished| finished.duration_since(self.started_at).ok())
+    }
+
+    /// 상태 배지에 표시할 짧은 라벨 (예: "✓ 1.2s", "✕ exit 1", "Stopped", "Running").
+    pub fn status_badge_label(&self) -> String {
+        match self.status_kind() {
+            SessionStatusKind::Running => String::from("Running"),
+            SessionStatusKind::Succeeded => self.run_duration().map_or_else(
+                || String::from("✓ done"),
+                |d| format!("✓ {}", format_duration(d)),
+            ),
+            SessionStatusKind::Failed(code) => format!("✕ exit {code}"),
+            SessionStatusKind::Stopped => String::from("Stopped"),
+        }
+    }
+}
+
+/// `Duration`을 짧은 사람용 문자열로 변환 ("820ms" / "1.2s" / "3m 04s").
+pub fn format_duration(duration: Duration) -> String {
+    let millis = duration.as_millis();
+    if millis < 1000 {
+        format!("{millis}ms")
+    } else if duration.as_secs() < 60 {
+        format!("{:.1}s", duration.as_secs_f64())
+    } else {
+        let secs = duration.as_secs();
+        format!("{}m {:02}s", secs / 60, secs % 60)
     }
 }
 
@@ -222,5 +284,28 @@ mod tests {
 
         assert_eq!(session.output_lines.len(), 0);
         assert!(session.output_lines.is_empty());
+    }
+
+    #[test]
+    fn status_kind_reflects_state() {
+        let mut session = RunSession::new("x".to_string());
+        assert_eq!(session.status_kind(), SessionStatusKind::Running);
+
+        session.is_running = false;
+        session.exit_code = Some(0);
+        assert_eq!(session.status_kind(), SessionStatusKind::Succeeded);
+
+        session.exit_code = Some(2);
+        assert_eq!(session.status_kind(), SessionStatusKind::Failed(2));
+
+        session.exit_code = None; // 사용자 중지
+        assert_eq!(session.status_kind(), SessionStatusKind::Stopped);
+    }
+
+    #[test]
+    fn format_duration_is_human_readable() {
+        assert_eq!(format_duration(Duration::from_millis(820)), "820ms");
+        assert_eq!(format_duration(Duration::from_millis(1200)), "1.2s");
+        assert_eq!(format_duration(Duration::from_secs(75)), "1m 15s");
     }
 }

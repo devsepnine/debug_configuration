@@ -1,5 +1,5 @@
 use crate::messages::Message;
-use crate::models::{Pane, RunSession};
+use crate::models::{Pane, RunSession, SessionStatusKind};
 use crate::utils::{
     ICON_ARROW_DOWN_FILL, ICON_ARROW_DOWN_LINE, ICON_CLOSE, ICON_PANE_MAXIMIZE, ICON_PANE_RESTORE,
     ICON_REFRESH, ICON_STOP,
@@ -158,7 +158,11 @@ fn view_pane_content<'a>(
         .and_then(|id| sessions.iter().find(|s| s.id == id));
     let session_name =
         current_session.map_or_else(|| String::from("Empty"), |s| s.config_name.clone());
-    let is_session_running = current_session.is_some_and(|session| session.is_running);
+    let session_status = current_session.map(RunSession::status_kind);
+    // 상태 배지는 완료된 세션에만 표시 (실행 중은 점으로 충분).
+    let session_badge = current_session
+        .filter(|session| !session.is_running)
+        .map(RunSession::status_badge_label);
 
     let mut title_controls: Option<Element<'a, Message>> = None;
     let content: Element<'a, Message> = if let Some(session_id) = pane.session_id {
@@ -202,26 +206,27 @@ fn view_pane_content<'a>(
     };
 
     // TitleBar 복구 - session_name 표시
-    let mut title_bar = pane_grid::TitleBar::new(session_title(session_name, is_session_running))
-        .padding([6, 9])
-        .style(move |theme: &Theme| {
-            let palette = theme.extended_palette();
-            pane_container_style_with_radius(
-                with_drag_opacity(
+    let mut title_bar =
+        pane_grid::TitleBar::new(session_title(session_name, session_status, session_badge))
+            .padding([6, 9])
+            .style(move |theme: &Theme| {
+                let palette = theme.extended_palette();
+                pane_container_style_with_radius(
+                    with_drag_opacity(
+                        Color {
+                            a: 0.58,
+                            ..palette.background.strong.color
+                        },
+                        dragging_pane_id == Some(pane_id),
+                    ),
                     Color {
-                        a: 0.58,
-                        ..palette.background.strong.color
+                        a: 0.0,
+                        ..palette.background.base.text
                     },
-                    dragging_pane_id == Some(pane_id),
-                ),
-                Color {
-                    a: 0.0,
-                    ..palette.background.base.text
-                },
-                0.0,
-                border::Radius::default().top(4.0),
-            )
-        });
+                    0.0,
+                    border::Radius::default().top(4.0),
+                )
+            });
     if let Some(controls) = title_controls {
         title_bar = title_bar
             .controls(pane_grid::Controls::new(controls))
@@ -355,32 +360,55 @@ fn view_session_controls(
         .into()
 }
 
-fn session_title(session_name: String, is_running: bool) -> Element<'static, Message> {
-    row![
+fn session_title(
+    session_name: String,
+    status: Option<SessionStatusKind>,
+    badge: Option<String>,
+) -> Element<'static, Message> {
+    let mut title = row![
         container(Space::new())
             .width(7)
             .height(7)
-            .style(move |theme: &Theme| session_status_dot_style(theme, is_running)),
-        text(session_name).size(12)
+            .style(move |theme: &Theme| session_status_dot_style(theme, status)),
+        text(session_name).size(12),
     ]
     .spacing(8)
-    .align_y(Alignment::Center)
-    .into()
+    .align_y(Alignment::Center);
+
+    if let Some(badge) = badge {
+        let is_failed = matches!(status, Some(SessionStatusKind::Failed(_)));
+        title = title
+            .push(Space::new().width(8))
+            .push(
+                text(badge)
+                    .size(11)
+                    .style(move |theme: &Theme| text::Style {
+                        color: Some(if is_failed {
+                            theme.extended_palette().danger.base.color
+                        } else {
+                            Color {
+                                a: 0.55,
+                                ..theme.extended_palette().background.base.text
+                            }
+                        }),
+                    }),
+            );
+    }
+
+    title.into()
 }
 
-fn session_status_dot_style(theme: &Theme, is_running: bool) -> container::Style {
+fn session_status_dot_style(theme: &Theme, status: Option<SessionStatusKind>) -> container::Style {
     let palette = theme.extended_palette();
-    let color = if is_running {
-        palette.success.base.color
-    } else {
-        palette.background.base.text
+    let (color, alpha) = match status {
+        Some(SessionStatusKind::Running) => (palette.success.base.color, 0.92),
+        Some(SessionStatusKind::Succeeded) => (palette.background.base.text, 0.42),
+        Some(SessionStatusKind::Failed(_)) => (palette.danger.base.color, 0.88),
+        Some(SessionStatusKind::Stopped) | None => (palette.background.base.text, 0.30),
     };
 
     container::Style {
-        background: Some(Background::Color(Color {
-            a: if is_running { 0.92 } else { 0.32 },
-            ..color
-        })),
+        background: Some(Background::Color(Color { a: alpha, ..color })),
         border: Border {
             radius: 999.0.into(),
             ..Border::default()

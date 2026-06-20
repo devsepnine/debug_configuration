@@ -236,6 +236,8 @@ pub enum Message {
     WindowResized(window::Id, iced::Size),
     /// 윈도우 최대화 상태 동기화
     WindowMaximized(bool),
+    /// 윈도우 포커스 변경 (백그라운드 완료 알림 판단용)
+    WindowFocusChanged(bool),
     /// 커스텀 타이틀바에서 창 드래그 시작
     StartWindowDrag,
     /// 커스텀 프레임에서 창 리사이즈 시작

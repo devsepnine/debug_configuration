@@ -1,7 +1,7 @@
 use crate::messages::{ConfigurationDropPosition, Message, ViewMode};
 use crate::models::{
     ConfigTypeData, ConfigurationType, ExecuteMode, ExecuteModeType, LayoutId, PackageManager,
-    RunConfiguration, RunSession, WorkspaceTab,
+    RunConfiguration, RunSession, SessionStatusKind, WorkspaceTab,
 };
 use crate::services::{
     AppSettings, load_from_path, load_settings, open_configurations, register_running_pid,
@@ -43,6 +43,9 @@ use chrome::{
     workspace_content_island_style, workspace_content_surface_style,
     workspace_tab_bar_island_style,
 };
+
+/// 세션 리스트의 상태 배지 고정 폭 — 레이아웃 계산과 실제 렌더링이 공유한다.
+const SESSION_STATUS_BADGE_WIDTH: f32 = 52.0;
 
 #[derive(Default)]
 struct FileDialogState {
@@ -144,7 +147,7 @@ fn session_name_max_width() -> usize {
     const PANEL_PADDING: f32 = 12.0; // panel container padding [8, 6] 좌우
     const LIST_PADDING: f32 = 12.0; // list column padding [8, 6] 좌우
     const ITEM_PADDING: f32 = 16.0; // item container padding [8, 8] 좌우
-    const CONTENT_ROW_SPACING: f32 = 16.0; // item_content row spacing(8) × 갭 2개
+    const CONTENT_ROW_SPACING: f32 = 24.0; // item_content row spacing(8) × 갭 3개 (점|이름|배지|버튼)
     const STATUS_DOT_WIDTH: f32 = 7.0; // 실행 상태 점
     const ACTION_BUTTONS_WIDTH: f32 = 51.0; // action button 24px × 2개 + spacing(3)
     const SCROLLBAR_WIDTH: f32 = 6.0; // 세로 스크롤바 width 4 + spacing 2
@@ -154,6 +157,7 @@ fn session_name_max_width() -> usize {
         + ITEM_PADDING
         + CONTENT_ROW_SPACING
         + STATUS_DOT_WIDTH
+        + SESSION_STATUS_BADGE_WIDTH
         + ACTION_BUTTONS_WIDTH
         + SCROLLBAR_WIDTH;
 
@@ -211,6 +215,36 @@ fn cancellable_status(error: &str, noun: &str) -> String {
     } else {
         format!("{noun} failed: {error}")
     }
+}
+
+/// 백그라운드(비포커스) 상태에서 실행이 끝났을 때 OS 데스크톱 알림을 표시.
+/// 정상 종료/비정상 종료/스폰 실패를 모두 구분해 알리며, UI 스레드를 막지
+/// 않도록 별도 스레드에서 발행하고 발행 실패는 조용히 무시한다.
+fn notify_run_finished(name: &str, result: Result<i32, &str>) {
+    let (summary, body) = match result {
+        Ok(0) => (
+            String::from("Run finished"),
+            format!("{name} completed successfully"),
+        ),
+        Ok(code) => (
+            String::from("Run failed"),
+            format!("{name} exited with code {code}"),
+        ),
+        Err(error) => (
+            String::from("Run failed"),
+            format!("{name} failed: {error}"),
+        ),
+    };
+
+    std::thread::spawn(move || {
+        // app_id를 지정하지 않으면 Windows에서 PowerShell AppUserModelID로
+        // 폴백한다. 커스텀 AUMID는 Start Menu 등록이 선행되어야 토스트가 뜨므로,
+        // 미패키징 앱에서는 폴백을 그대로 사용하는 편이 안전하다.
+        let _ = notify_rust::Notification::new()
+            .summary(&summary)
+            .body(&body)
+            .show();
+    });
 }
 
 /// Node 구성에서 (`config_id`, `project_directory`, `working_directory`)를 추출.
@@ -280,6 +314,8 @@ pub struct RunConfigManager {
     window_id: Option<window::Id>,
     window_size: Size,
     is_window_maximized: bool,
+    /// 윈도우 포커스 여부 (백그라운드에서 실행이 끝났을 때만 알림)
+    is_window_focused: bool,
     /// 마지막으로 사용한 구성 파일 경로 (Open/Save)
     last_file_path: Option<PathBuf>,
 }
@@ -331,6 +367,7 @@ impl RunConfigManager {
             window_id: None,
             window_size: Size::new(800.0, 600.0),
             is_window_maximized: false,
+            is_window_focused: true,
             last_file_path: last_file_path.clone(),
         };
 
@@ -465,6 +502,7 @@ impl RunConfigManager {
             | Message::WindowOpened(_)
             | Message::WindowResized(_, _)
             | Message::WindowMaximized(_)
+            | Message::WindowFocusChanged(_)
             | Message::StartWindowDrag
             | Message::ResizeWindow(_)
             | Message::MinimizeWindow
@@ -619,6 +657,10 @@ impl RunConfigManager {
             Message::WindowOpened(id) => self.handle_window_opened(id),
             Message::WindowResized(id, size) => self.handle_window_resized(id, size),
             Message::WindowMaximized(is_maximized) => self.handle_window_maximized(is_maximized),
+            Message::WindowFocusChanged(focused) => {
+                self.is_window_focused = focused;
+                Task::none()
+            }
             Message::StartWindowDrag => self.handle_start_window_drag(),
             Message::ResizeWindow(direction) => self.handle_resize_window(direction),
             Message::MinimizeWindow => self.handle_minimize_window(),
@@ -1755,19 +1797,30 @@ impl RunConfigManager {
     ) -> Task<Message> {
         if let Some(session) = self.session_by_id_mut(session_id) {
             session.is_running = false;
+            session.finished_at = Some(SystemTime::now());
             // PID 추적 해제 + 세션에서도 제거 (Windows PID 재사용으로 인한 오인 kill 방지).
             if let Some(pid) = session.process_pid.take() {
                 unregister_running_pid(pid);
             }
             match result {
                 Ok(code) => {
+                    let config_name = session.config_name.clone();
                     session.exit_code = Some(code);
                     session.add_output_line(&format!("\nProcess exited with code: {code}"));
                     self.status_message = format!("Completed (exit code: {code})");
+                    // 창이 백그라운드일 때만 데스크톱 알림 (보고 있는 실행은 알리지 않음)
+                    if !self.is_window_focused {
+                        notify_run_finished(&config_name, Ok(code));
+                    }
                 }
                 Err(error) => {
+                    let config_name = session.config_name.clone();
                     session.add_output_line(&format!("\nError: {error}"));
                     self.status_message = format!("Failed: {error}");
+                    // 스폰/실행 실패도 백그라운드면 알림 (가장 중요한 실패 케이스)
+                    if !self.is_window_focused {
+                        notify_run_finished(&config_name, Err(&error));
+                    }
                 }
             }
         }
@@ -1921,6 +1974,7 @@ impl RunConfigManager {
                 session.clear_output();
                 session.is_running = true;
                 session.exit_code = None;
+                session.finished_at = None;
                 // 이전 실행의 PID는 더 이상 이 세션에 속하지 않는다. 새 프로세스가 PID를
                 // 보고하기 전 stale PID가 kill되지 않도록 추적을 해제하고 슬롯을 비운다.
                 if let Some(old_pid) = session.process_pid.take() {
@@ -2761,12 +2815,36 @@ impl RunConfigManager {
         )
         .gap(4);
 
+        // 상태 배지 (고정 폭, 완료된 세션만 텍스트 표시 — 실행 중은 점으로 충분)
+        let is_failed = matches!(session.status_kind(), SessionStatusKind::Failed(_));
+        let badge_text = if session.is_running {
+            String::new()
+        } else {
+            session.status_badge_label()
+        };
+        let badge = text(badge_text)
+            .size(10)
+            .width(Length::Fixed(SESSION_STATUS_BADGE_WIDTH))
+            .align_x(iced::alignment::Horizontal::Right)
+            .wrapping(text::Wrapping::None)
+            .style(move |theme: &Theme| text::Style {
+                color: Some(if is_failed {
+                    theme.extended_palette().danger.base.color
+                } else {
+                    Color {
+                        a: 0.5,
+                        ..theme.extended_palette().background.base.text
+                    }
+                }),
+            });
+
         let item_content = row![
             container(Space::new())
                 .width(7)
                 .height(7)
                 .style(move |theme: &Theme| session_list_status_dot_style(theme, session)),
             title_with_tooltip,
+            badge,
             row![
                 Self::view_session_action_button(
                     "Stop session",
@@ -3070,12 +3148,19 @@ impl RunConfigManager {
             Subscription::none()
         };
 
+        let window_focus_subscription = event::listen_with(|event, _status, _id| match event {
+            Event::Window(window::Event::Focused) => Some(Message::WindowFocusChanged(true)),
+            Event::Window(window::Event::Unfocused) => Some(Message::WindowFocusChanged(false)),
+            _ => None,
+        });
+
         Subscription::batch([
             cursor_subscription,
             configuration_release_subscription,
             editor_focus_subscription,
             env_modal_keyboard_subscription,
             tab_name_edit_subscription,
+            window_focus_subscription,
             window::open_events().map(Message::WindowOpened),
             window::resize_events().map(|(id, size)| Message::WindowResized(id, size)),
         ])
