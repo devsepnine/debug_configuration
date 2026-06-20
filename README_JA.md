@@ -87,6 +87,16 @@ cargo build --release
 cargo run --release
 ```
 
+### Linux 実行時の依存関係
+Linux ではいくつかのデスクトップサービスに実行時依存します。通常のデスクトップセッションには存在しますが、最小構成/ヘッドレス環境では欠けていることがあり、その場合は該当機能が静かに無効化されます:
+
+- **ファイルダイアログ**（開く / 保存 / 出力エクスポート）は D-Bus 経由の XDG Desktop Portal を使用します — `xdg-desktop-portal` とバックエンド（`xdg-desktop-portal-gtk`、`-kde`、`-hyprland` など）をインストールして起動してください。
+- **デスクトップ通知** には `org.freedesktop.Notifications` を実装する通知デーモンが必要です（GNOME/KDE は標準提供。なければ `dunst` / `mako`）。
+- **URL を開く** には `xdg-utils` の `xdg-open` を使用します。
+- **描画** は wgpu（Vulkan/GL）を使用します。GPU ドライバー（Mesa）の動作を推奨します（tiny-skia ソフトウェア描画がフォールバック）。
+
+ソースからビルドする際のシステムライブラリは CI ワークフローに記載: `libfontconfig1-dev`、`libwayland-dev`、`libx11-xcb-dev`、`libxkbcommon-dev`、`pkg-config`。
+
 ### プラットフォームチェック
 本プロジェクトは Windows、macOS、Linux での動作を目標としています。
 

@@ -87,6 +87,16 @@ cargo build --release
 cargo run --release
 ```
 
+### Linux runtime dependencies
+On Linux the app relies on a few desktop services at runtime. They are present on a normal desktop session but may be missing on minimal/headless setups, in which case the related feature degrades silently:
+
+- **File dialogs** (open / save / export output) use the XDG Desktop Portal over D-Bus — install and run `xdg-desktop-portal` plus a backend (`xdg-desktop-portal-gtk`, `-kde`, or `-hyprland`).
+- **Desktop notifications** need a running notification daemon implementing `org.freedesktop.Notifications` (GNOME/KDE provide one; otherwise `dunst` / `mako`).
+- **Opening URLs** uses `xdg-open` from `xdg-utils`.
+- **Rendering** uses wgpu (Vulkan/GL); a working GPU driver (Mesa) is recommended (a tiny-skia software path is the fallback).
+
+Build-time system libraries (for compiling from source) are listed in the CI workflow: `libfontconfig1-dev`, `libwayland-dev`, `libx11-xcb-dev`, `libxkbcommon-dev`, `pkg-config`.
+
 ### Platform Check
 The project is intended to run on Windows, macOS, and Linux.
 
