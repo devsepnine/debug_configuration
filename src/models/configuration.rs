@@ -11,6 +11,8 @@ pub enum ConfigurationType {
     ShellScript,
     /// Node.js package manager 실행
     Node,
+    /// 여러 구성을 묶어 한 번에 실행 (복합 구성)
+    Compound,
 }
 
 /// JavaScript package manager selection for Node configurations.
@@ -361,6 +363,13 @@ pub enum ConfigTypeData {
         /// Node 옵션 (`NODE_OPTIONS` 환경 변수)
         node_options: String,
     },
+    /// 복합 구성 데이터 — 함께 실행할 다른 구성들의 id 목록.
+    /// 실행 시 각 멤버가 자신의 세션/페인으로 동시에 펼쳐진다.
+    Compound {
+        /// 함께 실행할 멤버 구성들의 id (실행 순서는 무의미 — 동시 실행)
+        #[serde(default)]
+        members: Vec<Uuid>,
+    },
 }
 
 /// `ConfigTypeData::Application` 변형의 가변 필드 묶음.
@@ -394,6 +403,7 @@ impl ConfigTypeData {
             ConfigTypeData::Application { .. } => ConfigurationType::Application,
             ConfigTypeData::ShellScript { .. } => ConfigurationType::ShellScript,
             ConfigTypeData::Node { .. } => ConfigurationType::Node,
+            ConfigTypeData::Compound { .. } => ConfigurationType::Compound,
         }
     }
 
@@ -465,13 +475,23 @@ impl ConfigTypeData {
             None
         }
     }
+
+    /// Compound 변형이면 멤버 id 목록의 가변 참조 반환.
+    pub fn compound_members_mut(&mut self) -> Option<&mut Vec<Uuid>> {
+        if let ConfigTypeData::Compound { members } = self {
+            Some(members)
+        } else {
+            None
+        }
+    }
 }
 
 impl ConfigurationType {
-    pub const ALL: [ConfigurationType; 3] = [
+    pub const ALL: [ConfigurationType; 4] = [
         ConfigurationType::Application,
         ConfigurationType::ShellScript,
         ConfigurationType::Node,
+        ConfigurationType::Compound,
     ];
 }
 
@@ -484,6 +504,7 @@ impl std::fmt::Display for ConfigurationType {
                 ConfigurationType::Application => "Application",
                 ConfigurationType::ShellScript => "Shell Script",
                 ConfigurationType::Node => "Node",
+                ConfigurationType::Compound => "Compound",
             }
         )
     }

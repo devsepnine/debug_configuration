@@ -154,6 +154,9 @@ fn build_command(config: &RunConfiguration) -> (String, Vec<(String, String)>) {
             };
             (command_str, extra_env)
         }
+        // Compound 구성은 셸 명령이 없다 — app.rs가 멤버별로 펼쳐 실행하므로
+        // 이 스트림 경로에는 도달하지 않는다 (방어적으로 빈 명령 반환).
+        ConfigTypeData::Compound { .. } => (String::new(), Vec::new()),
     }
 }
 

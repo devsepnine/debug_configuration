@@ -44,6 +44,10 @@ pub enum Message {
     NameChanged(String),
     /// 구성 타입 변경
     TypeChanged(ConfigurationType),
+    /// Compound 구성에 멤버(다른 구성 id) 추가
+    CompoundMemberAdded(Uuid),
+    /// Compound 구성에서 멤버 제거
+    CompoundMemberRemoved(Uuid),
     /// 명령어 변경
     CommandChanged(String),
     /// 인자 변경

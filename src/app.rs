@@ -385,6 +385,8 @@ impl RunConfigManager {
             | Message::ConfigurationDragExited(_)
             | Message::NameChanged(_)
             | Message::TypeChanged(_)
+            | Message::CompoundMemberAdded(_)
+            | Message::CompoundMemberRemoved(_)
             | Message::CommandChanged(_)
             | Message::ArgumentsChanged(_)
             | Message::ExecuteModeChanged(_)
@@ -481,6 +483,10 @@ impl RunConfigManager {
             Message::ConfigurationDragExited(index) => self.handle_configuration_drag_exited(index),
             Message::NameChanged(name) => self.handle_name_changed(name),
             Message::TypeChanged(config_type) => self.handle_type_changed(&config_type),
+            Message::CompoundMemberAdded(member_id) => self.handle_compound_member_added(member_id),
+            Message::CompoundMemberRemoved(member_id) => {
+                self.handle_compound_member_removed(member_id)
+            }
             Message::CommandChanged(command) => self.handle_command_changed(command),
             Message::ArgumentsChanged(arguments) => self.handle_arguments_changed(arguments),
             Message::ExecuteModeChanged(mode_type) => self.handle_execute_mode_changed(mode_type),
@@ -818,6 +824,12 @@ impl RunConfigManager {
             // 구성별 Node 캐시도 함께 제거 (UUID는 재사용되지 않으므로 누수 방지).
             self.node_available_scripts.remove(&config_id);
             self.node_available_package_jsons.remove(&config_id);
+            // 삭제된 구성을 참조하던 Compound 멤버에서도 제거 (댕글링 참조 방지).
+            for other in &mut self.configurations {
+                if let Some(members) = other.type_data.compound_members_mut() {
+                    members.retain(|id| *id != config_id);
+                }
+            }
             if let Some(modal) = &self.env_modal
                 && modal.config_id == config_id
             {
@@ -884,6 +896,14 @@ impl RunConfigManager {
             && let Some(config) = self.configurations.get(idx)
         {
             self.selected_config_index = Some(idx);
+
+            // Compound 구성: 멤버들을 각자의 세션/페인으로 동시 실행
+            if let ConfigTypeData::Compound { members } = &config.type_data {
+                let compound_name = config.name.clone();
+                let members = members.clone();
+                return self.run_compound(&compound_name, &members);
+            }
+
             let config = config.clone();
 
             let session = RunSession::new(config.name.clone());
@@ -906,6 +926,78 @@ impl RunConfigManager {
             );
         }
 
+        Task::none()
+    }
+
+    /// Compound 구성 실행: 각 멤버를 자신의 세션/페인으로 펼쳐 동시 실행한다.
+    /// 누락된(삭제된) 멤버와 중첩 Compound 멤버는 건너뛴다.
+    fn run_compound(&mut self, compound_name: &str, members: &[Uuid]) -> Task<Message> {
+        self.ensure_workspace_tab();
+        self.current_view = ViewMode::Sessions;
+
+        let mut tasks = Vec::new();
+        let mut skipped = 0usize;
+
+        for &member_id in members {
+            let Some(member) = self.configurations.iter().find(|c| c.id == member_id) else {
+                skipped += 1; // 삭제된 멤버
+                continue;
+            };
+            if matches!(member.type_data, ConfigTypeData::Compound { .. }) {
+                skipped += 1; // 중첩 방지
+                continue;
+            }
+
+            let config = member.clone();
+            let session = RunSession::new(config.name.clone());
+            let session_id = session.id;
+            let cancel_flag = session.cancel_flag.clone();
+
+            self.sessions.push(session);
+            if let Some(tab) = self.workspace_tabs.get_mut(self.selected_tab_index) {
+                tab.open_session(session_id);
+            }
+
+            tasks.push(Task::run(
+                run_configuration_stream(config, session_id, cancel_flag),
+                |msg| msg,
+            ));
+        }
+
+        let launched = tasks.len();
+        self.status_message = if launched == 0 {
+            format!("Compound '{compound_name}' has no runnable members")
+        } else if skipped > 0 {
+            format!("Running compound '{compound_name}': {launched} task(s), {skipped} skipped")
+        } else {
+            format!("Running compound '{compound_name}': {launched} task(s)")
+        };
+
+        Task::batch(tasks)
+    }
+
+    fn handle_compound_member_added(&mut self, member_id: Uuid) -> Task<Message> {
+        // 자기 자신은 멤버로 추가 불가 (무한 중첩 방지)
+        if self.selected_config_id() == Some(member_id) {
+            return Task::none();
+        }
+        if let Some(members) = self
+            .selected_type_data_mut()
+            .and_then(ConfigTypeData::compound_members_mut)
+            && !members.contains(&member_id)
+        {
+            members.push(member_id);
+        }
+        Task::none()
+    }
+
+    fn handle_compound_member_removed(&mut self, member_id: Uuid) -> Task<Message> {
+        if let Some(members) = self
+            .selected_type_data_mut()
+            .and_then(ConfigTypeData::compound_members_mut)
+        {
+            members.retain(|id| *id != member_id);
+        }
         Task::none()
     }
 
@@ -1024,6 +1116,9 @@ impl RunConfigManager {
                         script_name: None,
                         arguments: String::new(),
                         node_options: String::new(),
+                    },
+                    ConfigurationType::Compound => ConfigTypeData::Compound {
+                        members: Vec::new(),
                     },
                 };
             }
@@ -3203,5 +3298,78 @@ mod tests {
         assert_eq!(app.next_workspace_name(Some(1)), "Workspace 2");
         // 제외하지 않으면 다음 빈 번호
         assert_eq!(app.next_workspace_name(None), "Workspace 3");
+    }
+
+    #[test]
+    fn run_compound_fans_out_to_member_sessions() {
+        let mut app = manager_with_configs(&["A", "B", "Bundle"]);
+        let a_id = app.configurations[0].id;
+        let b_id = app.configurations[1].id;
+        app.configurations[2].type_data = ConfigTypeData::Compound {
+            members: vec![a_id, b_id],
+        };
+        let _ = app.handle_run_configuration(Some(2));
+        assert_eq!(app.sessions.len(), 2);
+        let names: Vec<&str> = app
+            .sessions
+            .iter()
+            .map(|s| s.config_name.as_str())
+            .collect();
+        assert!(names.contains(&"A") && names.contains(&"B"));
+    }
+
+    #[test]
+    fn run_compound_skips_missing_and_nested_members() {
+        let mut app = manager_with_configs(&["A", "Inner", "Bundle"]);
+        let a_id = app.configurations[0].id;
+        app.configurations[1].type_data = ConfigTypeData::Compound { members: vec![] };
+        let inner_id = app.configurations[1].id;
+        app.configurations[2].type_data = ConfigTypeData::Compound {
+            members: vec![a_id, inner_id, Uuid::new_v4()],
+        };
+        let _ = app.handle_run_configuration(Some(2));
+        assert_eq!(app.sessions.len(), 1); // 중첩 Compound와 누락 멤버는 건너뜀
+        assert_eq!(app.sessions[0].config_name, "A");
+    }
+
+    #[test]
+    fn compound_member_add_dedups_and_excludes_self() {
+        let mut app = manager_with_configs(&["A", "Bundle"]);
+        let a_id = app.configurations[0].id;
+        let bundle_id = app.configurations[1].id;
+        app.configurations[1].type_data = ConfigTypeData::Compound { members: vec![] };
+        app.selected_config_index = Some(1);
+        let _ = app.handle_compound_member_added(a_id);
+        let _ = app.handle_compound_member_added(a_id); // 중복 무시
+        let _ = app.handle_compound_member_added(bundle_id); // 자기 자신 무시
+        let ConfigTypeData::Compound { members } = &app.configurations[1].type_data else {
+            panic!("expected compound");
+        };
+        assert_eq!(members, &vec![a_id]);
+    }
+
+    #[test]
+    fn delete_strips_member_from_compound() {
+        let mut app = manager_with_configs(&["A", "B", "Bundle"]);
+        let a_id = app.configurations[0].id;
+        let b_id = app.configurations[1].id;
+        app.configurations[2].type_data = ConfigTypeData::Compound {
+            members: vec![a_id, b_id],
+        };
+        app.selected_config_index = Some(2);
+        let _ = app.handle_compound_member_removed(b_id);
+        let _ = app.handle_delete_configuration(Some(0)); // "A" 삭제
+        let compound = app
+            .configurations
+            .iter()
+            .find(|c| matches!(c.type_data, ConfigTypeData::Compound { .. }))
+            .expect("compound still present");
+        let ConfigTypeData::Compound { members } = &compound.type_data else {
+            unreachable!()
+        };
+        assert!(
+            members.is_empty(),
+            "deleted ids must be stripped from members"
+        );
     }
 }

@@ -307,6 +307,7 @@ fn type_label(
         ConfigurationType::Application => "APP",
         ConfigurationType::ShellScript => "SH",
         ConfigurationType::Node => "Node",
+        ConfigurationType::Compound => "Multi",
     };
 
     container(themed_badge_text(label, is_selected))
@@ -317,6 +318,7 @@ fn type_label(
                 ConfigurationType::Application => palette.primary.base.color,
                 ConfigurationType::ShellScript => palette.success.base.color,
                 ConfigurationType::Node => palette.danger.base.color,
+                ConfigurationType::Compound => palette.secondary.base.color,
             };
 
             container::Style {
