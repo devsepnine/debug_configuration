@@ -913,8 +913,9 @@ impl RunConfigManager {
             self.sessions.push(session);
 
             self.ensure_workspace_tab();
+            let aspect = self.workspace_content_aspect();
             if let Some(tab) = self.workspace_tabs.get_mut(self.selected_tab_index) {
-                tab.open_session(session_id);
+                tab.open_session(session_id, aspect);
             }
 
             self.status_message = format!("Running: {}", config.name);
@@ -937,6 +938,7 @@ impl RunConfigManager {
 
         let mut tasks = Vec::new();
         let mut skipped = 0usize;
+        let aspect = self.workspace_content_aspect();
 
         for &member_id in members {
             let Some(member) = self.configurations.iter().find(|c| c.id == member_id) else {
@@ -955,7 +957,7 @@ impl RunConfigManager {
 
             self.sessions.push(session);
             if let Some(tab) = self.workspace_tabs.get_mut(self.selected_tab_index) {
-                tab.open_session(session_id);
+                tab.open_session(session_id, aspect);
             }
 
             tasks.push(Task::run(
@@ -2015,10 +2017,11 @@ impl RunConfigManager {
 
         self.ensure_workspace_tab();
 
+        let aspect = self.workspace_content_aspect();
         let opened = self
             .workspace_tabs
             .get_mut(self.selected_tab_index)
-            .is_some_and(|tab| tab.open_session(session_id));
+            .is_some_and(|tab| tab.open_session(session_id, aspect));
 
         self.status_message = if opened {
             String::from("Session opened in workspace")
@@ -2130,6 +2133,20 @@ impl RunConfigManager {
         } else if self.selected_tab_index >= self.workspace_tabs.len() {
             self.selected_tab_index = self.workspace_tabs.len() - 1;
         }
+    }
+
+    /// 워크스페이스 페인 영역의 대략적인 가로/세로 비율 (균형 분할 방향 결정용).
+    ///
+    /// 세션 리스트 패널과 윈도우 chrome을 대략 제외한 추정치다. 정밀할 필요는 없고
+    /// (넓다 vs 높다)만 구분하면 충분하다.
+    fn workspace_content_aspect(&self) -> f32 {
+        const SESSION_LIST_WIDTH: f32 = 260.0;
+        const HORIZONTAL_MARGIN: f32 = 40.0;
+        const VERTICAL_CHROME: f32 = 96.0;
+
+        let width = (self.window_size.width - SESSION_LIST_WIDTH - HORIZONTAL_MARGIN).max(120.0);
+        let height = (self.window_size.height - VERTICAL_CHROME).max(120.0);
+        width / height
     }
 
     /// 현재 선택된 구성의 가변 참조 가져오기

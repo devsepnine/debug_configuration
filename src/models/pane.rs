@@ -65,6 +65,64 @@ impl LayoutTree {
         }
     }
 
+    /// 새 패인을 추가할 때 분할할 leaf와 분할 축을 선택한다.
+    ///
+    /// 가장 큰 패인을 골라 더 긴 변 방향으로 쪼개 균형 잡힌 격자를 유지한다
+    /// (넓으면 좌우=Vertical, 높으면 상하=Horizontal). `aspect`는 표시 영역의
+    /// 가로/세로 비율로, 넓은 창은 열을, 높은 창은 행을 더 만들게 한다.
+    pub fn best_split_target(&self, aspect: f32) -> Option<(LayoutId, pane_grid::Axis)> {
+        let aspect = if aspect.is_finite() && aspect > 0.0 {
+            aspect
+        } else {
+            1.0
+        };
+
+        let mut leaves = Vec::new();
+        self.collect_leaf_sizes(1.0, 1.0, &mut leaves);
+
+        leaves
+            .into_iter()
+            .map(|(id, width_frac, height_frac)| {
+                let width = width_frac * aspect;
+                let height = height_frac;
+                let axis = if width >= height {
+                    pane_grid::Axis::Vertical // 좌우 분할 (폭을 나눔)
+                } else {
+                    pane_grid::Axis::Horizontal // 상하 분할 (높이를 나눔)
+                };
+                (id, axis, width * height)
+            })
+            .max_by(|a, b| a.2.total_cmp(&b.2))
+            .map(|(id, axis, _)| (id, axis))
+    }
+
+    /// 각 leaf의 상대 (가로, 세로) 비율을 트리에서 누적 계산.
+    fn collect_leaf_sizes(
+        &self,
+        width_frac: f32,
+        height_frac: f32,
+        out: &mut Vec<(LayoutId, f32, f32)>,
+    ) {
+        match self {
+            LayoutTree::Leaf { id, .. } => out.push((*id, width_frac, height_frac)),
+            LayoutTree::Split {
+                axis,
+                ratio,
+                first,
+                second,
+            } => match *axis {
+                pane_grid::Axis::Vertical => {
+                    first.collect_leaf_sizes(width_frac * *ratio, height_frac, out);
+                    second.collect_leaf_sizes(width_frac * (1.0 - *ratio), height_frac, out);
+                }
+                pane_grid::Axis::Horizontal => {
+                    first.collect_leaf_sizes(width_frac, height_frac * *ratio, out);
+                    second.collect_leaf_sizes(width_frac, height_frac * (1.0 - *ratio), out);
+                }
+            },
+        }
+    }
+
     /// 특정 ID의 leaf를 분할
     pub fn split_leaf(
         &mut self,
@@ -306,8 +364,11 @@ impl WorkspaceTab {
             .any(|pane| pane.session_id == Some(session_id))
     }
 
-    /// 현재 워크스페이스에 세션 열기
-    pub fn open_session(&mut self, session_id: Uuid) -> bool {
+    /// 현재 워크스페이스에 세션 열기.
+    ///
+    /// 빈 패인이 있으면 거기에 채우고, 없으면 가장 큰 패인을 긴 변 방향으로 분할해
+    /// 균형 잡힌 격자를 유지한다 (`aspect` = 표시 영역의 가로/세로 비율).
+    pub fn open_session(&mut self, session_id: Uuid, aspect: f32) -> bool {
         if self.contains_session(session_id) {
             return false;
         }
@@ -321,13 +382,10 @@ impl WorkspaceTab {
             if let Some(pane) = self.layout_tree.get_pane_mut(layout_id) {
                 pane.set_session(session_id);
             }
-        } else if let Some((layout_id, _)) = self.layout_tree.collect_leaves().into_iter().next() {
-            let _ = self.layout_tree.split_leaf(
-                layout_id,
-                pane_grid::Axis::Vertical,
-                Pane::with_session(session_id),
-                false,
-            );
+        } else if let Some((layout_id, axis)) = self.layout_tree.best_split_target(aspect) {
+            let _ =
+                self.layout_tree
+                    .split_leaf(layout_id, axis, Pane::with_session(session_id), false);
         }
 
         self.rebuild_from_layout_tree();
@@ -378,5 +436,72 @@ impl WorkspaceTab {
         let (layout_tree, mapping) = LayoutTree::from_pane_grid(&self.pane_layout);
         self.layout_tree = layout_tree;
         self.id_mapping = mapping.into_iter().collect();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn leaf_areas(tree: &LayoutTree, width: f32, height: f32, out: &mut Vec<f32>) {
+        match tree {
+            LayoutTree::Leaf { .. } => out.push(width * height),
+            LayoutTree::Split {
+                axis,
+                ratio,
+                first,
+                second,
+            } => match *axis {
+                pane_grid::Axis::Vertical => {
+                    leaf_areas(first, width * *ratio, height, out);
+                    leaf_areas(second, width * (1.0 - *ratio), height, out);
+                }
+                pane_grid::Axis::Horizontal => {
+                    leaf_areas(first, width, height * *ratio, out);
+                    leaf_areas(second, width, height * (1.0 - *ratio), out);
+                }
+            },
+        }
+    }
+
+    #[test]
+    fn best_split_target_splits_largest_along_longer_side() {
+        // 단일 leaf: 넓은 화면이면 좌우(Vertical) 분할
+        let mut tree = LayoutTree::new_leaf(0, Pane::empty());
+        let (id, axis) = tree.best_split_target(1.6).unwrap();
+        assert_eq!(id, 0);
+        assert!(matches!(axis, pane_grid::Axis::Vertical));
+
+        // 좌우로 한 번 나누면 각 칸이 세로로 길어져 상하(Horizontal) 분할을 선호
+        tree.split_leaf(0, pane_grid::Axis::Vertical, Pane::empty(), false);
+        let (_, axis) = tree.best_split_target(1.6).unwrap();
+        assert!(matches!(axis, pane_grid::Axis::Horizontal));
+    }
+
+    #[test]
+    fn open_session_keeps_layout_balanced() {
+        let mut tab = WorkspaceTab::empty(String::from("W"));
+        for _ in 0..4 {
+            tab.open_session(Uuid::new_v4(), 1.6);
+        }
+        assert_eq!(tab.session_count(), 4);
+
+        let mut areas = Vec::new();
+        leaf_areas(&tab.layout_tree, 1.0, 1.0, &mut areas);
+        assert_eq!(areas.len(), 4);
+
+        // 균형 격자면 각 칸 ≈0.25, 기존 계단형이면 최대 0.5였다.
+        let max_area = areas.iter().copied().fold(0.0_f32, f32::max);
+        assert!(max_area <= 0.3, "layout not balanced: areas = {areas:?}");
+    }
+
+    #[test]
+    fn open_session_fills_empty_leaf_first() {
+        let mut tab = WorkspaceTab::empty(String::from("W"));
+        let id = Uuid::new_v4();
+        tab.open_session(id, 1.6);
+        // 첫 세션은 분할 없이 빈 leaf를 채운다 (단일 패인).
+        assert_eq!(tab.pane_layout.panes.len(), 1);
+        assert!(tab.contains_session(id));
     }
 }
