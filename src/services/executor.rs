@@ -157,6 +157,36 @@ fn build_command(config: &RunConfiguration) -> (String, Vec<(String, String)>) {
     }
 }
 
+/// Windows에서 사용할 PowerShell 실행 파일을 결정한다 (세션당 1회 감지 후 캐시).
+///
+/// PowerShell 7+(`pwsh`)는 `&&`/`||` 체이닝을 네이티브 지원하므로 우선 사용하고,
+/// 설치되어 있지 않으면 Windows PowerShell 5.x(`powershell`)로 폴백한다.
+#[cfg(windows)]
+fn windows_powershell_exe() -> &'static str {
+    use std::os::windows::process::CommandExt;
+
+    static EXE: LazyLock<&'static str> = LazyLock::new(|| {
+        let pwsh_available = std::process::Command::new("pwsh")
+            .args(["-NoProfile", "-Command", "exit"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .map(|out| out.status.success())
+            .unwrap_or(false);
+
+        if pwsh_available { "pwsh" } else { "powershell" }
+    });
+
+    *EXE
+}
+
+/// Windows PowerShell 5.x는 `&&`를 지원하지 않으므로 `;`(순차 실행)로 대체한다.
+/// 단락 평가(앞 명령 실패 시 중단)는 보존되지 않는 최선의 폴백이며, pwsh 7이 감지되면
+/// 이 변환은 호출되지 않는다.
+#[cfg(windows)]
+fn rewrite_chaining_for_legacy_powershell(command_str: &str) -> String {
+    command_str.replace(" && ", "; ")
+}
+
 fn create_process_command(
     config: &RunConfiguration,
     command_str: &str,
@@ -165,25 +195,32 @@ fn create_process_command(
     use std::process::Stdio;
     use tokio::process::Command;
 
-    let mut cmd = if cfg!(target_os = "windows") {
-        let mut c = Command::new("powershell");
+    #[cfg(windows)]
+    let mut cmd = {
+        let exe = windows_powershell_exe();
+        // pwsh(7+)는 && 를 네이티브 지원하므로 변환하지 않는다. 5.x 폴백 시에만 변환.
+        let adapted = if exe == "pwsh" {
+            command_str.to_string()
+        } else {
+            rewrite_chaining_for_legacy_powershell(command_str)
+        };
+        let mut c = Command::new(exe);
         c.args([
             "-NoProfile",
             "-NonInteractive",
             "-Command",
-            &format!("[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; {command_str}"),
+            &format!("[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; {adapted}"),
         ]);
+        c.creation_flags(CREATE_NO_WINDOW);
         c
-    } else {
+    };
+
+    #[cfg(not(windows))]
+    let mut cmd = {
         let mut c = Command::new("sh");
         c.args(["-l", "-c", command_str]);
         c
     };
-
-    #[cfg(windows)]
-    {
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
 
     #[cfg(unix)]
     {
@@ -450,19 +487,16 @@ async fn terminate_and_reap(child: &mut Child) {
     }
 }
 
-/// Application 타입의 명령어 생성
+/// Application 타입의 명령어 생성.
+///
+/// `&&` 등 셸 체이닝은 변환하지 않고 그대로 둔다 — Windows PowerShell 5.x 폴백 시의
+/// `&&` → `;` 변환은 `create_process_command`에서 모든 구성 타입에 일관 적용된다.
 fn build_application_command(command: &str, arguments: &str) -> String {
-    let command_with_args = if arguments.is_empty() {
+    if arguments.is_empty() {
         command.to_string()
     } else {
         format!("{command} {arguments}")
-    };
-
-    // PowerShell 5.x는 && 연산자를 지원하지 않으므로 ; 로 변환
-    #[cfg(target_os = "windows")]
-    let command_with_args = command_with_args.replace(" && ", "; ");
-
-    command_with_args
+    }
 }
 
 /// Shell Script 타입의 명령어 생성
@@ -736,6 +770,27 @@ mod tests {
             build_application_command("echo", "hello world"),
             "echo hello world"
         );
+    }
+
+    #[test]
+    fn application_command_preserves_chaining_operator() {
+        // && 는 빌드 단계에서 변환하지 않는다. (pwsh는 네이티브 지원, 5.x 폴백 변환은
+        // create_process_command가 모든 타입에 일관 적용)
+        assert_eq!(
+            build_application_command("npm i", "&& npm test"),
+            "npm i && npm test"
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn legacy_powershell_rewrites_and_to_semicolon() {
+        assert_eq!(
+            rewrite_chaining_for_legacy_powershell("npm i && npm test"),
+            "npm i; npm test"
+        );
+        // && 가 없으면 그대로
+        assert_eq!(rewrite_chaining_for_legacy_powershell("echo hi"), "echo hi");
     }
 
     #[test]
