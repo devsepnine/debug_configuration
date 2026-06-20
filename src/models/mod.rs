@@ -7,4 +7,4 @@ pub use configuration::{
     RunConfiguration,
 };
 pub use pane::{LayoutId, Pane, WorkspaceTab};
-pub use session::{RunSession, SessionStatusKind};
+pub use session::{RunSession, SearchState, SessionStatusKind};

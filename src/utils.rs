@@ -99,6 +99,7 @@ pub const ICON_ARROW_DOWN_LINE: &[u8] =
     include_bytes!("../assets/mingcute--arrow-down-circle-line.svg");
 pub const ICON_PANE_MAXIMIZE: &[u8] = include_bytes!("../assets/app--pane-maximize.svg");
 pub const ICON_PANE_RESTORE: &[u8] = include_bytes!("../assets/app--pane-restore.svg");
+pub const ICON_SEARCH: &[u8] = include_bytes!("../assets/app--search.svg");
 
 // ============================================================================
 // Node package manager utility functions

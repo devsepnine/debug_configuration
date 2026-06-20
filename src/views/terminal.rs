@@ -5,6 +5,7 @@ use iced::{
     mouse,
     widget::{Canvas, canvas, container},
 };
+use std::collections::HashSet;
 use unicode_width::UnicodeWidthChar;
 use uuid::Uuid;
 
@@ -120,10 +121,24 @@ type DisplaySegment = (usize, usize, bool);
 /// Virtual scrolling과 자동 줄바꿈을 지원하여 대량의 로그를 효율적으로 렌더링
 struct TerminalCanvas {
     lines: Vec<Vec<crate::ansi::TextSegment>>,
+    /// `lines`와 1:1 대응하는 검색 하이라이트 종류 (매치/현재 매치/없음)
+    highlights: Vec<LineHighlight>,
     session_id: Uuid,
     initial_scroll_progress: f32,
     auto_scroll: bool,
     urls: Vec<UrlInfo>,
+}
+
+/// 검색 시 라인 배경 하이라이트 종류.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum LineHighlight {
+    /// 하이라이트 없음
+    #[default]
+    None,
+    /// 검색어 매치 라인
+    Match,
+    /// 현재 선택된 매치 라인 (강조)
+    Current,
 }
 
 impl TerminalCanvas {
@@ -504,8 +519,21 @@ impl canvas::Program<Message> for TerminalCanvas {
             }
         };
         let scrollbar_color = theme.extended_palette().secondary.weak.color;
+        // 검색 매치 라인 배경 (warning=노랑 계열). 현재 매치는 더 진하게.
+        let warning = theme.extended_palette().warning.base.color;
+        let match_bg = Color { a: 0.16, ..warning };
+        let current_match_bg = Color { a: 0.42, ..warning };
 
-        // Render selection highlight (behind text, but above background)
+        // Z-order: 매치 배경 → 선택 → 텍스트(render_lines). 매치 배경을 먼저 깔아야
+        // 선택 배경이 그 위에 보인다(검색 중 텍스트 선택 시).
+        self.render_line_highlights(
+            &mut frame,
+            state,
+            max_chars,
+            visible_lines,
+            match_bg,
+            current_match_bg,
+        );
         self.render_selection(
             &mut frame,
             state,
@@ -1051,6 +1079,77 @@ impl TerminalCanvas {
     }
 
     /// 텍스트 라인 렌더링
+    /// 검색 매치 라인 배경 패스. 텍스트·선택보다 먼저 그려 Z-order가
+    /// 매치배경 → 선택 → 텍스트가 되게 한다. `rendered_lines` 증가 규칙은
+    /// `render_lines`와 정확히 동일해야 y 정렬이 맞는다.
+    fn render_line_highlights(
+        &self,
+        frame: &mut canvas::Frame,
+        state: &ScrollState,
+        max_chars: usize,
+        visible_lines: usize,
+        match_bg: Color,
+        current_match_bg: Color,
+    ) {
+        if self.highlights.iter().all(|h| *h == LineHighlight::None) {
+            return;
+        }
+
+        let partial_offset = state.offset.fract();
+        let target_start_line = Self::f32_floor_to_usize(state.offset);
+        let mut current_wrapped_line = 0;
+        let mut rendered_lines = 0;
+
+        for (line_idx, segments) in self.lines.iter().enumerate() {
+            let wrapped_count = Self::calculate_wrapped_count(segments, max_chars);
+            if current_wrapped_line + wrapped_count <= target_start_line {
+                current_wrapped_line += wrapped_count;
+                continue;
+            }
+            if current_wrapped_line > target_start_line + visible_lines {
+                break;
+            }
+
+            let bg = match self.highlights.get(line_idx).copied().unwrap_or_default() {
+                LineHighlight::Current => Some(current_match_bg),
+                LineHighlight::Match => Some(match_bg),
+                LineHighlight::None => None,
+            };
+
+            if segments.iter().all(|s| s.text.is_empty()) {
+                // 빈 줄: 하이라이트 대상 아님. render_empty_line과 동일하게 카운팅.
+                if current_wrapped_line >= target_start_line {
+                    rendered_lines += 1;
+                }
+                current_wrapped_line += 1;
+            } else {
+                for chunk_idx in 0..wrapped_count {
+                    let this_wrapped_line = current_wrapped_line + chunk_idx;
+                    if this_wrapped_line >= target_start_line
+                        && this_wrapped_line < target_start_line + visible_lines + 1
+                    {
+                        if let Some(bg) = bg {
+                            let y =
+                                (Self::usize_to_f32(rendered_lines) - partial_offset) * LINE_HEIGHT;
+                            let y_aligned = y.round();
+                            let rect = canvas::Path::rectangle(
+                                Point::new(0.0, y_aligned + HORIZONTAL_PADDING),
+                                iced::Size::new(frame.width(), LINE_HEIGHT),
+                            );
+                            frame.fill(&rect, bg);
+                        }
+                        rendered_lines += 1;
+                    }
+                }
+                current_wrapped_line += wrapped_count;
+            }
+
+            if rendered_lines >= visible_lines + 2 {
+                break;
+            }
+        }
+    }
+
     fn render_lines(
         &self,
         frame: &mut canvas::Frame,
@@ -1438,11 +1537,12 @@ impl TerminalCanvas {
 /// # Arguments
 /// * `session` - 렌더링할 세션의 참조
 pub fn view_terminal_for_session(session: &RunSession, is_dragging: bool) -> Element<'_, Message> {
-    let lines = prepare_lines(session);
+    let (lines, highlights) = prepare_lines(session);
     let urls = TerminalCanvas::extract_urls(&lines);
 
     let canvas = Canvas::new(TerminalCanvas {
         lines,
+        highlights,
         session_id: session.id,
         initial_scroll_progress: session.scroll_progress,
         auto_scroll: session.auto_scroll,
@@ -1479,26 +1579,91 @@ pub fn view_terminal_for_session(session: &RunSession, is_dragging: bool) -> Ele
         .into()
 }
 
-/// 세션에서 표시할 라인 준비
-fn prepare_lines(session: &RunSession) -> Vec<Vec<crate::ansi::TextSegment>> {
-    let total_lines = session.output_lines.len();
+/// 세션에서 표시할 라인 + 라인별 검색 하이라이트 종류 준비.
+///
+/// 매칭은 대소문자 무시 부분일치(라인 단위). 필터 모드면 매치 라인만, 아니면 최근
+/// `RENDER_LINE_LIMIT`개를 표시한다. 각 출력 라인의 위치 인덱스로 매치/현재 매치를
+/// 판정해 `LineHighlight`를 부여한다(정보/빈 라인은 `None`).
+fn prepare_lines(session: &RunSession) -> (Vec<Vec<crate::ansi::TextSegment>>, Vec<LineHighlight>) {
+    use crate::ansi::TextSegment;
 
-    let start_idx = total_lines.saturating_sub(RENDER_LINE_LIMIT);
+    let search = session.search.as_ref();
+    let query = search.map_or("", |s| s.query.as_str());
+    let active = search.is_some() && !query.is_empty();
+    let filter = search.is_some_and(|s| s.filter);
+
+    // 매치 위치 인덱스 + 현재 매치 인덱스 (검색 활성 시에만).
+    let matches: Vec<usize> = if active {
+        session.search_match_indices(query)
+    } else {
+        Vec::new()
+    };
+    let match_set: HashSet<usize> = matches.iter().copied().collect();
+    let current_output_idx: Option<usize> = if matches.is_empty() {
+        None
+    } else {
+        let cur = search.map_or(0, |s| s.current).min(matches.len() - 1);
+        Some(matches[cur])
+    };
+    let highlight_for = |output_idx: usize| -> LineHighlight {
+        if Some(output_idx) == current_output_idx {
+            LineHighlight::Current
+        } else if match_set.contains(&output_idx) {
+            LineHighlight::Match
+        } else {
+            LineHighlight::None
+        }
+    };
 
     let mut lines = Vec::new();
+    let mut highlights = Vec::new();
+
+    if active && filter {
+        // 필터 모드: 매치 라인만 (출력 인덱스 유지로 현재 매치 강조 가능).
+        let total = matches.len();
+        let start_idx = total.saturating_sub(RENDER_LINE_LIMIT);
+        if total > RENDER_LINE_LIMIT {
+            lines.push(vec![TextSegment::new(format!(
+                "... {} older matches hidden (matches: {total})",
+                total - RENDER_LINE_LIMIT
+            ))]);
+            highlights.push(LineHighlight::None);
+            lines.push(vec![TextSegment::new(String::new())]);
+            highlights.push(LineHighlight::None);
+        } else if total == 0 {
+            lines.push(vec![TextSegment::new(format!(
+                "No lines match \"{query}\""
+            ))]);
+            highlights.push(LineHighlight::None);
+        }
+        for &output_idx in matches.iter().skip(start_idx) {
+            if let Some((_, segments)) = session.output_lines.get(output_idx) {
+                lines.push(segments.clone());
+                highlights.push(highlight_for(output_idx));
+            }
+        }
+        return (lines, highlights);
+    }
+
+    let total_lines = session.output_lines.len();
+    let start_idx = total_lines.saturating_sub(RENDER_LINE_LIMIT);
 
     // 숨겨진 라인 정보 표시
     if total_lines > RENDER_LINE_LIMIT {
         let hidden = total_lines - RENDER_LINE_LIMIT;
-        let info_line = format!("... {hidden} older lines hidden (total: {total_lines} lines)");
-        lines.push(vec![crate::ansi::TextSegment::new(info_line)]);
-        lines.push(vec![crate::ansi::TextSegment::new(String::new())]);
+        lines.push(vec![TextSegment::new(format!(
+            "... {hidden} older lines hidden (total: {total_lines} lines)"
+        ))]);
+        highlights.push(LineHighlight::None);
+        lines.push(vec![TextSegment::new(String::new())]);
+        highlights.push(LineHighlight::None);
     }
 
-    // 최근 라인 추가
-    for (_, segments) in session.output_lines.iter().skip(start_idx) {
+    // 최근 라인 추가 (출력 인덱스로 하이라이트 판정)
+    for (output_idx, (_, segments)) in session.output_lines.iter().enumerate().skip(start_idx) {
         lines.push(segments.clone());
+        highlights.push(highlight_for(output_idx));
     }
 
-    lines
+    (lines, highlights)
 }

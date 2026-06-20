@@ -2,15 +2,17 @@ use crate::messages::Message;
 use crate::models::{Pane, RunSession, SessionStatusKind};
 use crate::utils::{
     ICON_ARROW_DOWN_FILL, ICON_ARROW_DOWN_LINE, ICON_CLOSE, ICON_PANE_MAXIMIZE, ICON_PANE_RESTORE,
-    ICON_REFRESH, ICON_STOP,
+    ICON_REFRESH, ICON_SEARCH, ICON_STOP,
 };
-use crate::views::shared::{IconButtonState, icon_button_foreground, icon_button_style};
+use crate::views::shared::{
+    IconButtonState, icon_button_foreground, icon_button_style, session_search_input_id,
+};
 use crate::views::terminal::view_terminal_for_session;
 use crate::widgets::pane_grid;
 use iced::widget::Space;
 use iced::{
     Alignment, Background, Border, Color, Element, Length, Theme, border,
-    widget::{button, container, row, svg, text},
+    widget::{button, column, container, row, svg, text, text_input},
 };
 
 const CONTROL_ICON_SIZE: f32 = 14.0;
@@ -180,7 +182,14 @@ fn view_pane_content<'a>(
                 is_dragging,
             ));
 
-            container(terminal_output)
+            // 검색바가 열려 있으면 터미널 위에 표시.
+            let body: Element<'a, Message> = if session.search.is_some() {
+                column![view_session_search_bar(session), terminal_output].into()
+            } else {
+                terminal_output
+            };
+
+            container(body)
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .into()
@@ -304,6 +313,25 @@ fn view_session_controls(
         is_dragging,
     );
 
+    // 검색 버튼 — 검색바가 열려 있으면 active 강조 + 토글로 닫기.
+    let search_open = session.search.is_some();
+    let search_state = if search_open {
+        IconButtonState::Active
+    } else {
+        IconButtonState::Inactive
+    };
+    let search_message = if search_open {
+        Message::CloseSessionSearch(session_id)
+    } else {
+        Message::OpenSessionSearch(session_id)
+    };
+    let search_button = control_button(
+        control_icon(svg::Handle::from_memory(ICON_SEARCH), search_state),
+        Some(search_message),
+        search_state,
+        is_dragging,
+    );
+
     let maximize_button = control_button(
         control_icon(
             svg::Handle::from_memory(if is_maximized {
@@ -334,6 +362,8 @@ fn view_session_controls(
         stop_button,
         Space::new().width(4),
         auto_scroll_button,
+        Space::new().width(4),
+        search_button,
     ]
     .align_y(Alignment::Center)
     .spacing(1.0);
@@ -358,6 +388,103 @@ fn view_session_controls(
             ..container::Style::default()
         })
         .into()
+}
+
+/// 출력 검색바 (터미널 위에 표시). 매치 개수, 이전/다음, 필터 토글, 닫기.
+fn view_session_search_bar(session: &RunSession) -> Element<'_, Message> {
+    let search = session
+        .search
+        .as_ref()
+        .expect("view_session_search_bar requires search state");
+    let session_id = session.id;
+
+    let total = session.search_match_indices(&search.query).len();
+    let count_text = if search.query.is_empty() {
+        String::new()
+    } else if total == 0 {
+        String::from("0/0")
+    } else {
+        format!("{}/{}", (search.current % total) + 1, total)
+    };
+
+    let input = text_input("Find in output...", &search.query)
+        .id(session_search_input_id(session_id))
+        .on_input(move |value| Message::SessionSearchChanged(session_id, value))
+        .on_submit(Message::SessionSearchNext(session_id))
+        .size(12)
+        .padding([2, 6])
+        .width(Length::Fill);
+
+    let count = text(count_text)
+        .size(11)
+        .style(|theme: &Theme| text::Style {
+            color: Some(Color {
+                a: 0.6,
+                ..theme.extended_palette().background.base.text
+            }),
+        });
+
+    let filter_state = if search.filter {
+        IconButtonState::Active
+    } else {
+        IconButtonState::Inactive
+    };
+
+    let controls = row![
+        glyph_button(
+            "<",
+            Message::SessionSearchPrev(session_id),
+            IconButtonState::Active
+        ),
+        glyph_button(
+            ">",
+            Message::SessionSearchNext(session_id),
+            IconButtonState::Active
+        ),
+        glyph_button(
+            "filter",
+            Message::ToggleSessionSearchFilter(session_id),
+            filter_state
+        ),
+        glyph_button(
+            "x",
+            Message::CloseSessionSearch(session_id),
+            IconButtonState::Active
+        ),
+    ]
+    .spacing(2)
+    .align_y(Alignment::Center);
+
+    container(
+        row![input, count, controls]
+            .spacing(8)
+            .align_y(Alignment::Center),
+    )
+    .padding([4, 8])
+    .width(Length::Fill)
+    .style(|theme: &Theme| container::Style {
+        background: Some(Background::Color(
+            theme.extended_palette().background.weak.color,
+        )),
+        ..container::Style::default()
+    })
+    .into()
+}
+
+/// 검색바용 작은 텍스트/글리프 버튼 (컨트롤과 동일한 토글 스타일 재사용).
+fn glyph_button(
+    label: &str,
+    message: Message,
+    state: IconButtonState,
+) -> iced::widget::Button<'static, Message> {
+    let content = container(text(label.to_string()).size(12))
+        .center_x(Length::Shrink)
+        .center_y(Length::Fill);
+    button(content)
+        .padding([2, 7])
+        .height(CONTROL_BUTTON_SIZE)
+        .style(move |theme: &Theme, status| icon_button_style(theme, status, state, 4.0))
+        .on_press(message)
 }
 
 fn session_title(

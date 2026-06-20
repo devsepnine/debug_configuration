@@ -22,6 +22,19 @@ pub enum SessionStatusKind {
 /// 라인별 렌더링 관리로 성능 최적화
 const MAX_OUTPUT_LINES: usize = 2000;
 
+/// 세션 출력 검색/필터 상태. 검색바가 열려 있을 때만 `Some`.
+/// 매칭은 대소문자 무시 부분일치(라인 단위)이며, 매치 인덱스는 항상 현재
+/// `output_lines`에서 즉석 계산하므로(실시간 출력에도 신선) 여기 캐시하지 않는다.
+#[derive(Debug, Clone, Default)]
+pub struct SearchState {
+    /// 검색어
+    pub query: String,
+    /// 매치 라인만 표시(필터 모드)
+    pub filter: bool,
+    /// 현재 매치 순번 (매치 목록 기준 0-based; 매치가 있을 때만 의미)
+    pub current: usize,
+}
+
 /// 실행 세션을 나타내는 구조체
 /// 프로세스 실행 상태와 출력을 추적
 #[derive(Clone)]
@@ -52,6 +65,8 @@ pub struct RunSession {
     /// 실행 중인 프로세스의 PID
     /// 앱 종료 시 OS 레벨에서 직접 프로세스를 kill하기 위해 추적
     pub process_pid: Option<u32>,
+    /// 출력 검색/필터 상태 (검색바가 열려 있으면 `Some`)
+    pub search: Option<SearchState>,
 }
 
 impl std::fmt::Debug for RunSession {
@@ -92,7 +107,26 @@ impl RunSession {
             scroll_progress: 1.0, // 기본값: 맨 아래
             auto_scroll: true,    // 기본값: 자동 스크롤 활성화
             process_pid: None,
+            search: None,
         }
+    }
+
+    /// 검색어(대소문자 무시 부분일치)에 매치하는 `output_lines`의 위치 인덱스 목록.
+    /// 빈 검색어면 빈 목록. FIFO 제거로 인덱스가 변할 수 있어 매번 즉석 계산한다.
+    pub fn search_match_indices(&self, query: &str) -> Vec<usize> {
+        if query.is_empty() {
+            return Vec::new();
+        }
+        let needle = query.to_lowercase();
+        self.output_lines
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, segments))| {
+                let text: String = segments.iter().map(|seg| seg.text.as_str()).collect();
+                text.to_lowercase().contains(&needle)
+            })
+            .map(|(idx, _)| idx)
+            .collect()
     }
 
     /// 출력 라인을 추가하고 필요시 오래된 라인 제거
@@ -303,6 +337,20 @@ mod tests {
 
         session.exit_code = None; // 사용자 중지
         assert_eq!(session.status_kind(), SessionStatusKind::Stopped);
+    }
+
+    #[test]
+    fn search_match_indices_is_case_insensitive_substring() {
+        let mut session = RunSession::new("x".to_string());
+        session.add_output_line("Starting build");
+        session.add_output_line("ERROR: boom");
+        session.add_output_line("warning: minor");
+        session.add_output_line("error again");
+
+        assert_eq!(session.search_match_indices(""), Vec::<usize>::new());
+        assert_eq!(session.search_match_indices("error"), vec![1, 3]);
+        assert_eq!(session.search_match_indices("WARN"), vec![2]);
+        assert_eq!(session.search_match_indices("zzz"), Vec::<usize>::new());
     }
 
     #[test]

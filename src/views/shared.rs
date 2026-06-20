@@ -3,6 +3,13 @@ use iced::{
     Background, Border, Color, Shadow, Theme,
     widget::{button, container, text},
 };
+use uuid::Uuid;
+
+/// 세션 출력 검색바 입력 위젯의 안정적 Id (세션별 고유). Ctrl+F 포커스(app)와
+/// text_input `.id()`(pane_view)가 동일 Id를 공유하도록 한 곳에서 생성한다.
+pub(crate) fn session_search_input_id(session_id: Uuid) -> iced::advanced::widget::Id {
+    iced::advanced::widget::Id::from(format!("session-search-{session_id}"))
+}
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum IconButtonState {

@@ -221,6 +221,24 @@ pub enum Message {
     /// 자동 스크롤 토글 (세션 ID)
     ToggleAutoScroll(Uuid),
 
+    // 출력 검색/필터 (세션 ID로 식별)
+    /// 검색바 열기/포커스 (`session_id`)
+    OpenSessionSearch(Uuid),
+    /// 검색바 닫기 (`session_id`)
+    CloseSessionSearch(Uuid),
+    /// 검색어 변경 (`session_id`, 새 검색어)
+    SessionSearchChanged(Uuid, String),
+    /// 다음 매치로 이동 (`session_id`)
+    SessionSearchNext(Uuid),
+    /// 이전 매치로 이동 (`session_id`)
+    SessionSearchPrev(Uuid),
+    /// 필터 모드 토글(매치 라인만 표시) (`session_id`)
+    ToggleSessionSearchFilter(Uuid),
+    /// 활성 pane의 세션에 검색바 열기 (Ctrl+F — 대상 세션은 핸들러가 해석)
+    OpenSearchInActivePane,
+    /// 활성 검색바 닫기 (ESC — 대상 세션은 핸들러가 해석)
+    CloseActiveSearch,
+
     // URL 처리
     /// URL을 기본 브라우저로 열기
     OpenUrl(String),

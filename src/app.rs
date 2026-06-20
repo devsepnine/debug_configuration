@@ -1,7 +1,7 @@
 use crate::messages::{ConfigurationDropPosition, Message, ViewMode};
 use crate::models::{
     ConfigTypeData, ConfigurationType, ExecuteMode, ExecuteModeType, LayoutId, PackageManager,
-    RunConfiguration, RunSession, SessionStatusKind, WorkspaceTab,
+    RunConfiguration, RunSession, SearchState, SessionStatusKind, WorkspaceTab,
 };
 use crate::services::{
     AppSettings, load_from_path, load_settings, open_configurations, register_running_pid,
@@ -520,7 +520,15 @@ impl RunConfigManager {
             | Message::CopyToClipboard(_)
             | Message::OpenUrl(_)
             | Message::SessionScrollChanged(_, _)
-            | Message::ToggleAutoScroll(_) => self.handle_session_messages(message),
+            | Message::ToggleAutoScroll(_)
+            | Message::OpenSessionSearch(_)
+            | Message::CloseSessionSearch(_)
+            | Message::SessionSearchChanged(_, _)
+            | Message::SessionSearchNext(_)
+            | Message::SessionSearchPrev(_)
+            | Message::ToggleSessionSearchFilter(_)
+            | Message::OpenSearchInActivePane
+            | Message::CloseActiveSearch => self.handle_session_messages(message),
             Message::AddWorkspaceTab
             | Message::CloseTab(_)
             | Message::TabNameClicked(_)
@@ -667,6 +675,28 @@ impl RunConfigManager {
                 self.handle_session_scroll_changed(session_id, progress)
             }
             Message::ToggleAutoScroll(session_id) => self.handle_toggle_auto_scroll(session_id),
+            Message::OpenSessionSearch(session_id) => self.handle_open_session_search(session_id),
+            Message::CloseSessionSearch(session_id) => self.handle_close_session_search(session_id),
+            Message::SessionSearchChanged(session_id, query) => {
+                self.handle_session_search_changed(session_id, query)
+            }
+            Message::SessionSearchNext(session_id) => {
+                self.handle_session_search_step(session_id, 1)
+            }
+            Message::SessionSearchPrev(session_id) => {
+                self.handle_session_search_step(session_id, -1)
+            }
+            Message::ToggleSessionSearchFilter(session_id) => {
+                self.handle_toggle_session_search_filter(session_id)
+            }
+            Message::OpenSearchInActivePane => match self.focused_search_session_id() {
+                Some(session_id) => self.handle_open_session_search(session_id),
+                None => Task::none(),
+            },
+            Message::CloseActiveSearch => match self.focused_search_session_id() {
+                Some(session_id) => self.handle_close_session_search(session_id),
+                None => Task::none(),
+            },
             _ => unreachable!("non-session message routed to handle_session_messages"),
         }
     }
@@ -1929,6 +1959,94 @@ impl RunConfigManager {
         }
 
         Task::none()
+    }
+
+    fn handle_open_session_search(&mut self, session_id: Uuid) -> Task<Message> {
+        if let Some(session) = self.session_by_id_mut(session_id)
+            && session.search.is_none()
+        {
+            session.search = Some(SearchState::default());
+        }
+        // 검색바 입력에 포커스 (다음 view에서 위젯이 존재)
+        iced::widget::operation::focus(crate::views::shared::session_search_input_id(session_id))
+    }
+
+    fn handle_close_session_search(&mut self, session_id: Uuid) -> Task<Message> {
+        if let Some(session) = self.session_by_id_mut(session_id) {
+            session.search = None;
+        }
+        Task::none()
+    }
+
+    fn handle_session_search_changed(&mut self, session_id: Uuid, query: String) -> Task<Message> {
+        if let Some(session) = self.session_by_id_mut(session_id)
+            && let Some(search) = session.search.as_mut()
+        {
+            search.query = query;
+            search.current = 0; // 검색어 변경 시 첫 매치부터
+        }
+        Task::none()
+    }
+
+    fn handle_toggle_session_search_filter(&mut self, session_id: Uuid) -> Task<Message> {
+        if let Some(session) = self.session_by_id_mut(session_id)
+            && let Some(search) = session.search.as_mut()
+        {
+            search.filter = !search.filter;
+            search.current = 0;
+        }
+        Task::none()
+    }
+
+    /// 다음/이전 매치로 이동(`direction`: +1 다음, -1 이전)하고 해당 라인으로 스크롤.
+    fn handle_session_search_step(&mut self, session_id: Uuid, direction: i32) -> Task<Message> {
+        let Some(session) = self.session_by_id_mut(session_id) else {
+            return Task::none();
+        };
+        let Some(query) = session.search.as_ref().map(|s| s.query.clone()) else {
+            return Task::none();
+        };
+        let matches = session.search_match_indices(&query);
+        if matches.is_empty() {
+            return Task::none();
+        }
+        let len = matches.len();
+        let new_current = {
+            let Some(search) = session.search.as_mut() else {
+                return Task::none();
+            };
+            // 라이브 출력으로 매치 수가 줄었을 수 있으니 스텝 전에 범위로 클램프.
+            let base = search.current.min(len - 1);
+            search.current = if direction >= 0 {
+                (base + 1) % len
+            } else {
+                (base + len - 1) % len
+            };
+            search.current
+        };
+        // 매치 라인의 상대 위치로 스크롤하고 자동 스크롤은 해제.
+        // 0..=N-1 인덱스를 0.0..=1.0(1.0=맨 아래)로 매핑 (마지막 라인이 정확히 1.0).
+        let denom = session.output_lines.len().saturating_sub(1).max(1);
+        let line = matches[new_current];
+        session.scroll_progress = (line as f32 / denom as f32).clamp(0.0, 1.0);
+        session.auto_scroll = false;
+        Task::none()
+    }
+
+    /// Ctrl+F/ESC가 대상으로 삼을 세션. 활성 탭의 leaf pane 중 이미 검색바가 열린
+    /// 세션을 우선, 없으면 첫 세션 pane (다중 pane에서 정확한 대상은 pane의 검색 버튼 사용).
+    fn focused_search_session_id(&self) -> Option<Uuid> {
+        let tab = self.workspace_tabs.get(self.selected_tab_index)?;
+        let leaves = tab.layout_tree.collect_leaves();
+        leaves
+            .iter()
+            .filter_map(|(_, pane)| pane.session_id)
+            .find(|id| {
+                self.sessions
+                    .iter()
+                    .any(|s| s.id == *id && s.search.is_some())
+            })
+            .or_else(|| leaves.iter().find_map(|(_, pane)| pane.session_id))
     }
 
     fn handle_pane_grid_resized(&mut self, event: pane_grid::ResizeEvent) -> Task<Message> {
@@ -3237,6 +3355,29 @@ impl RunConfigManager {
             _ => None,
         });
 
+        // 세션 화면에서 Ctrl/Cmd+F = 검색 열기, ESC = 검색 닫기. 대상 세션은 핸들러가
+        // 해석한다(클로저는 fn 포인터라 self 접근 불가). 모달이 열려 있으면 비활성화해
+        // 모달 ESC 처리와 충돌하지 않게 한다.
+        let session_search_subscription =
+            if matches!(self.current_view, ViewMode::Sessions) && self.env_modal.is_none() {
+                event::listen_with(|event, _status, _id| match event {
+                    Event::Keyboard(keyboard::Event::KeyPressed {
+                        key: keyboard::Key::Character(ref c),
+                        modifiers,
+                        ..
+                    }) if modifiers.command() && c.as_str() == "f" => {
+                        Some(Message::OpenSearchInActivePane)
+                    }
+                    Event::Keyboard(keyboard::Event::KeyPressed {
+                        key: keyboard::Key::Named(keyboard::key::Named::Escape),
+                        ..
+                    }) => Some(Message::CloseActiveSearch),
+                    _ => None,
+                })
+            } else {
+                Subscription::none()
+            };
+
         Subscription::batch([
             cursor_subscription,
             configuration_release_subscription,
@@ -3244,6 +3385,7 @@ impl RunConfigManager {
             env_modal_keyboard_subscription,
             tab_name_edit_subscription,
             window_focus_subscription,
+            session_search_subscription,
             window::open_events().map(Message::WindowOpened),
             window::resize_events().map(|(id, size)| Message::WindowResized(id, size)),
         ])
