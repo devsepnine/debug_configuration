@@ -527,6 +527,7 @@ impl RunConfigManager {
             | Message::SessionSearchNext(_)
             | Message::SessionSearchPrev(_)
             | Message::ToggleSessionSearchFilter(_)
+            | Message::ToggleSessionSearchRegex(_)
             | Message::OpenSearchInActivePane
             | Message::CloseActiveSearch => self.handle_session_messages(message),
             Message::AddWorkspaceTab
@@ -688,6 +689,9 @@ impl RunConfigManager {
             }
             Message::ToggleSessionSearchFilter(session_id) => {
                 self.handle_toggle_session_search_filter(session_id)
+            }
+            Message::ToggleSessionSearchRegex(session_id) => {
+                self.handle_toggle_session_search_regex(session_id)
             }
             Message::OpenSearchInActivePane => match self.focused_search_session_id() {
                 Some(session_id) => self.handle_open_session_search(session_id),
@@ -2011,6 +2015,18 @@ impl RunConfigManager {
             // 표시만 바뀌므로 current만 첫 매치로 리셋한다.
             search.filter = !search.filter;
             search.current = 0;
+        }
+        Task::none()
+    }
+
+    fn handle_toggle_session_search_regex(&mut self, session_id: Uuid) -> Task<Message> {
+        if let Some(session) = self.session_by_id_mut(session_id) {
+            if let Some(search) = session.search.as_mut() {
+                search.regex = !search.regex;
+                search.current = 0;
+            }
+            // 정규식 모드 변경은 매치 집합을 바꾸므로 캐시 재계산.
+            session.refresh_search_matches();
         }
         Task::none()
     }

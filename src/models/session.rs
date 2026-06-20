@@ -23,8 +23,9 @@ pub enum SessionStatusKind {
 const MAX_OUTPUT_LINES: usize = 2000;
 
 /// 세션 출력 검색/필터 상태. 검색바가 열려 있을 때만 `Some`.
-/// 매칭은 대소문자 무시 부분일치(라인 단위)이며, 매치 인덱스는 항상 현재
-/// `output_lines`에서 즉석 계산하므로(실시간 출력에도 신선) 여기 캐시하지 않는다.
+/// 매칭은 라인 단위이며 기본은 대소문자 무시 부분일치, `regex`면 대소문자 무시
+/// 정규식. 매치 인덱스(`matches`)는 출력/검색어 변경 시 `refresh_search_matches`로
+/// 갱신해 캐시한다(뷰는 매 프레임 재스캔 대신 캐시만 읽음).
 #[derive(Debug, Clone, Default)]
 pub struct SearchState {
     /// 검색어
@@ -33,6 +34,8 @@ pub struct SearchState {
     pub filter: bool,
     /// 현재 매치 순번 (매치 목록 기준 0-based; 매치가 있을 때만 의미)
     pub current: usize,
+    /// 정규식 모드 (off면 대소문자 무시 부분일치)
+    pub regex: bool,
     /// 매치 라인의 `output_lines` 위치 인덱스 캐시. 매 프레임 재스캔을 피하려고
     /// 검색어/출력이 바뀔 때만 `refresh_search_matches`로 갱신한다(뷰는 읽기만).
     pub matches: Vec<usize>,
@@ -118,10 +121,10 @@ impl RunSession {
     /// 범위 내로 클램프한다. 출력 추가/검색어 변경 등 상태 변화 시 `update()`에서
     /// 호출한다. 검색바가 닫혀 있으면(`search` None) no-op.
     pub fn refresh_search_matches(&mut self) {
-        let Some(query) = self.search.as_ref().map(|s| s.query.clone()) else {
+        let Some((query, regex)) = self.search.as_ref().map(|s| (s.query.clone(), s.regex)) else {
             return;
         };
-        let matches = self.search_match_indices(&query);
+        let matches = self.search_match_indices(&query, regex);
         if let Some(search) = self.search.as_mut() {
             let len = matches.len();
             search.matches = matches;
@@ -133,22 +136,41 @@ impl RunSession {
         }
     }
 
-    /// 검색어(대소문자 무시 부분일치)에 매치하는 `output_lines`의 위치 인덱스 목록.
+    /// 검색어에 매치하는 `output_lines`의 위치 인덱스 목록. `regex`면 대소문자 무시
+    /// 정규식(잘못된 패턴은 매치 없음으로 처리), 아니면 대소문자 무시 부분일치.
     /// 빈 검색어면 빈 목록. FIFO 제거로 인덱스가 변할 수 있어 매번 즉석 계산한다.
-    pub fn search_match_indices(&self, query: &str) -> Vec<usize> {
+    pub fn search_match_indices(&self, query: &str, regex: bool) -> Vec<usize> {
         if query.is_empty() {
             return Vec::new();
         }
-        let needle = query.to_lowercase();
-        self.output_lines
-            .iter()
-            .enumerate()
-            .filter(|(_, (_, segments))| {
-                let text: String = segments.iter().map(|seg| seg.text.as_str()).collect();
-                text.to_lowercase().contains(&needle)
-            })
-            .map(|(idx, _)| idx)
-            .collect()
+
+        let line_text = |segments: &[TextSegment]| -> String {
+            segments.iter().map(|seg| seg.text.as_str()).collect()
+        };
+
+        if regex {
+            // 잘못된 패턴은 빈 결과(패닉/크래시 방지). 컴파일은 refresh 시점에만 일어난다.
+            let Ok(re) = regex::RegexBuilder::new(query)
+                .case_insensitive(true)
+                .build()
+            else {
+                return Vec::new();
+            };
+            self.output_lines
+                .iter()
+                .enumerate()
+                .filter(|(_, (_, segments))| re.is_match(&line_text(segments)))
+                .map(|(idx, _)| idx)
+                .collect()
+        } else {
+            let needle = query.to_lowercase();
+            self.output_lines
+                .iter()
+                .enumerate()
+                .filter(|(_, (_, segments))| line_text(segments).to_lowercase().contains(&needle))
+                .map(|(idx, _)| idx)
+                .collect()
+        }
     }
 
     /// 출력 라인을 추가하고 필요시 오래된 라인 제거
@@ -369,10 +391,29 @@ mod tests {
         session.add_output_line("warning: minor");
         session.add_output_line("error again");
 
-        assert_eq!(session.search_match_indices(""), Vec::<usize>::new());
-        assert_eq!(session.search_match_indices("error"), vec![1, 3]);
-        assert_eq!(session.search_match_indices("WARN"), vec![2]);
-        assert_eq!(session.search_match_indices("zzz"), Vec::<usize>::new());
+        assert_eq!(session.search_match_indices("", false), Vec::<usize>::new());
+        assert_eq!(session.search_match_indices("error", false), vec![1, 3]);
+        assert_eq!(session.search_match_indices("WARN", false), vec![2]);
+        assert_eq!(
+            session.search_match_indices("zzz", false),
+            Vec::<usize>::new()
+        );
+    }
+
+    #[test]
+    fn search_match_indices_supports_regex_case_insensitive() {
+        let mut session = RunSession::new("x".to_string());
+        session.add_output_line("error 12");
+        session.add_output_line("warn 3");
+        session.add_output_line("ERROR 999");
+
+        // 대소문자 무시 정규식: "err...<공백><숫자>"
+        assert_eq!(
+            session.search_match_indices(r"err\w* \d+", true),
+            vec![0, 2]
+        );
+        // 잘못된 패턴은 매치 없음 (패닉 없음)
+        assert_eq!(session.search_match_indices("[", true), Vec::<usize>::new());
     }
 
     #[test]

@@ -401,8 +401,18 @@ fn view_session_search_bar(session: &RunSession) -> Element<'_, Message> {
 
     // 캐시된 매치 수 사용 (매 프레임 재스캔 방지; app의 update에서 갱신됨).
     let total = search.matches.len();
+    // 정규식 모드에서 패턴이 잘못됐는지 가벼운 유효성 검사(표시용; 컴파일 1회).
+    // 매칭 경로와 동일한 빌더(case_insensitive)를 써 유효성 판정을 일치시킨다.
+    let invalid_regex = search.regex
+        && !search.query.is_empty()
+        && regex::RegexBuilder::new(&search.query)
+            .case_insensitive(true)
+            .build()
+            .is_err();
     let count_text = if search.query.is_empty() {
         String::new()
+    } else if invalid_regex {
+        String::from("bad regex")
     } else if total == 0 {
         String::from("0/0")
     } else {
@@ -431,6 +441,11 @@ fn view_session_search_bar(session: &RunSession) -> Element<'_, Message> {
     } else {
         IconButtonState::Inactive
     };
+    let regex_state = if search.regex {
+        IconButtonState::Active
+    } else {
+        IconButtonState::Inactive
+    };
 
     let controls = row![
         glyph_button(
@@ -444,6 +459,12 @@ fn view_session_search_bar(session: &RunSession) -> Element<'_, Message> {
             "Next match (Enter)",
             Message::SessionSearchNext(session_id),
             IconButtonState::Active
+        ),
+        glyph_button(
+            ".*",
+            "Regex (case-insensitive)",
+            Message::ToggleSessionSearchRegex(session_id),
+            regex_state
         ),
         glyph_button(
             "filter",

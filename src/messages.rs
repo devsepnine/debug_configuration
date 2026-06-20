@@ -234,6 +234,8 @@ pub enum Message {
     SessionSearchPrev(Uuid),
     /// 필터 모드 토글(매치 라인만 표시) (`session_id`)
     ToggleSessionSearchFilter(Uuid),
+    /// 정규식 모드 토글 (`session_id`)
+    ToggleSessionSearchRegex(Uuid),
     /// 활성 pane의 세션에 검색바 열기 (Ctrl+F — 대상 세션은 핸들러가 해석)
     OpenSearchInActivePane,
     /// 활성 검색바 닫기 (ESC — 대상 세션은 핸들러가 해석)
