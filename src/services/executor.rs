@@ -341,13 +341,17 @@ fn take_process_streams(
 
 /// 출력 펌프 루프. 취소되면 `true`, stdout/stderr가 모두 닫혀 정상 종료되면 `false` 반환.
 /// 실제 프로세스 종료(kill/reap)는 호출자(`handle_spawned_process`)가 담당한다.
-async fn process_output_loop(
+async fn process_output_loop<O, E>(
     output: &mut iced::futures::channel::mpsc::Sender<Message>,
     session_id: Uuid,
-    stdout_reader: &mut Option<tokio::io::BufReader<ChildStdout>>,
-    stderr_reader: &mut Option<tokio::io::BufReader<ChildStderr>>,
+    stdout_reader: &mut Option<tokio::io::BufReader<O>>,
+    stderr_reader: &mut Option<tokio::io::BufReader<E>>,
     cancel_flag: &Arc<AtomicBool>,
-) -> bool {
+) -> bool
+where
+    O: tokio::io::AsyncRead + Unpin,
+    E: tokio::io::AsyncRead + Unpin,
+{
     loop {
         tokio::select! {
             // 취소 신호를 출력 읽기보다 우선 처리.
@@ -355,12 +359,16 @@ async fn process_output_loop(
             () = wait_for_cancel(cancel_flag) => {
                 return true;
             }
-            result = read_next_line(stdout_reader) => {
+            // `if .is_some()` 전제조건 필수: reader가 None이면 read_next_line이 즉시
+            // Ok(None)을 반환해, biased select가 매 루프마다 이 분기만 선택하고 다른
+            // reader를 영영 폴링하지 않는 livelock(한쪽 EOF 후 CPU 100% busy-spin,
+            // RunCompleted 미발송)이 발생한다. 전제조건으로 None 분기를 비활성화한다.
+            result = read_next_line(stdout_reader), if stdout_reader.is_some() => {
                 if handle_line_result(output, session_id, result).await {
                     *stdout_reader = None;
                 }
             }
-            result = read_next_line(stderr_reader) => {
+            result = read_next_line(stderr_reader), if stderr_reader.is_some() => {
                 if handle_line_result(output, session_id, result).await {
                     *stderr_reader = None;
                 }
@@ -744,6 +752,40 @@ mod tests {
         assert_eq!(
             package_manager_command_args("bun", NodeCommand::Build, None),
             vec![String::from("run"), String::from("build")]
+        );
+    }
+
+    /// 회귀 방지: 한쪽 reader가 먼저 EOF(None)가 돼도 출력 루프가 정상 종료해야 한다.
+    /// 과거 `tokio::select! { biased; ... }`가 None reader 분기(즉시 Ok(None))만 계속
+    /// 선택해 다른 reader를 영영 폴링하지 않는 livelock이 있었다 (CPU 100%, RunCompleted
+    /// 미발송 → 알림/exit code 미표시). `if reader.is_some()` 전제조건으로 해소됨.
+    #[tokio::test]
+    async fn output_loop_terminates_when_one_reader_eofs_first() {
+        use tokio::io::BufReader;
+
+        let (mut tx, _rx) = iced::futures::channel::mpsc::channel::<Message>(100);
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        // stdout: 데이터 후 EOF / stderr: 즉시 EOF (실제 "echo 후 종료" 시나리오 재현).
+        let stdout_data: &[u8] = b"out1\nout2\n";
+        let stderr_data: &[u8] = b"";
+        let mut stdout = Some(BufReader::new(stdout_data));
+        let mut stderr = Some(BufReader::new(stderr_data));
+
+        let completed = tokio::time::timeout(
+            Duration::from_secs(5),
+            process_output_loop(&mut tx, Uuid::new_v4(), &mut stdout, &mut stderr, &cancel),
+        )
+        .await
+        .expect("output loop livelocked (timed out) — biased select starvation regressed");
+
+        assert!(
+            !completed,
+            "both readers at EOF should report normal completion (false), not cancel"
+        );
+        assert!(
+            stdout.is_none() && stderr.is_none(),
+            "both readers should be drained to None"
         );
     }
 
