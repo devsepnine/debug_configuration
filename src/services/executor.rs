@@ -393,11 +393,24 @@ where
 {
     use tokio::io::AsyncBufReadExt;
 
-    if let Some(reader) = reader.as_mut() {
-        reader.lines().next_line().await
-    } else {
-        Ok(None)
+    let Some(reader) = reader.as_mut() else {
+        return Ok(None);
+    };
+
+    // 바이트 단위로 한 줄을 읽어 lossy 디코딩한다. AsyncBufReadExt::lines()는 유효한
+    // UTF-8만 허용해, 비UTF-8 로케일(LANG=C, ISO-8859, Shift-JIS 등) 출력의 첫
+    // 유효하지 않은 바이트에서 Err를 반환 → 호출부가 EOF로 처리해 이후 출력이 전부
+    // 유실된다. 바이트로 읽고 from_utf8_lossy로 변환하면 유실 없이 표시된다.
+    let mut buf = Vec::new();
+    if reader.read_until(b'\n', &mut buf).await? == 0 {
+        return Ok(None); // EOF
     }
+
+    // 개행은 호출부에서 다시 부여하므로 트림한다 (CRLF/LF 모두).
+    while matches!(buf.last(), Some(b'\n' | b'\r')) {
+        buf.pop();
+    }
+    Ok(Some(String::from_utf8_lossy(&buf).into_owned()))
 }
 
 async fn handle_line_result(
@@ -550,7 +563,13 @@ fn build_script_file_command(
 
     match extension.as_deref() {
         Some("py") => {
-            generic_interpreter_command("python", interp_opts, &script_path_quoted, script_options)
+            // Windows는 `python` 런처, 그 외(Linux/macOS)는 `python3`가 표준.
+            // (Ubuntu는 python3만 제공, macOS 12.3+는 /usr/bin/python 제거)
+            #[cfg(target_os = "windows")]
+            const PYTHON: &str = "python";
+            #[cfg(not(target_os = "windows"))]
+            const PYTHON: &str = "python3";
+            generic_interpreter_command(PYTHON, interp_opts, &script_path_quoted, script_options)
         }
         Some("js") => {
             generic_interpreter_command("node", interp_opts, &script_path_quoted, script_options)

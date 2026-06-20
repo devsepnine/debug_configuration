@@ -1829,8 +1829,12 @@ impl RunConfigManager {
     }
 
     fn handle_open_url(&mut self, url: &str) -> Task<Message> {
-        let _ = open::that(url);
-        self.status_message = format!("Opening URL: {url}");
+        // 결과를 반영한다. Linux에 xdg-open(xdg-utils)이 없으면 Err가 나는데,
+        // 무시하면 "Opening URL"만 표시되고 아무 일도 안 일어나 혼란을 준다.
+        self.status_message = match open::that(url) {
+            Ok(()) => format!("Opening URL: {url}"),
+            Err(error) => format!("Failed to open URL: {error}"),
+        };
         Task::none()
     }
 

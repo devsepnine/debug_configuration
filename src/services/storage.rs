@@ -1,6 +1,6 @@
 use crate::models::RunConfiguration;
 use crate::utils::DIALOG_CANCELLED;
-use rfd::FileDialog;
+use rfd::AsyncFileDialog;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -145,10 +145,14 @@ pub async fn save_configurations(
 ) -> Result<PathBuf, String> {
     let file_path = match current_path {
         Some(path) => path,
-        None => FileDialog::new()
+        // AsyncFileDialog는 내부적으로 메인 스레드로 마샬링하므로, Task::perform가
+        // 워커 스레드에서 폴링해도 안전하다 (macOS AppKit runModal()은 메인 스레드 전용).
+        None => AsyncFileDialog::new()
             .add_filter("JSON", &["json"])
             .set_file_name("configurations.json")
             .save_file()
+            .await
+            .map(|handle| handle.path().to_path_buf())
             .ok_or_else(|| DIALOG_CANCELLED.to_string())?,
     };
 
@@ -165,9 +169,12 @@ pub async fn save_configurations(
 /// * `Ok((Vec<RunConfiguration>, PathBuf))` - 열린 구성 목록과 파일 경로
 /// * `Err(String)` - 열기 실패 시 에러 메시지
 pub async fn open_configurations() -> Result<(Vec<RunConfiguration>, PathBuf), String> {
-    let file_path = FileDialog::new()
+    // off-main 안전성을 위해 AsyncFileDialog 사용 (save_configurations 참고).
+    let file_path = AsyncFileDialog::new()
         .add_filter("JSON", &["json"])
         .pick_file()
+        .await
+        .map(|handle| handle.path().to_path_buf())
         .ok_or_else(|| DIALOG_CANCELLED.to_string())?;
 
     let content =
