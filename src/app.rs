@@ -7,7 +7,7 @@ use crate::services::{
     AppSettings, load_from_path, load_settings, open_configurations, register_running_pid,
     run_configuration_stream, save_configurations, save_settings, unregister_running_pid,
 };
-use crate::utils::{DIALOG_CANCELLED, ICON_DELETE, ICON_STOP};
+use crate::utils::{DIALOG_CANCELLED, ICON_DELETE, ICON_PLAY, ICON_REFRESH, ICON_STOP};
 use crate::views::shared::icon_tooltip;
 use crate::views::{
     EditorLoadingState, EditorSelectState, EnvModalView, FileDialogLoadingState, NodeLoadingState,
@@ -440,6 +440,9 @@ impl RunConfigManager {
             | Message::RemoveSession(_)
             | Message::OpenSessionInWorkspace(_)
             | Message::SessionListItemHovered(_)
+            | Message::StopAllSessions
+            | Message::RerunAllSessions
+            | Message::RerunFailedSessions
             | Message::CopyToClipboard(_)
             | Message::OpenUrl(_)
             | Message::SessionScrollChanged(_, _)
@@ -577,6 +580,9 @@ impl RunConfigManager {
                 self.hovered_session_index = session_index;
                 Task::none()
             }
+            Message::StopAllSessions => self.handle_stop_all_sessions(),
+            Message::RerunAllSessions => self.handle_rerun_all_sessions(),
+            Message::RerunFailedSessions => self.handle_rerun_failed_sessions(),
             Message::CopyToClipboard(text) => iced::clipboard::write(text),
             Message::OpenUrl(url) => self.handle_open_url(&url),
             Message::SessionScrollChanged(session_id, progress) => {
@@ -2032,6 +2038,62 @@ impl RunConfigManager {
         Task::none()
     }
 
+    /// 실행 중인 모든 세션 중지 (각 세션의 기존 stop 경로 재사용).
+    fn handle_stop_all_sessions(&mut self) -> Task<Message> {
+        let running: Vec<Uuid> = self
+            .sessions
+            .iter()
+            .filter(|session| session.is_running)
+            .map(|session| session.id)
+            .collect();
+
+        let count = running.len();
+        for session_id in running {
+            let _ = self.handle_stop_session(session_id);
+        }
+
+        self.status_message = if count == 0 {
+            String::from("No running sessions to stop")
+        } else {
+            format!("Stopping {count} session(s)...")
+        };
+        Task::none()
+    }
+
+    /// 모든 세션 재실행.
+    fn handle_rerun_all_sessions(&mut self) -> Task<Message> {
+        let ids: Vec<Uuid> = self.sessions.iter().map(|session| session.id).collect();
+        self.rerun_sessions(&ids, "session(s)")
+    }
+
+    /// 실패(0이 아닌 종료 코드)한 세션만 재실행.
+    fn handle_rerun_failed_sessions(&mut self) -> Task<Message> {
+        let ids: Vec<Uuid> = self
+            .sessions
+            .iter()
+            .filter(|session| {
+                !session.is_running && session.exit_code.is_some_and(|code| code != 0)
+            })
+            .map(|session| session.id)
+            .collect();
+        self.rerun_sessions(&ids, "failed session(s)")
+    }
+
+    /// 주어진 세션 id들을 각각 재실행하고 Task들을 배치로 묶는다.
+    fn rerun_sessions(&mut self, ids: &[Uuid], noun: &str) -> Task<Message> {
+        if ids.is_empty() {
+            self.status_message = format!("No {noun} to rerun");
+            return Task::none();
+        }
+
+        let mut tasks = Vec::with_capacity(ids.len());
+        for &session_id in ids {
+            tasks.push(self.handle_rerun_session(session_id));
+        }
+        self.status_message = format!("Rerunning {} {noun}...", ids.len());
+        Task::batch(tasks)
+    }
+
     /// 기존 탭과 충돌하지 않는 `Workspace N` 형식의 이름 생성 (가장 작은 빈 번호).
     /// `exclude`로 지정한 인덱스의 탭은 점유 검사에서 제외한다 — 이름을 비워 확정할 때
     /// 그 탭이 원래 쓰던 번호를 그대로 되찾도록 하기 위함.
@@ -2580,13 +2642,45 @@ impl RunConfigManager {
 
     fn view_session_list_panel(&self) -> Element<'_, Message> {
         let current_tab = self.workspace_tabs.get(self.selected_tab_index);
-        let header = row![
-            text("Sessions").size(13),
-            Space::new().width(Length::Fill),
-            text(self.sessions.len().to_string()).size(11),
-        ]
-        .align_y(Alignment::Center)
-        .padding([0, 8]);
+
+        let has_running = self.sessions.iter().any(|session| session.is_running);
+        let has_failed = self
+            .sessions
+            .iter()
+            .any(|session| !session.is_running && session.exit_code.is_some_and(|code| code != 0));
+
+        let mut header = row![text("Sessions").size(13), Space::new().width(Length::Fill)]
+            .spacing(3)
+            .align_y(Alignment::Center)
+            .padding([0, 8]);
+
+        if !self.sessions.is_empty() {
+            header = header
+                .push(Self::view_session_action_button(
+                    "Stop all running",
+                    ICON_STOP,
+                    has_running.then_some(Message::StopAllSessions),
+                    SessionActionKind::Stop,
+                    has_running,
+                ))
+                .push(Self::view_session_action_button(
+                    "Rerun all",
+                    ICON_REFRESH,
+                    Some(Message::RerunAllSessions),
+                    SessionActionKind::Remove,
+                    true,
+                ))
+                .push(Self::view_session_action_button(
+                    "Rerun failed",
+                    ICON_PLAY,
+                    has_failed.then_some(Message::RerunFailedSessions),
+                    SessionActionKind::Remove,
+                    has_failed,
+                ))
+                .push(Space::new().width(4));
+        }
+
+        let header = header.push(text(self.sessions.len().to_string()).size(11));
 
         let mut list = column![].spacing(4).padding([8, 6]);
 
@@ -3388,5 +3482,77 @@ mod tests {
             members.is_empty(),
             "deleted ids must be stripped from members"
         );
+    }
+
+    fn manager_with_named_sessions(names: &[&str]) -> RunConfigManager {
+        let (mut app, _task) = RunConfigManager::new();
+        // 재실행이 이름으로 구성을 찾으므로 동일 이름의 구성도 함께 만든다.
+        app.configurations = names
+            .iter()
+            .map(|n| RunConfiguration {
+                name: (*n).to_string(),
+                ..RunConfiguration::default()
+            })
+            .collect();
+        app.sessions = names
+            .iter()
+            .map(|n| RunSession::new((*n).to_string()))
+            .collect();
+        app
+    }
+
+    #[test]
+    fn stop_all_cancels_only_running_sessions() {
+        let (mut app, _ids) = manager_with_sessions(&["a", "b", "c"]);
+        app.sessions[1].is_running = false; // b는 종료됨
+        let _ = app.handle_stop_all_sessions();
+        assert!(app.sessions[0].cancel_flag.load(Ordering::Relaxed));
+        assert!(!app.sessions[1].cancel_flag.load(Ordering::Relaxed));
+        assert!(app.sessions[2].cancel_flag.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn rerun_failed_reruns_only_nonzero_exit_sessions() {
+        let mut app = manager_with_named_sessions(&["ok", "fail"]);
+        app.sessions[0].is_running = false;
+        app.sessions[0].exit_code = Some(0);
+        app.sessions[1].is_running = false;
+        app.sessions[1].exit_code = Some(1);
+
+        let _ = app.handle_rerun_failed_sessions();
+
+        let ok = app.sessions.iter().find(|s| s.config_name == "ok").unwrap();
+        assert!(!ok.is_running, "exit-0 session must not be rerun");
+        assert_eq!(ok.exit_code, Some(0));
+
+        let fail = app
+            .sessions
+            .iter()
+            .find(|s| s.config_name == "fail")
+            .unwrap();
+        assert!(fail.is_running, "failed session must be rerun");
+        assert_eq!(fail.exit_code, None);
+    }
+
+    #[test]
+    fn rerun_all_reruns_every_session() {
+        let mut app = manager_with_named_sessions(&["a", "b"]);
+        app.sessions[0].is_running = false;
+        app.sessions[0].exit_code = Some(0);
+        app.sessions[1].is_running = false;
+        app.sessions[1].exit_code = Some(1);
+
+        let _ = app.handle_rerun_all_sessions();
+
+        assert!(app.sessions.iter().all(|s| s.is_running));
+    }
+
+    #[test]
+    fn rerun_failed_with_no_failures_is_noop() {
+        let mut app = manager_with_named_sessions(&["a"]);
+        // 실행 중 세션만 있음 (실패 없음)
+        let _ = app.handle_rerun_failed_sessions();
+        assert!(app.sessions[0].is_running);
+        assert!(app.status_message.contains("No failed"));
     }
 }

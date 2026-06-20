@@ -171,6 +171,12 @@ pub enum Message {
     OpenSessionInWorkspace(Uuid),
     /// 세션 리스트 항목 hover 상태 변경 (표시용 인덱스)
     SessionListItemHovered(Option<usize>),
+    /// 실행 중인 모든 세션 중지
+    StopAllSessions,
+    /// 모든 세션 재실행
+    RerunAllSessions,
+    /// 실패(0이 아닌 종료 코드)한 세션만 재실행
+    RerunFailedSessions,
 
     // 워크스페이스 탭 관리 메시지
     /// 새 워크스페이스 탭 추가
