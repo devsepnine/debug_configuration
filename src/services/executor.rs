@@ -88,6 +88,41 @@ fn quote_if_needed(path: &str) -> String {
 ///
 /// # Returns
 /// 실행 중 발생하는 이벤트를 담은 Message 스트림
+/// 스트림 태스크가 RunCompleted를 보내지 못한 채 종료되면(패닉 unwind 등) 세션이
+/// `is_running` 상태로 영구 고착되고 종료 알림/exit code도 영영 오지 않는다. 이 가드는
+/// 정상 종료 시 `disarm`되며, armed인 채로 drop되면 종료 보장용 RunCompleted(Err)를
+/// best-effort(try_send)로 발행한다.
+struct CompletionGuard {
+    output: iced::futures::channel::mpsc::Sender<Message>,
+    session_id: Uuid,
+    armed: bool,
+}
+
+impl CompletionGuard {
+    fn new(output: iced::futures::channel::mpsc::Sender<Message>, session_id: Uuid) -> Self {
+        Self {
+            output,
+            session_id,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CompletionGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.output.try_send(Message::RunCompleted(
+                self.session_id,
+                Err(String::from("Run interrupted unexpectedly")),
+            ));
+        }
+    }
+}
+
 pub fn run_configuration_stream(
     config: RunConfiguration,
     session_id: Uuid,
@@ -96,6 +131,9 @@ pub fn run_configuration_stream(
     stream::channel(
         100,
         move |mut output: iced::futures::channel::mpsc::Sender<Message>| async move {
+            // 종료 보장 가드: 정상 경로의 끝에서 disarm한다.
+            let mut completion = CompletionGuard::new(output.clone(), session_id);
+
             let (command_str, extra_env) = build_command(&config);
             let mut cmd = create_process_command(&config, &command_str, &extra_env);
             send_command_info(&mut output, session_id, &config, &command_str, &extra_env).await;
@@ -113,8 +151,20 @@ pub fn run_configuration_stream(
                     .await;
                 }
             }
+
+            completion.disarm();
         },
     )
+}
+
+/// PowerShell 실행 파일 탐지(LazyLock)를 미리 초기화한다. 이 탐지는 한 번 blocking
+/// subprocess(pwsh 스폰+대기)를 수행하므로, 앱 시작 시 메인 스레드에서 미리 호출해
+/// 두면 첫 구성 실행이 tokio 워커에서 블로킹되는 것을 방지한다. Windows 외에는 no-op.
+pub fn prewarm_shell_detection() {
+    #[cfg(windows)]
+    {
+        let _ = windows_powershell_exe();
+    }
 }
 
 /// 구성으로부터 셸에서 실행할 명령 문자열과, 프로세스에 직접 주입할 환경변수 목록을 생성.
@@ -309,7 +359,7 @@ async fn handle_spawned_process(
         )
         .await;
     } else {
-        wait_for_process(output, session_id, &mut child).await;
+        wait_for_process(output, session_id, &mut child, &cancel_flag).await;
     }
 }
 
@@ -401,6 +451,13 @@ where
 {
     use tokio::io::AsyncBufReadExt;
 
+    // 줄당 누적 상한. 개행 없이 대량 출력하는 자식(progress bar의 \r-only 출력,
+    // `yes | tr -d '\n'` 등)이 버퍼를 무한히 키워 OOM으로 앱 전체가 죽는 것을 막는다.
+    // 상한 도달 시 개행을 기다리지 않고 현재까지의 청크를 한 줄로 flush한다. 검사는
+    // fill_buf 청크 단위로 이루어지므로 실제 flush 크기는 상한 + 최대 한 버퍼 청크까지
+    // 살짝 초과할 수 있다(메모리는 여전히 상수 상한으로 묶임).
+    const MAX_LINE_BYTES: usize = 1024 * 1024;
+
     let Some(reader) = reader.as_mut() else {
         return Ok(None);
     };
@@ -408,15 +465,44 @@ where
     // 바이트 단위로 한 줄을 읽어 lossy 디코딩한다. AsyncBufReadExt::lines()는 유효한
     // UTF-8만 허용해, 비UTF-8 로케일(LANG=C, ISO-8859, Shift-JIS 등) 출력의 첫
     // 유효하지 않은 바이트에서 Err를 반환 → 호출부가 EOF로 처리해 이후 출력이 전부
-    // 유실된다. 바이트로 읽고 from_utf8_lossy로 변환하면 유실 없이 표시된다.
+    // 유실된다. fill_buf/consume로 직접 읽고 from_utf8_lossy로 변환하면 유실 없이
+    // 표시하면서 줄 길이 상한도 강제할 수 있다.
     let mut buf = Vec::new();
-    if reader.read_until(b'\n', &mut buf).await? == 0 {
-        return Ok(None); // EOF
+    let mut found_newline = false;
+    loop {
+        let consumed = {
+            let available = reader.fill_buf().await?;
+            if available.is_empty() {
+                break; // EOF
+            }
+            match available.iter().position(|&b| b == b'\n') {
+                Some(pos) => {
+                    buf.extend_from_slice(&available[..=pos]);
+                    found_newline = true;
+                    pos + 1
+                }
+                None => {
+                    buf.extend_from_slice(available);
+                    available.len()
+                }
+            }
+        };
+        reader.consume(consumed);
+        if found_newline || buf.len() >= MAX_LINE_BYTES {
+            break;
+        }
     }
 
-    // 개행은 호출부에서 다시 부여하므로 트림한다 (CRLF/LF 모두).
-    while matches!(buf.last(), Some(b'\n' | b'\r')) {
-        buf.pop();
+    if buf.is_empty() {
+        return Ok(None); // EOF, 더 읽을 것 없음
+    }
+
+    // 개행은 호출부에서 다시 부여하므로 트림한다 (CRLF/LF). 상한으로 잘린 청크는
+    // 개행이 없으므로 트림하지 않는다.
+    if found_newline {
+        while matches!(buf.last(), Some(b'\n' | b'\r')) {
+            buf.pop();
+        }
     }
     Ok(Some(String::from_utf8_lossy(&buf).into_owned()))
 }
@@ -442,19 +528,35 @@ async fn wait_for_process(
     output: &mut iced::futures::channel::mpsc::Sender<Message>,
     session_id: Uuid,
     child: &mut Child,
+    cancel_flag: &Arc<AtomicBool>,
 ) {
-    match child.wait().await {
-        Ok(status) => {
-            send_run_result(output, session_id, Ok(status.code().unwrap_or(-1))).await;
-        }
-        Err(e) => {
+    // 종료 대기 중에도 cancel_flag를 관찰한다. 자식이 stdout/stderr를 닫았지만(EOF로
+    // process_output_loop가 빠져나옴) 아직 종료하지 않은 경우, cancel 관찰이 없으면
+    // child.wait()가 영원히 블록되어 Stop이 무반응이 되고 세션이 is_running에 고착된다.
+    tokio::select! {
+        biased;
+        () = wait_for_cancel(cancel_flag) => {
+            terminate_and_reap(child).await;
             send_run_result(
                 output,
                 session_id,
-                Err(format!("Failed to wait for process: {e}")),
+                Err(String::from("Process stopped by user")),
             )
             .await;
         }
+        wait_result = child.wait() => match wait_result {
+            Ok(status) => {
+                send_run_result(output, session_id, Ok(status.code().unwrap_or(-1))).await;
+            }
+            Err(e) => {
+                send_run_result(
+                    output,
+                    session_id,
+                    Err(format!("Failed to wait for process: {e}")),
+                )
+                .await;
+            }
+        },
     }
 }
 
@@ -787,6 +889,31 @@ mod tests {
             stdout.is_none() && stderr.is_none(),
             "both readers should be drained to None"
         );
+    }
+
+    /// 회귀 방지: 개행 없는 대량 출력이 줄당 상한(1 MiB)에서 flush되어야 한다
+    /// (무한 버퍼 증가 → OOM 방지). 상한으로 잘려도 바이트 유실은 없어야 한다.
+    #[tokio::test]
+    async fn read_next_line_caps_unbounded_newlineless_output() {
+        use tokio::io::BufReader;
+
+        let big = vec![b'x'; 1024 * 1024 + 5000]; // 개행 없는 1 MiB + 5000 바이트
+        let mut reader = Some(BufReader::new(big.as_slice()));
+
+        // 첫 호출: 상한에서 잘린 청크 (정확히 상한이거나 한 버퍼 청크 이내 초과).
+        let chunk = read_next_line(&mut reader).await.unwrap().unwrap();
+        assert!(
+            chunk.len() >= 1024 * 1024,
+            "줄당 상한에서 flush되어야 함 (got {})",
+            chunk.len()
+        );
+
+        // 나머지는 다음 호출에서 반환 — 합치면 원본 전체 (유실 없음).
+        let rest = read_next_line(&mut reader).await.unwrap().unwrap();
+        assert_eq!(chunk.len() + rest.len(), big.len(), "바이트 유실 없어야 함");
+
+        // 그 다음은 EOF.
+        assert!(read_next_line(&mut reader).await.unwrap().is_none());
     }
 
     #[test]

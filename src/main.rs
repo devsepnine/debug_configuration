@@ -43,6 +43,10 @@ fn main() -> iced::Result {
     eprintln!("[Startup] Run/Debug Configuration Manager");
     eprintln!("[Startup] Press Ctrl+C for graceful shutdown");
 
+    // PowerShell 탐지(LazyLock, 1회 blocking subprocess)를 창이 뜨기 전 메인 스레드에서
+    // 미리 초기화 → 첫 구성 실행이 tokio 워커에서 블로킹되지 않는다 (Windows 외 no-op).
+    services::prewarm_shell_detection();
+
     iced::application(RunConfigManager::new, update, view)
         .subscription(subscription)
         .font(D2CODING_FONT)
