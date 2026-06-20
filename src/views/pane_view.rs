@@ -2,7 +2,7 @@ use crate::messages::Message;
 use crate::models::{Pane, RunSession, SessionStatusKind};
 use crate::utils::{
     ICON_ARROW_DOWN_FILL, ICON_ARROW_DOWN_LINE, ICON_CLOSE, ICON_PANE_MAXIMIZE, ICON_PANE_RESTORE,
-    ICON_REFRESH, ICON_SEARCH, ICON_STOP,
+    ICON_REFRESH, ICON_SAVE, ICON_SEARCH, ICON_STOP,
 };
 use crate::views::shared::{
     IconButtonState, icon_button_foreground, icon_button_style, icon_tooltip,
@@ -333,6 +333,20 @@ fn view_session_controls(
         is_dragging,
     );
 
+    // 출력 내보내기 (파일로 저장) — 출력이 있을 때만 활성화 (빈 0바이트 파일 방지)
+    let has_output = !session.output_lines.is_empty();
+    let export_state = if has_output {
+        IconButtonState::Active
+    } else {
+        IconButtonState::Inactive
+    };
+    let export_button = control_button(
+        control_icon(svg::Handle::from_memory(ICON_SAVE), export_state),
+        has_output.then_some(Message::ExportSessionOutput(session_id)),
+        export_state,
+        is_dragging,
+    );
+
     let maximize_button = control_button(
         control_icon(
             svg::Handle::from_memory(if is_maximized {
@@ -365,6 +379,8 @@ fn view_session_controls(
         auto_scroll_button,
         Space::new().width(4),
         search_button,
+        Space::new().width(4),
+        export_button,
     ]
     .align_y(Alignment::Center)
     .spacing(1.0);

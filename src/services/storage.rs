@@ -163,6 +163,27 @@ pub async fn save_configurations(
     Ok(file_path)
 }
 
+/// 임의 텍스트(세션 출력 등)를 사용자가 선택한 파일로 저장.
+///
+/// off-main 안전성을 위해 `AsyncFileDialog` 사용 (save_configurations 참고).
+///
+/// # Returns
+/// * `Ok(PathBuf)` - 저장된 파일 경로
+/// * `Err(String)` - 취소(`DIALOG_CANCELLED`) 또는 쓰기 실패
+pub async fn export_text(content: String, suggested_name: String) -> Result<PathBuf, String> {
+    let file_path = AsyncFileDialog::new()
+        .add_filter("Text", &["txt", "log"])
+        .set_file_name(suggested_name)
+        .save_file()
+        .await
+        .map(|handle| handle.path().to_path_buf())
+        .ok_or_else(|| DIALOG_CANCELLED.to_string())?;
+
+    std::fs::write(&file_path, content).map_err(|e| format!("File write error: {e}"))?;
+
+    Ok(file_path)
+}
+
 /// 사용자가 선택한 파일에서 구성 목록 열기
 ///
 /// # Returns

@@ -240,6 +240,10 @@ pub enum Message {
     OpenSearchInActivePane,
     /// 활성 검색바 닫기 (ESC — 대상 세션은 핸들러가 해석)
     CloseActiveSearch,
+    /// 세션 출력을 파일로 내보내기 (`session_id`)
+    ExportSessionOutput(Uuid),
+    /// 출력 내보내기 완료 (저장 경로 또는 에러/취소)
+    SessionOutputExported(Result<PathBuf, String>),
 
     // URL 처리
     /// URL을 기본 브라우저로 열기

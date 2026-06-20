@@ -4,8 +4,9 @@ use crate::models::{
     RunConfiguration, RunSession, SearchState, SessionStatusKind, WorkspaceTab,
 };
 use crate::services::{
-    AppSettings, load_from_path, load_settings, open_configurations, register_running_pid,
-    run_configuration_stream, save_configurations, save_settings, unregister_running_pid,
+    AppSettings, export_text, load_from_path, load_settings, open_configurations,
+    register_running_pid, run_configuration_stream, save_configurations, save_settings,
+    unregister_running_pid,
 };
 use crate::utils::{DIALOG_CANCELLED, ICON_DELETE, ICON_PLAY, ICON_REFRESH, ICON_STOP};
 use crate::views::shared::icon_tooltip;
@@ -529,7 +530,9 @@ impl RunConfigManager {
             | Message::ToggleSessionSearchFilter(_)
             | Message::ToggleSessionSearchRegex(_)
             | Message::OpenSearchInActivePane
-            | Message::CloseActiveSearch => self.handle_session_messages(message),
+            | Message::CloseActiveSearch
+            | Message::ExportSessionOutput(_)
+            | Message::SessionOutputExported(_) => self.handle_session_messages(message),
             Message::AddWorkspaceTab
             | Message::CloseTab(_)
             | Message::TabNameClicked(_)
@@ -701,6 +704,10 @@ impl RunConfigManager {
                 Some(session_id) => self.handle_close_session_search(session_id),
                 None => Task::none(),
             },
+            Message::ExportSessionOutput(session_id) => {
+                self.handle_export_session_output(session_id)
+            }
+            Message::SessionOutputExported(result) => self.handle_session_output_exported(result),
             _ => unreachable!("non-session message routed to handle_session_messages"),
         }
     }
@@ -2028,6 +2035,54 @@ impl RunConfigManager {
             // 정규식 모드 변경은 매치 집합을 바꾸므로 캐시 재계산.
             session.refresh_search_matches();
         }
+        Task::none()
+    }
+
+    /// 세션 출력 전체를 평문으로 펼쳐 파일로 저장(다이얼로그). RENDER_LINE_LIMIT와
+    /// 무관하게 버퍼에 남은 모든 라인을 내보낸다.
+    fn handle_export_session_output(&mut self, session_id: Uuid) -> Task<Message> {
+        let Some(session) = self.sessions.iter().find(|s| s.id == session_id) else {
+            return Task::none();
+        };
+        let content: String = session
+            .output_lines
+            .iter()
+            .map(|(_, segments)| {
+                segments
+                    .iter()
+                    .map(|seg| seg.text.as_str())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        // 파일명에 부적합한 문자(경로 구분/예약문자/제어문자)를 치환한 기본 이름
+        // (다이얼로그에서 수정 가능).
+        let safe_name: String = session
+            .config_name
+            .chars()
+            .map(|c| {
+                if c.is_ascii_control()
+                    || matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|')
+                {
+                    '_'
+                } else {
+                    c
+                }
+            })
+            .collect();
+        let suggested = format!("{safe_name}-output.log");
+        self.status_message = String::from("Exporting output...");
+        Task::perform(
+            export_text(content, suggested),
+            Message::SessionOutputExported,
+        )
+    }
+
+    fn handle_session_output_exported(&mut self, result: Result<PathBuf, String>) -> Task<Message> {
+        self.status_message = match result {
+            Ok(path) => format!("Output saved: {}", path.display()),
+            Err(error) => cancellable_status(&error, "Export"),
+        };
         Task::none()
     }
 
