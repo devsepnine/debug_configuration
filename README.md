@@ -24,12 +24,13 @@ Grab the latest pre-built binary for your platform from the [Releases page](http
 ## Key Features
 
 ### Configuration Management
-- Create, edit, and delete run configurations
-- Select configuration type (Application, Shell Script, Node)
+- Create, edit, clone, and delete run configurations
+- Select configuration type (Application, Shell Script, Node, Compound)
+- Compound type runs several configurations together as one group
 - Set command, arguments, and working directory
 - Manage environment variables (add, edit, delete)
 - Reorder configurations with drag and drop
-- Open/save configurations (JSON format)
+- Open/save configurations (versioned JSON format)
 
 ### Node Project Support
 - Node-oriented commands supported (run, install, start, test, build, etc.)
@@ -42,6 +43,9 @@ Grab the latest pre-built binary for your platform from the [Releases page](http
 - Run multiple sessions simultaneously
 - Real-time output display (ANSI color support)
 - Rerun, stop, remove, and hide sessions from a workspace
+- Status badge on finished sessions (success, failed exit code, run duration)
+- Desktop notification when a run finishes while the window is unfocused
+- Bulk actions: Stop All, Rerun All, Rerun Failed
 - Persistent session list with workspace-aware open state
 - Workspace tab system
   - Keep at least one workspace tab available
@@ -52,6 +56,12 @@ Grab the latest pre-built binary for your platform from the [Releases page](http
   - Drag and drop pane rearrangement
   - Resize panes
   - Maximize and restore panes when multiple panes are open
+
+### Output Search and Export
+- Search output (Ctrl+F): case-insensitive substring or regex
+- Match-line highlighting with next/previous navigation and a match count
+- Filter mode to show only matching lines
+- Export the full session output to a text/log file
 
 ### UI Features
 - Catppuccin Mocha theme
