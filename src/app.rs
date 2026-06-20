@@ -268,6 +268,42 @@ fn node_paths(config: &RunConfiguration) -> Option<(Uuid, String, String)> {
     }
 }
 
+/// Node 메타데이터(package.json 목록 + scripts)를 파일시스템에서 스캔한다.
+/// 재귀 디렉터리 워크가 무거울 수 있어 `spawn_blocking`으로 전용 블로킹 스레드에서
+/// 실행하므로, iced/tokio 워커도 UI 스레드도 막지 않는다.
+async fn scan_node_metadata(
+    config_id: Uuid,
+    project_dir: String,
+    working_dir: String,
+) -> (Uuid, Vec<String>, Vec<String>) {
+    use crate::utils::{
+        find_all_package_jsons, find_package_json, parse_scripts, to_relative_path,
+    };
+    use std::path::Path;
+
+    tokio::task::spawn_blocking(move || {
+        let project_path = Path::new(&project_dir);
+        let package_jsons: Vec<String> = find_all_package_jsons(project_path)
+            .iter()
+            .map(|p| to_relative_path(p, project_path))
+            .collect();
+        let scripts = if working_dir.is_empty() {
+            Vec::new()
+        } else {
+            find_package_json(Path::new(&working_dir))
+                .and_then(|pkg| parse_scripts(&pkg).ok())
+                .unwrap_or_default()
+        };
+        (config_id, package_jsons, scripts)
+    })
+    .await
+    .unwrap_or_else(|err| {
+        // 블로킹 스캔 태스크 패닉/취소 — 조용히 빈 결과로 폴백하되 진단 가능하게 로그.
+        eprintln!("[Node] metadata scan task failed: {err}");
+        (config_id, Vec::new(), Vec::new())
+    })
+}
+
 /// 애플리케이션의 메인 상태를 관리하는 구조체
 /// Elm Architecture의 Model에 해당
 pub struct RunConfigManager {
@@ -439,6 +475,7 @@ impl RunConfigManager {
             | Message::BrowseProjectDirectory
             | Message::ProjectDirectorySelected(_)
             | Message::PackageJsonsScanned(_, _, _)
+            | Message::NodeMetadataLoaded(_, _, _)
             | Message::PackageJsonDropdownChanged(_)
             | Message::NodeRuntimeChanged(_)
             | Message::NodeRuntimesDetected(_)
@@ -550,6 +587,9 @@ impl RunConfigManager {
             }
             Message::PackageJsonsScanned(config_id, project_directory, relative_paths) => {
                 self.handle_package_jsons_scanned(config_id, &project_directory, &relative_paths)
+            }
+            Message::NodeMetadataLoaded(config_id, package_jsons, scripts) => {
+                self.handle_node_metadata_loaded(config_id, package_jsons, scripts)
             }
             Message::PackageJsonDropdownChanged(relative_path) => {
                 self.handle_package_json_dropdown_changed(&relative_path)
@@ -1665,15 +1705,16 @@ impl RunConfigManager {
 
                 if !self.configurations.is_empty() {
                     self.selected_config_index = Some(0);
-                    self.load_node_metadata_for_current_configurations();
+                    self.load_node_metadata_for_current_configurations()
+                } else {
+                    Task::none()
                 }
             }
             Err(error) => {
                 self.status_message = format!("Load failed: {error}");
+                Task::none()
             }
         }
-
-        Task::none()
     }
 
     fn handle_save_configurations(&mut self) -> Task<Message> {
@@ -1718,24 +1759,51 @@ impl RunConfigManager {
                 self.node_available_package_jsons.clear();
                 self.env_modal = None;
                 self.selected_config_index = (!self.configurations.is_empty()).then_some(0);
-                self.load_node_metadata_for_current_configurations();
+                let metadata_task = self.load_node_metadata_for_current_configurations();
 
                 self.last_file_path = Some(path.clone());
                 self.save_app_settings();
                 self.status_message = format!("Opened: {}", path.display());
+                metadata_task
             }
             Err(error) => {
                 self.status_message = cancellable_status(&error, "Open");
+                Task::none()
             }
         }
-
-        Task::none()
     }
 
-    fn load_node_metadata_for_current_configurations(&mut self) {
-        for (config_id, project_dir, working_dir) in self.collect_node_config_paths() {
-            self.load_node_metadata(config_id, &project_dir, &working_dir);
-        }
+    /// 현재 구성들의 Node 메타데이터(package.json 목록 + scripts)를 백그라운드에서 로드.
+    /// 재귀 디렉터리 스캔이 무거울 수 있어 UI 스레드(update)가 아닌 워커에서 수행하고,
+    /// 결과는 NodeMetadataLoaded로 받아 적용한다 (이전엔 로드/열기 시 모든 Node 구성을
+    /// 동기 스캔해 창 전체가 그동안 멈췄다 — blocking-on-UI-thread 버그).
+    fn load_node_metadata_for_current_configurations(&self) -> Task<Message> {
+        let tasks: Vec<Task<Message>> = self
+            .collect_node_config_paths()
+            .into_iter()
+            .map(|(config_id, project_dir, working_dir)| {
+                Task::perform(
+                    scan_node_metadata(config_id, project_dir, working_dir),
+                    |(id, package_jsons, scripts)| {
+                        Message::NodeMetadataLoaded(id, package_jsons, scripts)
+                    },
+                )
+            })
+            .collect();
+        Task::batch(tasks)
+    }
+
+    fn handle_node_metadata_loaded(
+        &mut self,
+        config_id: Uuid,
+        package_jsons: Vec<String>,
+        scripts: Vec<String>,
+    ) -> Task<Message> {
+        self.node_available_package_jsons
+            .insert(config_id, package_jsons);
+        self.node_available_scripts.insert(config_id, scripts);
+        self.sync_editor_select_state_for_selected_config();
+        Task::none()
     }
 
     fn collect_node_config_paths(&self) -> Vec<(Uuid, String, String)> {
@@ -1765,10 +1833,14 @@ impl RunConfigManager {
     }
 
     fn handle_process_started(&mut self, session_id: Uuid, pid: u32) -> Task<Message> {
-        // 시그널 핸들러(Ctrl+C)가 정리할 수 있도록 전역 레지스트리에 등록.
-        register_running_pid(pid);
-
-        if let Some(session) = self.session_by_id_mut(session_id) {
+        // 세션이 이미 제거/완료된 뒤 늦게 도착한 ProcessStarted라면 등록하지 않는다.
+        // 등록만 되고 완료 시 unregister가 매칭되지 않으면 PID가 레지스트리에 영구
+        // 누수되어, 시그널 핸들러가 재사용된 무관한 PID를 kill할 수 있다.
+        if let Some(session) = self.session_by_id_mut(session_id)
+            && session.is_running
+        {
+            // 시그널 핸들러(Ctrl+C)가 정리할 수 있도록 전역 레지스트리에 등록.
+            register_running_pid(pid);
             session.process_pid = Some(pid);
             eprintln!("[Process] Started {} (PID: {})", session.config_name, pid);
         }
@@ -1963,6 +2035,13 @@ impl RunConfigManager {
     }
 
     fn handle_rerun_session(&mut self, session_id: Uuid) -> Task<Message> {
+        // 동시성 설계: 실행 중 재실행 시 이전 스트림과 새 스트림이 잠시 공존하지만 격리된다.
+        // (1) 이전 cancel_flag.store(true)는 이전 스트림이 보유한 같은 Arc를 가리켜 이전
+        //     실행을 중단시키고, 이후 cancel_flag를 새 Arc로 교체해 새 스트림과 분리한다.
+        // (2) session.id를 new_id로 바꾸므로 이전 스트림이 보내는 모든 메시지(OutputReceived/
+        //     RunCompleted, old_id 키)는 더 이상 어떤 세션과도 매칭되지 않아 무시된다 —
+        //     교차 배선(cross-wiring) 없음. 이전 프로세스는 이전 스트림의 terminate_and_reap가
+        //     강제 종료한다. (잠깐 is_running=true인데 새 프로세스 시작 전인 transient는 무해)
         if let Some(session) = self.sessions.iter_mut().find(|s| s.id == session_id) {
             if session.is_running {
                 session.cancel_flag.store(true, Ordering::Relaxed);
@@ -3242,44 +3321,15 @@ impl Drop for RunConfigManager {
             running_sessions.len()
         );
 
-        // Step 1: 먼저 SIGTERM으로 graceful shutdown 시도
-        for session in &running_sessions {
-            if let Some(pid) = session.process_pid {
-                eprintln!(
-                    "[Shutdown] Sending SIGTERM to PID {} ({})",
-                    pid, session.config_name
-                );
-
-                #[cfg(unix)]
-                unsafe {
-                    // Unix: 프로세스 그룹 전체에 SIGTERM
-                    libc::killpg(pid as i32, libc::SIGTERM);
-                }
-
-                #[cfg(windows)]
-                {
-                    // Windows: taskkill로 graceful 종료 시도 (without /F)
-                    use std::os::windows::process::CommandExt;
-                    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-                    let _ = std::process::Command::new("taskkill")
-                        .args(["/PID", &pid.to_string(), "/T"])
-                        .creation_flags(CREATE_NO_WINDOW)
-                        .output();
-                }
-            }
-        }
-
-        // Step 2: 2초 대기 (graceful shutdown 기회)
-        eprintln!("[Shutdown] Waiting 2 seconds for graceful termination...");
-        std::thread::sleep(std::time::Duration::from_secs(2));
-
-        // Step 3: 아직 살아있는 프로세스는 SIGKILL로 강제 종료
-        eprintln!("[Shutdown] Force killing remaining processes...");
+        // 종료 경로이므로 graceful 유예(2초 sleep) 없이 즉시 강제 종료한다. 이전 구현은
+        // Drop이 실행되는 UI/메인 스레드를 2초간 std::thread::sleep으로 블로킹해 종료 시
+        // 창이 멈췄다. graceful 종료(SIGTERM 유예)는 정상 Stop 경로의 비동기
+        // terminate_and_reap가 담당하고, 여기서는 종료 시 자식 누수 방지가 목적이다.
         for session in &running_sessions {
             if let Some(pid) = session.process_pid {
                 #[cfg(unix)]
                 unsafe {
-                    // Unix: SIGKILL로 강제 종료
+                    // Unix: 프로세스 그룹 전체에 SIGKILL
                     libc::killpg(pid as i32, libc::SIGKILL);
                     eprintln!(
                         "[Shutdown] Sent SIGKILL to PID {} ({})",
@@ -3289,7 +3339,7 @@ impl Drop for RunConfigManager {
 
                 #[cfg(windows)]
                 {
-                    // Windows: /F 플래그로 강제 종료
+                    // Windows: /T /F로 프로세스 트리 강제 종료
                     use std::os::windows::process::CommandExt;
                     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
                     let _ = std::process::Command::new("taskkill")

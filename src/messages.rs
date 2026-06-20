@@ -82,6 +82,9 @@ pub enum Message {
     ProjectDirectorySelected(Result<String, String>),
     /// Node `package.json` 스캔 완료 (`config_id`, `project_directory`, 상대 경로 목록)
     PackageJsonsScanned(Uuid, String, Vec<String>),
+    /// Node 메타데이터 비동기 로드 완료 — 파일 로드/열기 시 UI 스레드 블로킹을 피하기
+    /// 위해 백그라운드 스캔 결과를 전달 (`config_id`, package.json 상대경로, scripts)
+    NodeMetadataLoaded(Uuid, Vec<String>, Vec<String>),
     /// Node package.json 드롭다운 선택 변경 (상대 경로)
     PackageJsonDropdownChanged(String),
     /// Node Runtime 감지 완료
