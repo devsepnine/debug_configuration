@@ -2,7 +2,7 @@ use crate::messages::Message;
 use crate::models::RunSession;
 use iced::{
     Border, Color, Element, Event, Length, Point, Rectangle, Renderer, Theme, border, keyboard,
-    mouse,
+    mouse, window,
     widget::{Canvas, canvas, container},
 };
 use std::collections::HashSet;
@@ -15,9 +15,6 @@ const FONT: iced::Font = crate::D2CODING;
 // ============================================================================
 // Constants
 // ============================================================================
-
-/// 렌더링할 최대 라인 수 (메모리 관리)
-const RENDER_LINE_LIMIT: usize = 500;
 
 /// 라인 높이 (픽셀)
 const LINE_HEIGHT: f32 = 16.0;
@@ -65,17 +62,29 @@ struct TextPosition {
     char_idx: usize,
 }
 
-/// URL 정보
+/// 한 줄 안의 URL 위치(문자 인덱스 기준). 어느 줄인지는 소유자가 알고 있으므로 line_idx 없음.
+/// 가상화: URL은 전체 버퍼를 미리 스캔하지 않고, 보이는 줄(렌더)·커서 아래 줄(히트테스트)에
+/// 한해 즉석 계산한다 — O(visible).
 #[derive(Debug, Clone)]
-struct UrlInfo {
-    /// 라인 인덱스
-    line_idx: usize,
-    /// URL 시작 문자 인덱스
+struct UrlSpan {
+    /// URL 시작 문자 인덱스 (줄 내)
     start_char: usize,
-    /// URL 끝 문자 인덱스
+    /// URL 끝 문자 인덱스 (줄 내)
     end_char: usize,
     /// URL 문자열
     url: String,
+}
+
+/// wrap 캐시 무효화 키. `prepare_lines`가 만드는 줄 집합·순서가 바뀌는 입력만 담는다.
+/// 해시(u64) 대신 값 비교로 충돌 가능성을 원천 제거한다(충돌 시 stale 캐시 → 렌더 오정렬).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct RenderKey {
+    /// 세션 출력 변경 카운터.
+    content_version: u64,
+    /// 필터(매치만 표시) 모드 여부 — 줄 집합 자체를 바꾼다.
+    filter: bool,
+    /// 필터 모드일 때만 의미 있는 검색어(필터 OFF면 줄 집합이 검색어와 무관하므로 빈 문자열).
+    query: String,
 }
 
 /// Canvas 스크롤 상태
@@ -99,6 +108,18 @@ struct ScrollState {
     last_session_id: Option<Uuid>,
     /// 초기화 완료 여부
     is_initialized: bool,
+
+    // ── 가상화 wrap 캐시 (S3) ─────────────────────────────────────────────
+    // 매 프레임 모든 줄의 래핑 행 수를 per-char로 재계산하던 것을, 캐시된 정수 배열로
+    // 대체한다. (max_chars=가로폭, content_version+필터=콘텐츠 키) 가 바뀔 때만 재생성.
+    /// `lines`와 1:1 대응하는 줄별 래핑 행 수(캐시).
+    line_counts: Vec<u32>,
+    /// `line_counts`의 합(총 래핑 행 수) 캐시.
+    cached_total: usize,
+    /// 캐시를 만든 max_chars(가로폭). 불일치 시 재생성.
+    cached_max_chars: usize,
+    /// 캐시를 만든 콘텐츠/필터 키. 불일치 시 재생성.
+    cached_render_key: RenderKey,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -119,14 +140,36 @@ type DisplaySegment = (usize, usize, bool);
 /// Canvas로 터미널 출력을 그리는 Program
 ///
 /// Virtual scrolling과 자동 줄바꿈을 지원하여 대량의 로그를 효율적으로 렌더링
-struct TerminalCanvas {
-    lines: Vec<Vec<crate::ansi::TextSegment>>,
+struct TerminalCanvas<'a> {
+    /// 렌더링할 줄들. 대부분 세션 버퍼를 빌린다(zero-copy) — `prepare_lines`가 매 view마다
+    /// 모든 줄을 deep-clone하던 비용을 제거한다. 합성 줄("No lines match")만 Owned.
+    lines: Vec<LineRef<'a>>,
     /// `lines`와 1:1 대응하는 검색 하이라이트 종류 (매치/현재 매치/없음)
     highlights: Vec<LineHighlight>,
     session_id: Uuid,
     initial_scroll_progress: f32,
     auto_scroll: bool,
-    urls: Vec<UrlInfo>,
+    /// 가상화 wrap 캐시 무효화 키. 이 키가 같으면 `prepare_lines` 결과(=`lines`)도
+    /// 동일하므로 캐시를 재사용한다.
+    render_key: RenderKey,
+}
+
+/// 터미널에 렌더링할 한 줄. 대부분은 세션 버퍼를 빌려(zero-copy) 클론 비용을 없앤다.
+/// "No lines match" 같은 합성 줄만 Owned. `Deref<Target=[TextSegment]>`라 기존 렌더/측정
+/// 코드(`&[TextSegment]`를 받는)들을 그대로 둘 수 있다.
+enum LineRef<'a> {
+    Ref(&'a Vec<crate::ansi::TextSegment>),
+    Owned(Vec<crate::ansi::TextSegment>),
+}
+
+impl std::ops::Deref for LineRef<'_> {
+    type Target = [crate::ansi::TextSegment];
+    fn deref(&self) -> &Self::Target {
+        match self {
+            LineRef::Ref(segments) => segments,
+            LineRef::Owned(segments) => segments,
+        }
+    }
 }
 
 /// 검색 시 라인 배경 하이라이트 종류.
@@ -141,10 +184,13 @@ enum LineHighlight {
     Current,
 }
 
-impl TerminalCanvas {
+impl<'a> TerminalCanvas<'a> {
     fn usize_to_f32(value: usize) -> f32 {
-        let value = u16::try_from(value).unwrap_or(u16::MAX);
-        f32::from(value)
+        // f32는 2^24까지 정수를 정확히 표현하므로 그 지점에서 clamp해 정밀도 손실을 막는다.
+        // 과거에는 u16::MAX(65535)로 clamp했는데, 5만 줄 + 줄바꿈이면 래핑 행 수가 65535를
+        // 넘어 total_wrapped가 조용히 잘리고 max_scroll/스크롤바/꼬리추적이 어긋났다.
+        const MAX_EXACT: usize = 1 << 24;
+        value.min(MAX_EXACT) as f32
     }
 
     fn f32_floor_to_usize(value: f32) -> usize {
@@ -152,7 +198,8 @@ impl TerminalCanvas {
             return 0;
         }
 
-        value.floor().to_string().parse::<usize>().unwrap_or(0)
+        // f32 → usize 캐스팅은 Rust에서 saturating이라 거대한 값도 안전하다.
+        value.floor() as usize
     }
 
     fn line_display_width_f32(text: &str) -> f32 {
@@ -163,50 +210,42 @@ impl TerminalCanvas {
     // URL 감지 및 처리
     // ============================================================================
 
-    /// 텍스트에서 URL 추출
-    ///
-    /// RFC 3986 표준에 따라 URL 패턴을 감지
-    /// - http://, https://, localhost 패턴 지원
-    /// - RFC 3986 금지 문자 제외: `<`, `>`, `"`, `{`, `}`, `|`, `\`, `^`, `` ` ``
-    /// - Trailing punctuation 자동 제거
-    fn extract_urls(lines: &[Vec<crate::ansi::TextSegment>]) -> Vec<UrlInfo> {
-        let mut urls = Vec::new();
-
+    /// 한 줄의 텍스트에서 URL 위치를 추출한다 (RFC 3986: http/https/localhost, 금지문자
+    /// 제외, trailing punctuation 제거). 전체 버퍼를 미리 스캔하지 않고 보이는 줄(렌더) 또는
+    /// 커서 아래 줄(히트테스트)에 대해서만 호출되어 비용이 O(visible)이다.
+    fn urls_in_line(line: &str) -> Vec<UrlSpan> {
         // RFC 3986 기반 URL 패턴
         // 금지 문자: whitespace, < > " { } | \ ^ ` (RFC 3986 Section 2.4)
-        // Regex 컴파일은 비용이 크므로 최초 1회만 컴파일하여 재사용 (매 view()마다 재컴파일 방지).
+        // Regex 컴파일은 비용이 크므로 최초 1회만 컴파일하여 재사용.
         static URL_PATTERN: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
             regex::Regex::new(r#"https?://[^\s<>"{}|\\^`]+|localhost:\d+[^\s<>"{}|\\^`]*"#).unwrap()
         });
 
-        for (line_idx, segments) in lines.iter().enumerate() {
-            // 세그먼트들을 하나의 문자열로 결합
-            let line: String = segments.iter().map(|s| s.text.as_str()).collect();
+        let mut urls = Vec::new();
+        for mat in URL_PATTERN.find_iter(line) {
+            let raw_url = mat.as_str();
 
-            for mat in URL_PATTERN.find_iter(&line) {
-                let raw_url = mat.as_str();
-
-                // Trailing punctuation 제거
-                // URL이 문장 끝에 올 때 마침표, 쉼표 등이 포함되는 것을 방지
-                let cleaned_url = Self::trim_trailing_punctuation(raw_url);
-
-                if cleaned_url.is_empty() {
-                    continue;
-                }
-
-                let start_char = line[..mat.start()].chars().count();
-                let end_char = start_char + cleaned_url.chars().count();
-
-                urls.push(UrlInfo {
-                    line_idx,
-                    start_char,
-                    end_char,
-                    url: cleaned_url.to_string(),
-                });
+            // Trailing punctuation 제거 (URL이 문장 끝에 올 때 마침표/쉼표 등 포함 방지)
+            let cleaned_url = Self::trim_trailing_punctuation(raw_url);
+            if cleaned_url.is_empty() {
+                continue;
             }
-        }
 
+            let start_char = line[..mat.start()].chars().count();
+            let end_char = start_char + cleaned_url.chars().count();
+            urls.push(UrlSpan {
+                start_char,
+                end_char,
+                url: cleaned_url.to_string(),
+            });
+        }
         urls
+    }
+
+    /// 세그먼트 벡터를 한 줄 문자열로 합쳐 URL을 추출한다.
+    fn urls_in_segments(segments: &[crate::ansi::TextSegment]) -> Vec<UrlSpan> {
+        let line: String = segments.iter().map(|s| s.text.as_str()).collect();
+        Self::urls_in_line(&line)
     }
 
     /// URL 끝에서 일반적인 구두점 제거
@@ -241,14 +280,12 @@ impl TerminalCanvas {
 
     /// 주어진 텍스트 위치가 URL 영역인지 확인
     fn find_url_at_position(&self, pos: TextPosition) -> Option<String> {
-        self.urls
-            .iter()
-            .find(|url| {
-                url.line_idx == pos.line_idx
-                    && pos.char_idx >= url.start_char
-                    && pos.char_idx < url.end_char
-            })
-            .map(|url| url.url.clone())
+        // 커서 아래 줄에 대해서만 URL을 즉석 계산해 위치를 판정한다(O(해당 줄 길이)).
+        let segments = self.lines.get(pos.line_idx)?;
+        Self::urls_in_segments(segments)
+            .into_iter()
+            .find(|url| pos.char_idx >= url.start_char && pos.char_idx < url.end_char)
+            .map(|url| url.url)
     }
 
     // ============================================================================
@@ -329,20 +366,45 @@ impl TerminalCanvas {
     ///
     /// # Returns
     /// 줄바꿈을 적용한 총 줄 수
-    fn calculate_total_wrapped_lines(&self, available_width: f32, char_width: f32) -> usize {
-        if available_width <= 0.0 || char_width <= 0.0 {
-            return self.lines.len();
-        }
-
+    fn calculate_total_wrapped_lines(
+        &self,
+        state: &ScrollState,
+        available_width: f32,
+        char_width: f32,
+    ) -> usize {
         let max_chars = Self::calculate_max_chars(available_width, char_width);
-        if max_chars == 0 {
-            return self.lines.len();
+        if self.wrap_cache_valid(state, max_chars) {
+            return state.cached_total;
         }
-
+        // 캐시 미스(폭/콘텐츠 변경 직후 또는 update 미선행 등): 이 호출만 정확히 계산.
+        // calculate_wrapped_count가 max_chars==0을 1행으로 처리하므로 0폭 분기는 불필요.
         self.lines
             .iter()
             .map(|line| Self::calculate_wrapped_count(line, max_chars))
             .sum()
+    }
+
+    /// 현재 캐시가 `(self.lines, max_chars, render_version)`과 정합하는지.
+    fn wrap_cache_valid(&self, state: &ScrollState, max_chars: usize) -> bool {
+        state.cached_max_chars == max_chars
+            && state.cached_render_key == self.render_key
+            && state.line_counts.len() == self.lines.len()
+    }
+
+    /// 키(가로폭/콘텐츠·필터 버전)가 바뀌었을 때만 줄별 래핑 행 수 캐시를 재생성한다.
+    /// `update()`에서 `&mut State`로 매 프레임 호출되며, 키가 같으면 즉시 반환한다.
+    fn rebuild_wrap_cache_if_needed(&self, state: &mut ScrollState, max_chars: usize) {
+        if self.wrap_cache_valid(state, max_chars) {
+            return;
+        }
+        state.line_counts = self
+            .lines
+            .iter()
+            .map(|line| Self::calculate_wrapped_count(line, max_chars) as u32)
+            .collect();
+        state.cached_total = Self::wrapped_total(&state.line_counts);
+        state.cached_max_chars = max_chars;
+        state.cached_render_key = self.render_key.clone();
     }
 
     /// 한 줄의 최대 display width 계산
@@ -369,15 +431,22 @@ impl TerminalCanvas {
         max_display_width: usize,
     ) -> usize {
         let display_width = Self::segments_display_width(segments);
-        if display_width == 0 {
+        // max_display_width==0(0폭/초기화 전)이면 줄바꿈 불가로 보고 1행 처리(0 나눗셈 패닉 방지).
+        if display_width == 0 || max_display_width == 0 {
             1
         } else {
             display_width.div_ceil(max_display_width)
         }
     }
+
+    /// 소스 줄별 래핑 행 수 배열로부터 총 래핑 행 수를 구한다.
+    /// (가상화: 매 프레임 줄을 다시 순회해 per-char 폭을 더하는 대신, 캐시된 행 수를 합산.)
+    fn wrapped_total(counts: &[u32]) -> usize {
+        counts.iter().map(|&c| c as usize).sum()
+    }
 }
 
-impl canvas::Program<Message> for TerminalCanvas {
+impl<'a> canvas::Program<Message> for TerminalCanvas<'a> {
     type State = ScrollState;
 
     fn mouse_interaction(
@@ -392,7 +461,7 @@ impl canvas::Program<Message> for TerminalCanvas {
                 Self::f32_floor_to_usize(Self::calculate_visible_lines(bounds.height));
             let char_width = get_char_width();
             let total_wrapped_lines =
-                self.calculate_total_wrapped_lines(available_width, char_width);
+                self.calculate_total_wrapped_lines(state, available_width, char_width);
 
             // 스크롤바 드래그 중
             if state.is_dragging_scrollbar {
@@ -407,6 +476,7 @@ impl canvas::Program<Message> for TerminalCanvas {
             // 스크롤바 영역 확인
             if total_wrapped_lines > visible_lines {
                 let scrollbar_bounds = self.calculate_scrollbar_bounds(
+                    state,
                     bounds,
                     available_width,
                     visible_lines,
@@ -444,14 +514,36 @@ impl canvas::Program<Message> for TerminalCanvas {
         bounds: Rectangle,
         cursor: mouse::Cursor,
     ) -> Option<canvas::Action<Message>> {
+        // 가상화 wrap 캐시 갱신: 가로폭/콘텐츠/필터가 바뀐 프레임에만 재생성한다. update()는
+        // 매 프레임(합성 RedrawRequested 포함) 호출되고 &mut State를 가지므로 여기가 유일한
+        // 재생성 지점이다(draw()는 &State라 갱신 불가, 캐시를 읽기만 한다).
+        //
+        // initialize_scroll_state보다 먼저 둔다: 세션 최초 마운트/전환 시 init이 내부에서
+        // scroll_metrics로 max_scroll을 읽어 초기 offset을 정하므로, 그 전에 캐시가 새 세션
+        // 기준으로 준비돼 있어야 정확하다(아니면 그 프레임만 naive fallback으로 O(n) 이중 계산).
+        let max_chars = {
+            let available_width = bounds.width - (HORIZONTAL_PADDING * 2.0);
+            Self::calculate_max_chars(available_width, get_char_width())
+        };
+        self.rebuild_wrap_cache_if_needed(state, max_chars);
+
         if let Some(action) = self.initialize_scroll_state(state, bounds) {
             return Some(action);
         }
 
-        let metrics = self.scroll_metrics(bounds);
+        let metrics = self.scroll_metrics(state, bounds);
 
-        if let Some(action) = self.apply_auto_scroll(state, metrics) {
-            return Some(action);
+        // iced 0.14는 매 프레임 합성 RedrawRequested 이벤트로 Program::update를 호출한다
+        // (iced_winit가 주입 → iced_widget Canvas가 모든 이벤트에 program.update 호출).
+        // 따라서 auto-scroll 꼬리 추적(맨 아래 재고정)은 이 프레임 틱에서만 수행하고,
+        // 실제 사용자 입력(휠/클릭/드래그/선택/Ctrl+C)은 아래 match로 먼저 라우팅해야 한다.
+        //
+        // 회귀 방지: 과거에는 apply_auto_scroll를 update 선두에서 무조건 실행하고 Some이면
+        // 조기 반환했다. RedrawRequested가 매 프레임 도착하는 데다 출력 스트리밍 중에는
+        // auto_scroll=true이고 새 줄마다 max_scroll이 커져 항상 Some(재고정)을 반환했기에,
+        // 휠 등 입력 이벤트가 match에 닿기 전에 영구히 선점되어 스크롤 자체가 불가능했다.
+        if let Event::Window(window::Event::RedrawRequested(_)) = event {
+            return self.apply_auto_scroll(state, metrics);
         }
 
         match event {
@@ -560,20 +652,21 @@ impl canvas::Program<Message> for TerminalCanvas {
 // Terminal Canvas - Private Methods
 // ============================================================================
 
-impl TerminalCanvas {
+impl<'a> TerminalCanvas<'a> {
     /// 스크롤바의 위치와 크기 계산
     ///
     /// # Returns
     /// (x, y, width, height)
     fn calculate_scrollbar_bounds(
         &self,
+        state: &ScrollState,
         bounds: Rectangle,
         available_width: f32,
         visible_lines: usize,
         offset: f32,
     ) -> (f32, f32, f32, f32) {
         let total_wrapped_lines =
-            self.calculate_total_wrapped_lines(available_width, get_char_width());
+            self.calculate_total_wrapped_lines(state, available_width, get_char_width());
         let total_lines_f = Self::usize_to_f32(total_wrapped_lines);
         let visible_lines_f = Self::usize_to_f32(visible_lines);
 
@@ -593,12 +686,12 @@ impl TerminalCanvas {
         )
     }
 
-    fn scroll_metrics(&self, bounds: Rectangle) -> ScrollMetrics {
+    fn scroll_metrics(&self, state: &ScrollState, bounds: Rectangle) -> ScrollMetrics {
         let available_width = bounds.width - (HORIZONTAL_PADDING * 2.0);
         let visible_lines_f = Self::calculate_visible_lines(bounds.height);
         let visible_lines = Self::f32_floor_to_usize(visible_lines_f);
         let total_wrapped_lines =
-            self.calculate_total_wrapped_lines(available_width, get_char_width());
+            self.calculate_total_wrapped_lines(state, available_width, get_char_width());
         let max_scroll = (Self::usize_to_f32(total_wrapped_lines) - visible_lines_f).max(0.0);
 
         ScrollMetrics {
@@ -630,7 +723,7 @@ impl TerminalCanvas {
         state.last_session_id = Some(self.session_id);
         state.is_initialized = true;
 
-        let metrics = self.scroll_metrics(bounds);
+        let metrics = self.scroll_metrics(state, bounds);
         state.offset =
             (self.initial_scroll_progress * metrics.max_scroll).clamp(0.0, metrics.max_scroll);
 
@@ -687,6 +780,7 @@ impl TerminalCanvas {
 
         if metrics.total_wrapped_lines > metrics.visible_lines {
             let scrollbar_bounds = self.calculate_scrollbar_bounds(
+                state,
                 bounds,
                 metrics.available_width,
                 metrics.visible_lines,
@@ -798,7 +892,7 @@ impl TerminalCanvas {
         let visible_lines = Self::calculate_visible_lines(bounds.height);
         let available_width = bounds.width - (HORIZONTAL_PADDING * 2.0);
         let total_wrapped_lines =
-            self.calculate_total_wrapped_lines(available_width, get_char_width());
+            self.calculate_total_wrapped_lines(state, available_width, get_char_width());
 
         // 스크롤 범위 제한
         state.offset = (state.offset + scroll_delta)
@@ -880,8 +974,13 @@ impl TerminalCanvas {
         let mut current_wrapped_line = 0;
         let mut rendered_lines = 0; // 실제 렌더링 카운터 추가
 
+        let cache_ok = self.wrap_cache_valid(state, max_chars);
         for (line_idx, segments_vec) in self.lines.iter().enumerate() {
-            let wrapped_count = Self::calculate_wrapped_count(segments_vec, max_chars);
+            let wrapped_count = if cache_ok {
+                state.line_counts[line_idx] as usize
+            } else {
+                Self::calculate_wrapped_count(segments_vec, max_chars)
+            };
 
             // 가시성 체크: 완전히 위에 있으면 스킵 (render_lines와 동일)
             if current_wrapped_line + wrapped_count <= target_start_line {
@@ -1015,10 +1114,15 @@ impl TerminalCanvas {
         let mut current_wrapped_line = 0;
         let mut last_line_idx = 0;
 
+        let cache_ok = self.wrap_cache_valid(state, max_chars);
         for (line_idx, segments_vec) in self.lines.iter().enumerate() {
             // 세그먼트들을 문자열로 결합
             let line: String = segments_vec.iter().map(|s| s.text.as_str()).collect();
-            let wrapped_count = Self::calculate_wrapped_count(segments_vec, max_chars);
+            let wrapped_count = if cache_ok {
+                state.line_counts[line_idx] as usize
+            } else {
+                Self::calculate_wrapped_count(segments_vec, max_chars)
+            };
             last_line_idx = line_idx;
 
             if absolute_line_idx >= current_wrapped_line
@@ -1100,8 +1204,13 @@ impl TerminalCanvas {
         let mut current_wrapped_line = 0;
         let mut rendered_lines = 0;
 
+        let cache_ok = self.wrap_cache_valid(state, max_chars);
         for (line_idx, segments) in self.lines.iter().enumerate() {
-            let wrapped_count = Self::calculate_wrapped_count(segments, max_chars);
+            let wrapped_count = if cache_ok {
+                state.line_counts[line_idx] as usize
+            } else {
+                Self::calculate_wrapped_count(segments, max_chars)
+            };
             if current_wrapped_line + wrapped_count <= target_start_line {
                 current_wrapped_line += wrapped_count;
                 continue;
@@ -1164,8 +1273,13 @@ impl TerminalCanvas {
         let mut current_wrapped_line = 0;
         let mut rendered_lines = 0;
 
-        for (line_idx, segments) in self.lines.iter().enumerate() {
-            let wrapped_count = Self::calculate_wrapped_count(segments, max_chars);
+        let cache_ok = self.wrap_cache_valid(state, max_chars);
+        for (i, segments) in self.lines.iter().enumerate() {
+            let wrapped_count = if cache_ok {
+                state.line_counts[i] as usize
+            } else {
+                Self::calculate_wrapped_count(segments, max_chars)
+            };
 
             // 가시성 체크: 완전히 위에 있으면 스킵
             if current_wrapped_line + wrapped_count <= target_start_line {
@@ -1192,7 +1306,6 @@ impl TerminalCanvas {
                 self.render_wrapped_line(
                     frame,
                     segments,
-                    line_idx,
                     max_chars,
                     current_wrapped_line,
                     target_start_line,
@@ -1244,7 +1357,6 @@ impl TerminalCanvas {
         &self,
         frame: &mut canvas::Frame,
         segments: &[crate::ansi::TextSegment],
-        line_idx: usize,
         max_display_width: usize,
         current_wrapped_line: usize,
         target_start_line: usize,
@@ -1253,8 +1365,8 @@ impl TerminalCanvas {
         partial_offset: f32,
         url_color: Color,
     ) {
-        let line_urls = self.line_urls(line_idx);
         let line: String = segments.iter().map(|s| s.text.as_str()).collect();
+        let line_urls = Self::urls_in_line(&line);
         let chars: Vec<char> = line.chars().collect();
         let chunk_ranges = Self::chunk_ranges(&chars, max_display_width);
 
@@ -1294,7 +1406,7 @@ impl TerminalCanvas {
         scrollbar_color: Color,
     ) {
         let total_wrapped_lines =
-            self.calculate_total_wrapped_lines(available_width, get_char_width());
+            self.calculate_total_wrapped_lines(state, available_width, get_char_width());
 
         if total_wrapped_lines <= visible_lines {
             return;
@@ -1320,13 +1432,6 @@ impl TerminalCanvas {
             iced::Size::new(SCROLLBAR_WIDTH, scrollbar_height),
         );
         frame.fill(&scrollbar, scrollbar_color);
-    }
-
-    fn line_urls(&self, line_idx: usize) -> Vec<&UrlInfo> {
-        self.urls
-            .iter()
-            .filter(|url| url.line_idx == line_idx)
-            .collect()
     }
 
     fn chunk_ranges(chars: &[char], max_display_width: usize) -> Vec<(usize, usize)> {
@@ -1357,7 +1462,7 @@ impl TerminalCanvas {
     }
 
     fn display_segments_for_chunk(
-        line_urls: &[&UrlInfo],
+        line_urls: &[UrlSpan],
         chunk_start: usize,
         chunk_end: usize,
     ) -> Vec<DisplaySegment> {
@@ -1393,7 +1498,7 @@ impl TerminalCanvas {
         frame: &mut canvas::Frame,
         segments: &[crate::ansi::TextSegment],
         chars: &[char],
-        line_urls: &[&UrlInfo],
+        line_urls: &[UrlSpan],
         chunk_start: usize,
         chunk_end: usize,
         y_aligned: f32,
@@ -1529,6 +1634,22 @@ impl TerminalCanvas {
 // Public API
 // ============================================================================
 
+/// 터미널 뷰의 wrap 캐시 무효화 키. `prepare_lines`가 만드는 줄 집합이 바뀌는 입력만
+/// 반영한다: 콘텐츠(content_version)와 필터 모드, 그리고 필터 중일 때의 검색어. 검색
+/// 하이라이트(매치/현재 매치)는 줄바꿈 행 수에 영향을 주지 않으므로 키에서 제외한다.
+/// (필터 OFF면 줄 집합이 검색어와 무관 — 검색어는 하이라이트만 바꾸므로 키에 넣지 않는다.)
+fn render_key_for(session: &RunSession) -> RenderKey {
+    let (filter, query) = match session.search.as_ref() {
+        Some(search) if search.filter => (true, search.query.clone()),
+        _ => (false, String::new()),
+    };
+    RenderKey {
+        content_version: session.content_version,
+        filter,
+        query,
+    }
+}
+
 /// 특정 세션의 터미널 뷰 렌더링 (세션 참조 기반)
 ///
 /// Pane 시스템에서 사용하기 위한 헬퍼 함수
@@ -1538,7 +1659,6 @@ impl TerminalCanvas {
 /// * `session` - 렌더링할 세션의 참조
 pub fn view_terminal_for_session(session: &RunSession, is_dragging: bool) -> Element<'_, Message> {
     let (lines, highlights) = prepare_lines(session);
-    let urls = TerminalCanvas::extract_urls(&lines);
 
     let canvas = Canvas::new(TerminalCanvas {
         lines,
@@ -1546,7 +1666,7 @@ pub fn view_terminal_for_session(session: &RunSession, is_dragging: bool) -> Ele
         session_id: session.id,
         initial_scroll_progress: session.scroll_progress,
         auto_scroll: session.auto_scroll,
-        urls,
+        render_key: render_key_for(session),
     })
     .width(Length::Fill)
     .height(Length::Fill);
@@ -1581,10 +1701,11 @@ pub fn view_terminal_for_session(session: &RunSession, is_dragging: bool) -> Ele
 
 /// 세션에서 표시할 라인 + 라인별 검색 하이라이트 종류 준비.
 ///
-/// 매칭은 대소문자 무시 부분일치(라인 단위). 필터 모드면 매치 라인만, 아니면 최근
-/// `RENDER_LINE_LIMIT`개를 표시한다. 각 출력 라인의 위치 인덱스로 매치/현재 매치를
-/// 판정해 `LineHighlight`를 부여한다(정보/빈 라인은 `None`).
-fn prepare_lines(session: &RunSession) -> (Vec<Vec<crate::ansi::TextSegment>>, Vec<LineHighlight>) {
+/// 매칭은 대소문자 무시 부분일치(라인 단위). 필터 모드면 매치 라인만, 아니면 보관된 모든
+/// 줄을 표시한다(버퍼가 MAX_OUTPUT_LINES로 상한되고 가상화로 가시 영역만 그리므로 별도
+/// 렌더 상한/"older lines hidden" 헤더는 없다). 줄은 세션 버퍼를 빌려(zero-copy) 전달하며,
+/// 각 출력 라인의 위치 인덱스로 매치/현재 매치를 판정해 `LineHighlight`를 부여한다.
+fn prepare_lines(session: &RunSession) -> (Vec<LineRef<'_>>, Vec<LineHighlight>) {
     use crate::ansi::TextSegment;
 
     let search = session.search.as_ref();
@@ -1612,55 +1733,156 @@ fn prepare_lines(session: &RunSession) -> (Vec<Vec<crate::ansi::TextSegment>>, V
         }
     };
 
-    let mut lines = Vec::new();
+    let mut lines: Vec<LineRef<'_>> = Vec::new();
     let mut highlights = Vec::new();
 
     if active && filter {
-        // 필터 모드: 매치 라인만 (출력 인덱스 유지로 현재 매치 강조 가능).
-        let total = matches.len();
-        let start_idx = total.saturating_sub(RENDER_LINE_LIMIT);
-        if total > RENDER_LINE_LIMIT {
-            lines.push(vec![TextSegment::new(format!(
-                "... {} older matches hidden (matches: {total})",
-                total - RENDER_LINE_LIMIT
-            ))]);
-            highlights.push(LineHighlight::None);
-            lines.push(vec![TextSegment::new(String::new())]);
-            highlights.push(LineHighlight::None);
-        } else if total == 0 {
-            lines.push(vec![TextSegment::new(format!(
+        // 필터 모드: 매치 라인만 (출력 인덱스 유지로 현재 매치 강조). 매치가 없으면 안내
+        // 줄(버퍼에 없는 합성 줄)만 Owned로 추가한다.
+        if matches.is_empty() {
+            lines.push(LineRef::Owned(vec![TextSegment::new(format!(
                 "No lines match \"{query}\""
-            ))]);
+            ))]));
             highlights.push(LineHighlight::None);
         }
-        for &output_idx in matches.iter().skip(start_idx) {
+        for &output_idx in matches {
             if let Some((_, segments)) = session.output_lines.get(output_idx) {
-                lines.push(segments.clone());
+                lines.push(LineRef::Ref(segments));
                 highlights.push(highlight_for(output_idx));
             }
         }
         return (lines, highlights);
     }
 
-    let total_lines = session.output_lines.len();
-    let start_idx = total_lines.saturating_sub(RENDER_LINE_LIMIT);
-
-    // 숨겨진 라인 정보 표시
-    if total_lines > RENDER_LINE_LIMIT {
-        let hidden = total_lines - RENDER_LINE_LIMIT;
-        lines.push(vec![TextSegment::new(format!(
-            "... {hidden} older lines hidden (total: {total_lines} lines)"
-        ))]);
-        highlights.push(LineHighlight::None);
-        lines.push(vec![TextSegment::new(String::new())]);
-        highlights.push(LineHighlight::None);
-    }
-
-    // 최근 라인 추가 (출력 인덱스로 하이라이트 판정)
-    for (output_idx, (_, segments)) in session.output_lines.iter().enumerate().skip(start_idx) {
-        lines.push(segments.clone());
+    // 일반 모드: 보관된 모든 줄을 빌려서 그대로 표시(zero-copy). 출력 인덱스로 하이라이트 판정.
+    for (output_idx, (_, segments)) in session.output_lines.iter().enumerate() {
+        lines.push(LineRef::Ref(segments));
         highlights.push(highlight_for(output_idx));
     }
 
     (lines, highlights)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ansi::TextSegment;
+    use iced::Size;
+    use iced::widget::canvas::Program as _;
+
+    /// 테스트용 캔버스: `n`개의 짧은 라인으로 구성 (래핑 없음 → total_wrapped == n).
+    /// 합성(Owned) 줄로 만들어 세션 borrow 없이 'static 수명을 갖는다.
+    fn canvas_with_lines(n: usize, auto_scroll: bool) -> (TerminalCanvas<'static>, Uuid) {
+        let id = Uuid::new_v4();
+        let lines: Vec<LineRef<'static>> = (0..n)
+            .map(|i| LineRef::Owned(vec![TextSegment::new(format!("line {i}"))]))
+            .collect();
+        let highlights = vec![LineHighlight::None; n];
+        (
+            TerminalCanvas {
+                lines,
+                highlights,
+                session_id: id,
+                initial_scroll_progress: 1.0,
+                auto_scroll,
+                render_key: RenderKey::default(),
+            },
+            id,
+        )
+    }
+
+    /// 초기화가 끝난(세션 전환 감지 통과) 스크롤 상태.
+    fn ready_state(id: Uuid) -> ScrollState {
+        ScrollState {
+            last_session_id: Some(id),
+            is_initialized: true,
+            ..ScrollState::default()
+        }
+    }
+
+    fn test_bounds() -> Rectangle {
+        Rectangle::new(Point::new(0.0, 0.0), Size::new(800.0, 400.0))
+    }
+
+    fn cursor_inside() -> mouse::Cursor {
+        mouse::Cursor::Available(Point::new(400.0, 200.0))
+    }
+
+    /// 회귀 방지(C1 스크롤 락): auto_scroll=true이고 출력이 흐르는 중(offset < max_scroll)에도
+    /// 휠 이벤트가 apply_auto_scroll에 선점되지 않고 처리되어, offset이 맨 아래로 스냅되지
+    /// 않아야 한다. 과거엔 update 선두의 apply_auto_scroll가 매 입력을 선점해 스크롤이 막혔다.
+    #[test]
+    fn wheel_is_not_preempted_by_auto_scroll_during_streaming() {
+        let (canvas, id) = canvas_with_lines(100, true);
+        let bounds = test_bounds();
+        let mut state = ready_state(id);
+        let max_scroll = canvas.scroll_metrics(&state, bounds).max_scroll;
+        assert!(max_scroll > 0.0, "테스트 전제: 스크롤 가능한 버퍼여야 함");
+
+        state.offset = max_scroll * 0.5; // 중간 위치(맨 아래 아님) → 과거엔 선점 대상
+
+        // 휠 위로 스크롤 (Lines{y:1.0} → delta = -SCROLL_SPEED → offset 감소)
+        let wheel = Event::Mouse(mouse::Event::WheelScrolled {
+            delta: mouse::ScrollDelta::Lines { x: 0.0, y: 1.0 },
+        });
+        let _ = canvas.update(&mut state, &wheel, bounds, cursor_inside());
+
+        assert!(
+            (state.offset - max_scroll).abs() > 0.01,
+            "휠이 선점되면 offset이 max_scroll로 스냅된다 — 선점되지 않아야 함 (offset={}, max={max_scroll})",
+            state.offset
+        );
+        assert!(
+            state.offset < max_scroll * 0.5,
+            "휠 위로 스크롤 시 offset이 감소해야 함 (offset={})",
+            state.offset
+        );
+    }
+
+    /// auto_scroll=true일 때 매 프레임 RedrawRequested는 offset을 맨 아래로 재고정해야 한다
+    /// (꼬리 추적이 입력 라우팅과 분리된 뒤에도 정상 동작하는지 확인).
+    #[test]
+    fn redraw_repins_to_bottom_when_auto_scroll() {
+        let (canvas, id) = canvas_with_lines(100, true);
+        let bounds = test_bounds();
+        let mut state = ready_state(id);
+        let max_scroll = canvas.scroll_metrics(&state, bounds).max_scroll;
+
+        state.offset = 0.0; // 맨 위
+
+        let redraw = Event::Window(window::Event::RedrawRequested(std::time::Instant::now()));
+        let action = canvas.update(&mut state, &redraw, bounds, cursor_inside());
+
+        assert!(action.is_some(), "재고정 시 redraw를 요청해야 함");
+        assert!(
+            (state.offset - max_scroll).abs() <= 0.01,
+            "RedrawRequested + auto_scroll → 맨 아래 재고정 (offset={}, max={max_scroll})",
+            state.offset
+        );
+    }
+
+    /// auto_scroll=false(사용자가 위로 스크롤해 자동 추적을 끈 상태)면 RedrawRequested가
+    /// offset을 건드리지 않아야 한다 ("시작부터 위로 스크롤된 채 폭주" 케이스 포함).
+    #[test]
+    fn redraw_does_not_repin_when_auto_scroll_disabled() {
+        let (canvas, id) = canvas_with_lines(100, false);
+        let bounds = test_bounds();
+
+        let mut state = ready_state(id);
+        state.offset = 10.0;
+
+        let redraw = Event::Window(window::Event::RedrawRequested(std::time::Instant::now()));
+        let _ = canvas.update(&mut state, &redraw, bounds, cursor_inside());
+
+        assert_eq!(state.offset, 10.0, "auto_scroll=false면 재고정하지 않아야 함");
+    }
+
+    // ── S1/S3: 가상화 wrap 수학 (순수 함수) ─────────────────────────────────
+
+    #[test]
+    fn wrapped_total_sums_counts() {
+        assert_eq!(TerminalCanvas::wrapped_total(&[]), 0);
+        assert_eq!(TerminalCanvas::wrapped_total(&[1, 1, 1]), 3);
+        assert_eq!(TerminalCanvas::wrapped_total(&[1, 3, 2, 1]), 7);
+    }
 }

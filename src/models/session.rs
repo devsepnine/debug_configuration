@@ -17,10 +17,27 @@ pub enum SessionStatusKind {
     Stopped,
 }
 
-/// 터미널 출력 버퍼의 최대 라인 수
-/// 이 제한을 초과하면 오래된 라인이 자동으로 제거됨
-/// 라인별 렌더링 관리로 성능 최적화
-const MAX_OUTPUT_LINES: usize = 2000;
+/// 터미널 출력 버퍼의 최대 라인 수 (보관 상한). 이 제한을 초과하면 오래된 라인이 FIFO로
+/// 영구 제거된다. 터미널 뷰는 가상화로 이 버퍼 전체를 스크롤해서 볼 수 있다(가시 영역만 렌더).
+const MAX_OUTPUT_LINES: usize = 50_000;
+
+/// 세션당 출력 버퍼의 최대 누적 바이트 (보관 상한). 줄 수 상한만으로는 메모리가 묶이지
+/// 않으므로(병적으로 긴 줄들), 이 바이트 예산을 함께 적용해 폭주하는 로그 생산자가 앱을
+/// OOM으로 죽이지 못하게 한다. 줄 수/바이트 중 하나라도 넘으면 앞에서 제거한다.
+const MAX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
+
+/// 단일 줄의 최대 저장 바이트. 개행 없는 초대형 줄 하나가 바이트 예산·폭 계산을 한 번에
+/// 폭증시키지 못하도록, 이 크기를 넘는 줄은 char 경계에서 잘라 마커를 붙여 저장한다.
+/// (executor의 1 MiB per-line read 상한보다 작은 표시/저장 상한.)
+const MAX_LINE_BYTES: usize = 64 * 1024;
+
+/// 잘린 줄 끝에 붙는 마커.
+const TRUNCATED_MARKER: &str = "…[truncated]";
+
+/// 세그먼트들의 텍스트 바이트 길이 합 (바이트 예산 계산용).
+fn segments_bytes(segments: &[TextSegment]) -> usize {
+    segments.iter().map(|s| s.text.len()).sum()
+}
 
 /// 세션 출력 검색/필터 상태. 검색바가 열려 있을 때만 `Some`.
 /// 매칭은 라인 단위이며 기본은 대소문자 무시 부분일치, `regex`면 대소문자 무시
@@ -56,6 +73,13 @@ pub struct RunSession {
     pub output_lines: VecDeque<(usize, Vec<TextSegment>)>,
     /// 다음 라인에 할당할 ID (증가만 하여 제거되어도 키 안정성 보장)
     next_line_id: usize,
+    /// 출력 콘텐츠 변경 카운터. 줄 추가/초기화 시 증가하며, 터미널 뷰의 가상화 wrap
+    /// 캐시(per-line 래핑 행 수)를 언제 재생성할지 판단하는 키로 쓰인다. 콘텐츠가
+    /// 안 바뀐 프레임에서는 값이 그대로라 캐시를 재사용한다.
+    pub content_version: u64,
+    /// 현재 보관 중인 출력의 누적 바이트(세그먼트 텍스트 길이 합). 바이트 예산 eviction용으로
+    /// 추가/제거와 lockstep 유지한다.
+    total_bytes: usize,
     /// 프로세스 실행 여부
     pub is_running: bool,
     /// 프로세스 종료 코드 (종료되지 않았으면 None)
@@ -106,6 +130,8 @@ impl RunSession {
             started_at: SystemTime::now(),
             output_lines: VecDeque::new(),
             next_line_id: 0,
+            content_version: 0,
+            total_bytes: 0,
             is_running: true,
             exit_code: None,
             finished_at: None,
@@ -182,26 +208,53 @@ impl RunSession {
 
         // \n으로 분리하여 각 줄을 별도로 추가
         for single_line in line.split('\n') {
-            // 라인 제한 초과 시 오래된 라인 제거 (FIFO).
-            // VecDeque이므로 앞에서 제거가 O(1) — 출력 폭주 시 Vec::remove(0)의
-            // O(n) 시프트 비용을 제거한다.
-            if self.output_lines.len() >= MAX_OUTPUT_LINES {
-                self.output_lines.pop_front();
-            }
+            // 초대형 단일 줄은 char 경계에서 잘라 저장(바이트 예산·폭 계산 폭증 방지).
+            let truncated;
+            let stored: &str = if single_line.len() > MAX_LINE_BYTES {
+                let mut end = MAX_LINE_BYTES;
+                while end > 0 && !single_line.is_char_boundary(end) {
+                    end -= 1;
+                }
+                truncated = format!("{}{TRUNCATED_MARKER}", &single_line[..end]);
+                &truncated
+            } else {
+                single_line
+            };
 
             // ANSI 색상 코드를 파싱하여 텍스트 세그먼트로 변환
-            let segments = parse_ansi_text(single_line);
+            let segments = parse_ansi_text(stored);
+            let bytes = segments_bytes(&segments);
 
             // 고유 ID와 함께 새 라인 추가
             let line_id = self.next_line_id;
             self.next_line_id += 1;
             self.output_lines.push_back((line_id, segments));
+            self.total_bytes += bytes;
+
+            // 줄 수와 바이트 예산을 모두 만족할 때까지 앞에서 제거(FIFO, O(1) per pop).
+            // 방금 추가한 줄 하나만 남을 때까지는 비우지 않는다(최소 1줄 유지).
+            // worst-case: 단일 줄이 예산을 넘으면 total_bytes가 MAX_OUTPUT_BYTES + 마지막 줄
+            // 크기(≤ MAX_LINE_BYTES + 마커)까지 일시 초과한다 — 버퍼를 완전히 비우는 것보다
+            // 1줄 유지가 낫다는 의도적 트레이드오프이며, 메모리는 여전히 상수로 묶인다.
+            while self.output_lines.len() > MAX_OUTPUT_LINES
+                || (self.total_bytes > MAX_OUTPUT_BYTES && self.output_lines.len() > 1)
+            {
+                if let Some((_, evicted)) = self.output_lines.pop_front() {
+                    self.total_bytes = self.total_bytes.saturating_sub(segments_bytes(&evicted));
+                } else {
+                    break;
+                }
+            }
         }
+        // 콘텐츠가 바뀌었으니 wrap 캐시 무효화 키를 올린다.
+        self.content_version = self.content_version.wrapping_add(1);
     }
 
     /// 출력 버퍼 초기화
     pub fn clear_output(&mut self) {
         self.output_lines.clear();
+        self.total_bytes = 0;
+        self.content_version = self.content_version.wrapping_add(1);
     }
 
     /// 현재 세션 상태(배지용)를 판별.
@@ -365,6 +418,71 @@ mod tests {
 
         assert_eq!(session.output_lines.len(), 0);
         assert!(session.output_lines.is_empty());
+        assert_eq!(session.total_bytes, 0, "clear는 바이트 카운터도 0으로 되돌려야 함");
+    }
+
+    #[test]
+    fn total_bytes_tracks_current_lines() {
+        let mut session = RunSession::new("x".to_string());
+        session.add_output_line("hello");
+        session.add_output_line("world!");
+        // 누적 바이트는 현재 보관 중인 줄들의 세그먼트 바이트 합과 정확히 일치해야 한다.
+        let sum: usize = session
+            .output_lines
+            .iter()
+            .map(|(_, segs)| segs.iter().map(|s| s.text.len()).sum::<usize>())
+            .sum();
+        assert_eq!(session.total_bytes, sum);
+    }
+
+    #[test]
+    fn long_line_is_truncated_with_marker() {
+        let mut session = RunSession::new("x".to_string());
+        let huge = "a".repeat(200 * 1024); // 200KB > MAX_LINE_BYTES(64KB)
+        session.add_output_line(&huge);
+
+        let stored: String = session
+            .output_lines
+            .back()
+            .unwrap()
+            .1
+            .iter()
+            .map(|s| s.text.as_str())
+            .collect();
+        assert!(
+            stored.ends_with(TRUNCATED_MARKER),
+            "초대형 줄은 truncation 마커로 끝나야 함"
+        );
+        assert!(
+            stored.len() <= MAX_LINE_BYTES + TRUNCATED_MARKER.len(),
+            "저장 길이가 상한 + 마커 이내여야 함 (got {})",
+            stored.len()
+        );
+    }
+
+    #[test]
+    fn byte_budget_evicts_before_line_cap() {
+        let mut session = RunSession::new("x".to_string());
+        // 각 줄 64KB. 줄 수 상한(50000)엔 한참 못 미치지만 바이트 예산(16MiB)이 먼저 차서
+        // 오래된 줄이 제거되어야 한다.
+        let big = "x".repeat(64 * 1024);
+        for _ in 0..400 {
+            session.add_output_line(&big);
+        }
+        assert!(
+            session.total_bytes <= MAX_OUTPUT_BYTES,
+            "총 바이트가 예산 이하로 유지되어야 함 (got {})",
+            session.total_bytes
+        );
+        assert!(
+            session.output_lines.len() < 400,
+            "바이트 예산으로 오래된 줄이 제거되어야 함 (len={})",
+            session.output_lines.len()
+        );
+        assert!(
+            !session.output_lines.is_empty(),
+            "최소 1줄은 유지되어야 함"
+        );
     }
 
     #[test]

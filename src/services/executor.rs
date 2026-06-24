@@ -9,6 +9,7 @@ use std::sync::{
 };
 use std::time::Duration;
 use tokio::process::{Child, ChildStderr, ChildStdout};
+use tokio::time::{Instant, sleep_until};
 use uuid::Uuid;
 
 #[cfg(windows)]
@@ -389,8 +390,24 @@ fn take_process_streams(
     )
 }
 
+/// 출력 배치 flush 주기(약 한 프레임). 자식이 로그를 폭주시킬 때 stdout 한 줄마다
+/// Message를 보내면 iced UI 스레드가 줄 수만큼 update()+view()+draw()를 돌려 포화되고
+/// 입력(스크롤/클릭)이 starvation 된다. 줄을 모아 이 주기마다 한 번에 보내 UI 메시지 비율을
+/// 출력량과 무관하게 ~60/s로 묶는다. app 측은 이미 멀티라인 페이로드를 처리한다
+/// (handle_output_received가 output.lines() 순회, add_output_line이 '\n' 분할).
+const OUTPUT_FLUSH_INTERVAL: Duration = Duration::from_millis(16);
+/// 배치가 이 줄 수에 도달하면 타이머를 기다리지 않고 즉시 flush (지연 최소화).
+const OUTPUT_FLUSH_MAX_LINES: usize = 64;
+/// 배치가 이 바이트에 도달하면 즉시 flush (flush 틱 사이 폭주로 버퍼가 무한히 커지는 것 방지).
+const OUTPUT_FLUSH_MAX_BYTES: usize = 16 * 1024;
+
 /// 출력 펌프 루프. 취소되면 `true`, stdout/stderr가 모두 닫혀 정상 종료되면 `false` 반환.
 /// 실제 프로세스 종료(kill/reap)는 호출자(`handle_spawned_process`)가 담당한다.
+///
+/// 줄 단위로 읽되 전송은 배치로 묶어 UI 메시지 폭주를 막는다. 배치 버퍼(`batch`)는 이
+/// 태스크에 지역적이고(세션당 스트림 태스크 1개) UI 스레드와 공유되지 않으므로 동기화가
+/// 필요 없다. 종료(취소/EOF) 직전에는 반드시 남은 배치를 flush해, 마지막 출력이
+/// 호출자가 보내는 RunCompleted(종료 배너)보다 먼저 도착하도록 한다.
 async fn process_output_loop<O, E>(
     output: &mut iced::futures::channel::mpsc::Sender<Message>,
     session_id: Uuid,
@@ -402,30 +419,51 @@ where
     O: tokio::io::AsyncRead + Unpin,
     E: tokio::io::AsyncRead + Unpin,
 {
+    let mut batch = String::new();
+    let mut batch_lines: usize = 0;
+    // 배치가 비어 있으면 None(타이머 비무장). 첫 줄이 들어올 때 무장한다.
+    let mut flush_at: Option<Instant> = None;
+
     loop {
         tokio::select! {
-            // 취소 신호를 출력 읽기보다 우선 처리.
+            // 취소를 최우선 처리(기존 동작 보존). 종료 전 남은 배치를 flush.
             biased;
             () = wait_for_cancel(cancel_flag) => {
+                flush_batch(output, session_id, &mut batch, &mut batch_lines).await;
                 return true;
+            }
+            // flush 마감 도달 → 배치 전송. `if !batch.is_empty()`로 idle 시 이 분기를
+            // 비활성화해 불필요한 기상/busy-spin을 막고(타이머는 batch 비었을 때 비무장),
+            // read 분기를 starve하지 않는다(flush 후 batch가 비면 다음 루프에서 자동 비활성).
+            () = wait_flush_deadline(flush_at), if !batch.is_empty() => {
+                flush_batch(output, session_id, &mut batch, &mut batch_lines).await;
+                flush_at = None;
             }
             // `if .is_some()` 전제조건 필수: reader가 None이면 read_next_line이 즉시
             // Ok(None)을 반환해, biased select가 매 루프마다 이 분기만 선택하고 다른
             // reader를 영영 폴링하지 않는 livelock(한쪽 EOF 후 CPU 100% busy-spin,
             // RunCompleted 미발송)이 발생한다. 전제조건으로 None 분기를 비활성화한다.
             result = read_next_line(stdout_reader), if stdout_reader.is_some() => {
-                if handle_line_result(output, session_id, result).await {
+                if accumulate_line(&mut batch, &mut batch_lines, &mut flush_at, result) {
                     *stdout_reader = None;
                 }
             }
             result = read_next_line(stderr_reader), if stderr_reader.is_some() => {
-                if handle_line_result(output, session_id, result).await {
+                if accumulate_line(&mut batch, &mut batch_lines, &mut flush_at, result) {
                     *stderr_reader = None;
                 }
             }
         }
 
+        // 크기 임계 도달 시 타이머를 기다리지 않고 즉시 flush (지연 최소화 + 메모리 상한).
+        if batch_lines >= OUTPUT_FLUSH_MAX_LINES || batch.len() >= OUTPUT_FLUSH_MAX_BYTES {
+            flush_batch(output, session_id, &mut batch, &mut batch_lines).await;
+            flush_at = None;
+        }
+
         if stdout_reader.is_none() && stderr_reader.is_none() {
+            // 정상 종료: 남은 배치를 flush한 뒤 완료 보고(RunCompleted)로 넘어간다.
+            flush_batch(output, session_id, &mut batch, &mut batch_lines).await;
             return false;
         }
     }
@@ -507,20 +545,53 @@ where
     Ok(Some(String::from_utf8_lossy(&buf).into_owned()))
 }
 
-async fn handle_line_result(
-    output: &mut iced::futures::channel::mpsc::Sender<Message>,
-    session_id: Uuid,
+/// 읽은 한 줄을 배치 버퍼에 누적한다. EOF/에러(=Ok(Some) 아님)면 해당 reader를 종료해야
+/// 하므로 `true`를 반환한다. 배치가 비어 있다가 첫 줄이 들어오면 flush 마감 시각을 무장한다.
+/// (개행은 호출부에서 트림됐으므로 여기서 다시 부여 — app 측이 lines()/'\n'로 재분할한다.)
+fn accumulate_line(
+    batch: &mut String,
+    batch_lines: &mut usize,
+    flush_at: &mut Option<Instant>,
     result: std::io::Result<Option<String>>,
 ) -> bool {
-    use iced::futures::SinkExt;
-
     if let Ok(Some(line)) = result {
-        let _ = output
-            .send(Message::OutputReceived(session_id, format!("{line}\n")))
-            .await;
+        batch.push_str(&line);
+        batch.push('\n');
+        *batch_lines += 1;
+        if flush_at.is_none() {
+            *flush_at = Some(Instant::now() + OUTPUT_FLUSH_INTERVAL);
+        }
         false
     } else {
         true
+    }
+}
+
+/// 누적된 배치를 한 개의 `OutputReceived` 메시지로 전송하고 버퍼를 비운다. 비어 있으면 no-op.
+async fn flush_batch(
+    output: &mut iced::futures::channel::mpsc::Sender<Message>,
+    session_id: Uuid,
+    batch: &mut String,
+    batch_lines: &mut usize,
+) {
+    use iced::futures::SinkExt;
+
+    if batch.is_empty() {
+        return;
+    }
+    let payload = std::mem::take(batch);
+    *batch_lines = 0;
+    let _ = output
+        .send(Message::OutputReceived(session_id, payload))
+        .await;
+}
+
+/// flush 마감까지 대기. 무장된 마감이 없으면 영원히 pending 한다 — select! 분기의
+/// `if !batch.is_empty()` 가드와 함께 idle 시 불필요한 기상/busy-spin을 방지한다.
+async fn wait_flush_deadline(flush_at: Option<Instant>) {
+    match flush_at {
+        Some(at) => sleep_until(at).await,
+        None => std::future::pending::<()>().await,
     }
 }
 
@@ -888,6 +959,63 @@ mod tests {
         assert!(
             stdout.is_none() && stderr.is_none(),
             "both readers should be drained to None"
+        );
+    }
+
+    /// 회귀 방지(C2 메시지 폭주): 출력 줄을 배치로 묶어 메시지 수를 줄이되, 내용과 순서는
+    /// 보존해야 한다. 200줄을 즉시 제공 → 64줄 임계 flush + EOF 시 잔여 flush로 200개보다
+    /// 훨씬 적은 메시지에 담기며, 모든 페이로드를 이어 붙이면 원본과 동일해야 한다.
+    #[tokio::test]
+    async fn output_loop_coalesces_lines_preserving_content_and_order() {
+        use iced::futures::StreamExt;
+        use tokio::io::BufReader;
+
+        let (mut tx, mut rx) = iced::futures::channel::mpsc::channel::<Message>(1000);
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        let mut data = Vec::new();
+        for i in 0..200 {
+            data.extend_from_slice(format!("line{i}\n").as_bytes());
+        }
+        let mut stdout = Some(BufReader::new(data.as_slice()));
+        let mut stderr: Option<BufReader<&[u8]>> = Some(BufReader::new(b"".as_slice()));
+
+        let completed = tokio::time::timeout(
+            Duration::from_secs(5),
+            process_output_loop(&mut tx, Uuid::new_v4(), &mut stdout, &mut stderr, &cancel),
+        )
+        .await
+        .expect("output loop timed out");
+        assert!(!completed, "both readers at EOF → normal completion (false)");
+
+        // 송신측 drop 후 수신 스트림을 모두 수집.
+        drop(tx);
+        let mut messages = Vec::new();
+        while let Some(msg) = rx.next().await {
+            messages.push(msg);
+        }
+
+        // 내용/순서 보존: 모든 OutputReceived 페이로드를 이어 붙이면 원본과 동일해야 한다
+        // (EOF 시 잔여 부분 배치 flush가 누락 없이 마지막 줄들까지 보내는지도 검증).
+        let mut reconstructed = String::new();
+        for msg in &messages {
+            if let Message::OutputReceived(_, payload) = msg {
+                reconstructed.push_str(payload);
+            }
+        }
+        let expected: String = (0..200).map(|i| format!("line{i}\n")).collect();
+        assert_eq!(reconstructed, expected, "배치 후에도 줄 내용/순서가 보존되어야 함");
+
+        // 배치 효과: 200줄이 줄 수보다 훨씬 적은 메시지로 묶여야 한다 (64줄 임계 → 약 4개;
+        // 인메모리 read는 즉시 완료되어 16ms 타이머가 거의 발화하지 않으므로 여유 상한 20).
+        let output_msgs = messages
+            .iter()
+            .filter(|m| matches!(m, Message::OutputReceived(_, _)))
+            .count();
+        assert!(output_msgs < 200, "배치로 메시지 수가 줄어야 함 (got {output_msgs})");
+        assert!(
+            output_msgs <= 20,
+            "200줄이 배치로 크게 줄어야 함 (got {output_msgs})"
         );
     }
 

@@ -1891,6 +1891,10 @@ impl RunConfigManager {
 
     fn handle_output_received(&mut self, session_id: Uuid, output: &str) -> Task<Message> {
         if let Some(session) = self.session_by_id_mut(session_id) {
+            // `output`은 단일 줄이 아니라 executor가 묶어 보낸 멀티라인 배치일 수 있다
+            // (process_output_loop의 출력 coalescing — UI 메시지 폭주 방지). `lines()`로
+            // 분할해 줄 단위로 누적한다(add_output_line이 내부에서 '\n' 재분할). 배치는
+            // 항상 trailing '\n'으로 끝나며 `lines()`가 이를 무시하므로 빈 줄은 생기지 않는다.
             for line in output.lines() {
                 session.add_output_line(line);
             }
