@@ -131,8 +131,8 @@ tasklist | findstr run_config_manager
 # 터미널에서 직접 실행하여 에러 메시지 확인
 ./run_config_manager
 
-# 폰트 파일 확인
-ls fonts/D2Coding.ttc
+# 폰트 파일 확인 (참고: 폰트는 바이너리에 임베드되므로 런타임에 이 파일은 필요 없음)
+ls fonts/D2Coding.ttf
 
 # 권한 확인
 chmod +x run_config_manager

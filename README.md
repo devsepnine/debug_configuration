@@ -24,12 +24,13 @@ Grab the latest pre-built binary for your platform from the [Releases page](http
 ## Key Features
 
 ### Configuration Management
-- Create, edit, and delete run configurations
-- Select configuration type (Application, Shell Script, Node)
+- Create, edit, clone, and delete run configurations
+- Select configuration type (Application, Shell Script, Node, Compound)
+- Compound type runs several configurations together as one group
 - Set command, arguments, and working directory
 - Manage environment variables (add, edit, delete)
 - Reorder configurations with drag and drop
-- Open/save configurations (JSON format)
+- Open/save configurations (versioned JSON format)
 
 ### Node Project Support
 - Node-oriented commands supported (run, install, start, test, build, etc.)
@@ -42,6 +43,9 @@ Grab the latest pre-built binary for your platform from the [Releases page](http
 - Run multiple sessions simultaneously
 - Real-time output display (ANSI color support)
 - Rerun, stop, remove, and hide sessions from a workspace
+- Status badge on finished sessions (success, failed exit code, run duration)
+- Desktop notification when a run finishes while the window is unfocused
+- Bulk actions: Stop All, Rerun All, Rerun Failed
 - Persistent session list with workspace-aware open state
 - Workspace tab system
   - Keep at least one workspace tab available
@@ -52,6 +56,12 @@ Grab the latest pre-built binary for your platform from the [Releases page](http
   - Drag and drop pane rearrangement
   - Resize panes
   - Maximize and restore panes when multiple panes are open
+
+### Output Search and Export
+- Search output (Ctrl+F): case-insensitive substring or regex
+- Match-line highlighting with next/previous navigation and a match count
+- Filter mode to show only matching lines
+- Export the full session output to a text/log file
 
 ### UI Features
 - Catppuccin Mocha theme
@@ -86,6 +96,16 @@ cargo build --release
 ```bash
 cargo run --release
 ```
+
+### Linux runtime dependencies
+On Linux the app relies on a few desktop services at runtime. They are present on a normal desktop session but may be missing on minimal/headless setups, in which case the related feature degrades silently:
+
+- **File dialogs** (open / save / export output) use the XDG Desktop Portal over D-Bus — install and run `xdg-desktop-portal` plus a backend (`xdg-desktop-portal-gtk`, `-kde`, or `-hyprland`).
+- **Desktop notifications** need a running notification daemon implementing `org.freedesktop.Notifications` (GNOME/KDE provide one; otherwise `dunst` / `mako`).
+- **Opening URLs** uses `xdg-open` from `xdg-utils`.
+- **Rendering** uses wgpu (Vulkan/GL); a working GPU driver (Mesa) is recommended (a tiny-skia software path is the fallback).
+
+Build-time system libraries (for compiling from source) are listed in the CI workflow: `libfontconfig1-dev`, `libwayland-dev`, `libx11-xcb-dev`, `libxkbcommon-dev`, `pkg-config`.
 
 ### Platform Check
 The project is intended to run on Windows, macOS, and Linux.

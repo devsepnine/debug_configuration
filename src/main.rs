@@ -21,7 +21,7 @@ use iced::{Color, Element, Font, Size, Subscription, Task, Theme, theme, window}
 use messages::Message;
 
 /// D2 Coding 폰트 임베드
-const D2CODING_FONT: &[u8] = include_bytes!("../fonts/D2Coding.ttf");
+pub(crate) const D2CODING_FONT: &[u8] = include_bytes!("../fonts/D2Coding.ttf");
 
 /// D2 Coding 폰트 정의
 pub const D2CODING: Font = Font::with_name("D2Coding");
@@ -29,16 +29,23 @@ pub const D2CODING: Font = Font::with_name("D2Coding");
 /// 애플리케이션 진입점
 fn main() -> iced::Result {
     // 시그널 핸들러 등록: Ctrl+C, SIGINT, SIGTERM 캐치
-    // 시그널 수신 시 std::process::exit(0) 호출 → Drop trait 실행 → 프로세스 정리
+    // std::process::exit(0)는 Drop을 실행하지 않으므로(스택 unwind 없음), 시그널 핸들러가
+    // 직접 자식 프로세스를 정리해야 한다. RunConfigManager에는 접근할 수 없으므로 전역 PID
+    // 레지스트리를 통해 실행 중인 모든 프로세스 트리를 강제 종료한 뒤 종료한다.
     ctrlc::set_handler(move || {
         eprintln!("\n[Signal] Termination signal received (Ctrl+C / SIGTERM)");
-        eprintln!("[Signal] Initiating graceful shutdown...");
+        eprintln!("[Signal] Killing child processes and exiting...");
+        services::kill_all_running_processes();
         std::process::exit(0);
     })
     .expect("Failed to set signal handler");
 
     eprintln!("[Startup] Run/Debug Configuration Manager");
     eprintln!("[Startup] Press Ctrl+C for graceful shutdown");
+
+    // PowerShell 탐지(LazyLock, 1회 blocking subprocess)를 창이 뜨기 전 메인 스레드에서
+    // 미리 초기화 → 첫 구성 실행이 tokio 워커에서 블로킹되지 않는다 (Windows 외 no-op).
+    services::prewarm_shell_detection();
 
     iced::application(RunConfigManager::new, update, view)
         .subscription(subscription)

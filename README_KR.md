@@ -24,12 +24,13 @@ Rust와 iced GUI 프레임워크로 개발되었으며, 여러 프로그램 실�
 ## 주요 기능
 
 ### 구성 관리
-- 실행 구성 생성, 수정, 삭제
-- 구성 타입 선택 (Application, Shell Script, Node)
+- 실행 구성 생성, 수정, 복제, 삭제
+- 구성 타입 선택 (Application, Shell Script, Node, Compound)
+- Compound 타입은 여러 구성을 묶어 한 번에 실행
 - 명령어, 인자, 작업 디렉토리 설정
 - 환경 변수 관리 (추가, 수정, 삭제)
 - 드래그 앤 드롭으로 구성 순서 변경
-- 구성 열기/저장 (JSON 형식)
+- 구성 열기/저장 (버전 관리 JSON 형식)
 
 ### Node 프로젝트 지원
 - Node 기반 명령어 지원 (run, install, start, test, build 등)
@@ -42,6 +43,9 @@ Rust와 iced GUI 프레임워크로 개발되었으며, 여러 프로그램 실�
 - 다중 세션 동시 실행
 - 실시간 출력 표시 (ANSI 색상 지원)
 - 세션 재실행, 중지, 제거, 워크스페이스에서 숨김
+- 완료된 세션의 상태 배지 (성공 / 실패 종료 코드 / 실행 시간)
+- 창이 비활성 상태에서 실행이 끝나면 데스크톱 알림
+- 일괄 작업: 모두 중지, 모두 재실행, 실패만 재실행
 - 워크스페이스 열림 상태를 표시하는 세션 리스트
 - 워크스페이스 탭 시스템
   - 최소 하나의 워크스페이스 탭 유지
@@ -52,6 +56,12 @@ Rust와 iced GUI 프레임워크로 개발되었으며, 여러 프로그램 실�
   - 드래그 앤 드롭으로 Pane 재배치
   - Pane 리사이징
   - 여러 Pane이 있을 때 최대화/복원 지원
+
+### 출력 검색 및 내보내기
+- 출력 검색 (Ctrl+F): 대소문자 무시 부분일치 또는 정규식
+- 매치 라인 하이라이트, 이전/다음 이동, 매치 개수 표시
+- 매치 라인만 표시하는 필터 모드
+- 세션 출력 전체를 텍스트/로그 파일로 내보내기
 
 ### UI 특징
 - Catppuccin Mocha 테마
@@ -86,6 +96,16 @@ cargo build --release
 ```bash
 cargo run --release
 ```
+
+### Linux 런타임 의존성
+Linux에서는 실행 시 몇 가지 데스크톱 서비스에 의존합니다. 일반 데스크톱 세션에는 있지만 최소 구성/헤드리스 환경에서는 없을 수 있으며, 그 경우 해당 기능이 조용히 비활성화됩니다:
+
+- **파일 다이얼로그**(열기 / 저장 / 출력 내보내기)는 D-Bus 기반 XDG Desktop Portal을 사용합니다 — `xdg-desktop-portal`과 백엔드(`xdg-desktop-portal-gtk`, `-kde`, `-hyprland` 등)를 설치·실행하세요.
+- **데스크톱 알림**은 `org.freedesktop.Notifications`를 구현하는 알림 데몬이 필요합니다(GNOME/KDE 기본 제공, 없으면 `dunst` / `mako`).
+- **URL 열기**는 `xdg-utils`의 `xdg-open`을 사용합니다.
+- **렌더링**은 wgpu(Vulkan/GL)를 사용합니다. GPU 드라이버(Mesa) 동작을 권장합니다(tiny-skia 소프트웨어 폴백).
+
+소스 빌드용 시스템 라이브러리는 CI 워크플로에 명시: `libfontconfig1-dev`, `libwayland-dev`, `libx11-xcb-dev`, `libxkbcommon-dev`, `pkg-config`.
 
 ### 플랫폼 체크
 이 프로젝트는 Windows, macOS, Linux 실행을 목표로 합니다.

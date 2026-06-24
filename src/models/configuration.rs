@@ -11,6 +11,8 @@ pub enum ConfigurationType {
     ShellScript,
     /// Node.js package manager 실행
     Node,
+    /// 여러 구성을 묶어 한 번에 실행 (복합 구성)
+    Compound,
 }
 
 /// JavaScript package manager selection for Node configurations.
@@ -361,13 +363,135 @@ pub enum ConfigTypeData {
         /// Node 옵션 (`NODE_OPTIONS` 환경 변수)
         node_options: String,
     },
+    /// 복합 구성 데이터 — 함께 실행할 다른 구성들의 id 목록.
+    /// 실행 시 각 멤버가 자신의 세션/페인으로 동시에 펼쳐진다.
+    Compound {
+        /// 함께 실행할 멤버 구성들의 id (실행 순서는 무의미 — 동시 실행)
+        #[serde(default)]
+        members: Vec<Uuid>,
+    },
+}
+
+/// `ConfigTypeData::Application` 변형의 가변 필드 묶음.
+pub struct ApplicationFieldsMut<'a> {
+    pub command: &'a mut String,
+    pub arguments: &'a mut String,
+}
+
+/// `ExecuteMode::ScriptFile` 변형의 가변 필드 묶음.
+pub struct ScriptFileFieldsMut<'a> {
+    pub script_path: &'a mut String,
+    pub script_options: &'a mut String,
+    pub interpreter_path: &'a mut Option<String>,
+    pub interpreter_options: &'a mut Option<String>,
+}
+
+/// `ConfigTypeData::Node` 변형의 가변 필드 묶음.
+pub struct NodeFieldsMut<'a> {
+    pub package_manager: &'a mut PackageManager,
+    pub node_runtime_path: &'a mut Option<String>,
+    pub command: &'a mut NodeCommand,
+    pub script_name: &'a mut Option<String>,
+    pub arguments: &'a mut String,
+    pub node_options: &'a mut String,
+}
+
+impl ConfigTypeData {
+    /// 이 데이터에 대응하는 구성 타입(판별자)을 반환.
+    pub fn config_type(&self) -> ConfigurationType {
+        match self {
+            ConfigTypeData::Application { .. } => ConfigurationType::Application,
+            ConfigTypeData::ShellScript { .. } => ConfigurationType::ShellScript,
+            ConfigTypeData::Node { .. } => ConfigurationType::Node,
+            ConfigTypeData::Compound { .. } => ConfigurationType::Compound,
+        }
+    }
+
+    /// Application 변형이면 가변 필드 묶음 반환.
+    pub fn application_mut(&mut self) -> Option<ApplicationFieldsMut<'_>> {
+        if let ConfigTypeData::Application { command, arguments } = self {
+            Some(ApplicationFieldsMut { command, arguments })
+        } else {
+            None
+        }
+    }
+
+    /// `ShellScript` + `ScriptFile` 변형이면 가변 필드 묶음 반환.
+    pub fn script_file_mut(&mut self) -> Option<ScriptFileFieldsMut<'_>> {
+        if let ConfigTypeData::ShellScript {
+            execute_mode:
+                ExecuteMode::ScriptFile {
+                    script_path,
+                    script_options,
+                    interpreter_path,
+                    interpreter_options,
+                },
+        } = self
+        {
+            Some(ScriptFileFieldsMut {
+                script_path,
+                script_options,
+                interpreter_path,
+                interpreter_options,
+            })
+        } else {
+            None
+        }
+    }
+
+    /// `ShellScript` + `ScriptText` 변형이면 스크립트 텍스트의 가변 참조 반환.
+    pub fn script_text_mut(&mut self) -> Option<&mut String> {
+        if let ConfigTypeData::ShellScript {
+            execute_mode: ExecuteMode::ScriptText { script_text },
+        } = self
+        {
+            Some(script_text)
+        } else {
+            None
+        }
+    }
+
+    /// Node 변형이면 가변 필드 묶음 반환.
+    pub fn node_mut(&mut self) -> Option<NodeFieldsMut<'_>> {
+        if let ConfigTypeData::Node {
+            package_manager,
+            node_runtime_path,
+            command,
+            script_name,
+            arguments,
+            node_options,
+            ..
+        } = self
+        {
+            Some(NodeFieldsMut {
+                package_manager,
+                node_runtime_path,
+                command,
+                script_name,
+                arguments,
+                node_options,
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Compound 변형이면 멤버 id 목록의 가변 참조 반환.
+    pub fn compound_members_mut(&mut self) -> Option<&mut Vec<Uuid>> {
+        if let ConfigTypeData::Compound { members } = self {
+            Some(members)
+        } else {
+            None
+        }
+    }
 }
 
 impl ConfigurationType {
-    pub const ALL: [ConfigurationType; 3] = [
+    pub const ALL: [ConfigurationType; 4] = [
         ConfigurationType::Application,
         ConfigurationType::ShellScript,
         ConfigurationType::Node,
+        ConfigurationType::Compound,
     ];
 }
 
@@ -380,6 +504,7 @@ impl std::fmt::Display for ConfigurationType {
                 ConfigurationType::Application => "Application",
                 ConfigurationType::ShellScript => "Shell Script",
                 ConfigurationType::Node => "Node",
+                ConfigurationType::Compound => "Compound",
             }
         )
     }
@@ -393,8 +518,6 @@ pub struct RunConfiguration {
     pub id: Uuid,
     /// 구성 이름
     pub name: String,
-    /// 구성 타입 (`Application`, `ShellScript` 등)
-    pub config_type: ConfigurationType,
     /// 작업 디렉토리 경로
     pub working_directory: String,
     /// 환경 변수 맵 (key-value)
@@ -408,7 +531,6 @@ impl Default for RunConfiguration {
         Self {
             id: Uuid::new_v4(),
             name: String::from("New Configuration"),
-            config_type: ConfigurationType::Application,
             working_directory: String::from("."),
             environment_variables: HashMap::new(),
             type_data: ConfigTypeData::Application {
@@ -419,4 +541,10 @@ impl Default for RunConfiguration {
     }
 }
 
-impl RunConfiguration {}
+impl RunConfiguration {
+    /// 구성 타입(판별자)을 `type_data`에서 파생. 별도 필드로 중복 저장하지 않으므로
+    /// 두 표현이 어긋나는 불법 상태가 발생할 수 없다.
+    pub fn config_type(&self) -> ConfigurationType {
+        self.type_data.config_type()
+    }
+}

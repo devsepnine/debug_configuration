@@ -201,7 +201,7 @@ pub fn parse_ansi_text(text: &str) -> Vec<TextSegment> {
                 // CSI (Control Sequence Introducer) 시퀀스 파싱
                 let mut params = String::new();
                 for next_ch in chars.by_ref() {
-                    if next_ch.is_ascii_alphabetic() || next_ch == 'm' {
+                    if next_ch.is_ascii_alphabetic() {
                         // 'm' 종료 문자 (SGR - Select Graphic Rendition)
                         if next_ch == 'm' {
                             parse_sgr_params(&params, &mut state);

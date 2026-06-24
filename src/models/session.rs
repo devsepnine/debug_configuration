@@ -1,12 +1,45 @@
 use crate::ansi::TextSegment;
+use std::collections::VecDeque;
 use std::sync::{Arc, atomic::AtomicBool};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 use uuid::Uuid;
+
+/// 세션의 현재 상태 (배지 표시용).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionStatusKind {
+    /// 실행 중
+    Running,
+    /// 정상 종료 (exit 0)
+    Succeeded,
+    /// 비정상 종료 (exit code != 0)
+    Failed(i32),
+    /// 사용자가 중지 (종료 코드 없음)
+    Stopped,
+}
 
 /// 터미널 출력 버퍼의 최대 라인 수
 /// 이 제한을 초과하면 오래된 라인이 자동으로 제거됨
 /// 라인별 렌더링 관리로 성능 최적화
 const MAX_OUTPUT_LINES: usize = 2000;
+
+/// 세션 출력 검색/필터 상태. 검색바가 열려 있을 때만 `Some`.
+/// 매칭은 라인 단위이며 기본은 대소문자 무시 부분일치, `regex`면 대소문자 무시
+/// 정규식. 매치 인덱스(`matches`)는 출력/검색어 변경 시 `refresh_search_matches`로
+/// 갱신해 캐시한다(뷰는 매 프레임 재스캔 대신 캐시만 읽음).
+#[derive(Debug, Clone, Default)]
+pub struct SearchState {
+    /// 검색어
+    pub query: String,
+    /// 매치 라인만 표시(필터 모드)
+    pub filter: bool,
+    /// 현재 매치 순번 (매치 목록 기준 0-based; 매치가 있을 때만 의미)
+    pub current: usize,
+    /// 정규식 모드 (off면 대소문자 무시 부분일치)
+    pub regex: bool,
+    /// 매치 라인의 `output_lines` 위치 인덱스 캐시. 매 프레임 재스캔을 피하려고
+    /// 검색어/출력이 바뀔 때만 `refresh_search_matches`로 갱신한다(뷰는 읽기만).
+    pub matches: Vec<usize>,
+}
 
 /// 실행 세션을 나타내는 구조체
 /// 프로세스 실행 상태와 출력을 추적
@@ -20,13 +53,15 @@ pub struct RunSession {
     pub started_at: SystemTime,
     /// 프로세스의 표준 출력/에러 라인 목록 (ID와 함께 저장하여 키 기반 렌더링)
     /// 각 라인은 색상 정보가 포함된 텍스트 세그먼트 벡터로 저장됨
-    pub output_lines: Vec<(usize, Vec<TextSegment>)>,
+    pub output_lines: VecDeque<(usize, Vec<TextSegment>)>,
     /// 다음 라인에 할당할 ID (증가만 하여 제거되어도 키 안정성 보장)
     next_line_id: usize,
     /// 프로세스 실행 여부
     pub is_running: bool,
     /// 프로세스 종료 코드 (종료되지 않았으면 None)
     pub exit_code: Option<i32>,
+    /// 프로세스 종료 시각 (실행 중이면 None) — 소요 시간 계산용
+    pub finished_at: Option<SystemTime>,
     /// 프로세스 취소를 위한 플래그 (멀티스레드 안전)
     pub cancel_flag: Arc<AtomicBool>,
     /// 스크롤 위치 (0.0 = 맨 위, 1.0 = 맨 아래)
@@ -36,6 +71,8 @@ pub struct RunSession {
     /// 실행 중인 프로세스의 PID
     /// 앱 종료 시 OS 레벨에서 직접 프로세스를 kill하기 위해 추적
     pub process_pid: Option<u32>,
+    /// 출력 검색/필터 상태 (검색바가 열려 있으면 `Some`)
+    pub search: Option<SearchState>,
 }
 
 impl std::fmt::Debug for RunSession {
@@ -48,6 +85,7 @@ impl std::fmt::Debug for RunSession {
             .field("next_line_id", &self.next_line_id)
             .field("is_running", &self.is_running)
             .field("exit_code", &self.exit_code)
+            .field("finished_at", &self.finished_at)
             .field("cancel_flag", &"<AtomicBool>")
             .field("scroll_progress", &self.scroll_progress)
             .field("auto_scroll", &self.auto_scroll)
@@ -66,14 +104,72 @@ impl RunSession {
             id: Uuid::new_v4(),
             config_name,
             started_at: SystemTime::now(),
-            output_lines: Vec::new(),
+            output_lines: VecDeque::new(),
             next_line_id: 0,
             is_running: true,
             exit_code: None,
+            finished_at: None,
             cancel_flag: Arc::new(AtomicBool::new(false)),
             scroll_progress: 1.0, // 기본값: 맨 아래
             auto_scroll: true,    // 기본값: 자동 스크롤 활성화
             process_pid: None,
+            search: None,
+        }
+    }
+
+    /// 검색 매치 캐시(`search.matches`)를 현재 출력/검색어로 갱신하고 `current`를
+    /// 범위 내로 클램프한다. 출력 추가/검색어 변경 등 상태 변화 시 `update()`에서
+    /// 호출한다. 검색바가 닫혀 있으면(`search` None) no-op.
+    pub fn refresh_search_matches(&mut self) {
+        let Some((query, regex)) = self.search.as_ref().map(|s| (s.query.clone(), s.regex)) else {
+            return;
+        };
+        let matches = self.search_match_indices(&query, regex);
+        if let Some(search) = self.search.as_mut() {
+            let len = matches.len();
+            search.matches = matches;
+            search.current = if len == 0 {
+                0
+            } else {
+                search.current.min(len - 1)
+            };
+        }
+    }
+
+    /// 검색어에 매치하는 `output_lines`의 위치 인덱스 목록. `regex`면 대소문자 무시
+    /// 정규식(잘못된 패턴은 매치 없음으로 처리), 아니면 대소문자 무시 부분일치.
+    /// 빈 검색어면 빈 목록. FIFO 제거로 인덱스가 변할 수 있어 매번 즉석 계산한다.
+    pub fn search_match_indices(&self, query: &str, regex: bool) -> Vec<usize> {
+        if query.is_empty() {
+            return Vec::new();
+        }
+
+        let line_text = |segments: &[TextSegment]| -> String {
+            segments.iter().map(|seg| seg.text.as_str()).collect()
+        };
+
+        if regex {
+            // 잘못된 패턴은 빈 결과(패닉/크래시 방지). 컴파일은 refresh 시점에만 일어난다.
+            let Ok(re) = regex::RegexBuilder::new(query)
+                .case_insensitive(true)
+                .build()
+            else {
+                return Vec::new();
+            };
+            self.output_lines
+                .iter()
+                .enumerate()
+                .filter(|(_, (_, segments))| re.is_match(&line_text(segments)))
+                .map(|(idx, _)| idx)
+                .collect()
+        } else {
+            let needle = query.to_lowercase();
+            self.output_lines
+                .iter()
+                .enumerate()
+                .filter(|(_, (_, segments))| line_text(segments).to_lowercase().contains(&needle))
+                .map(|(idx, _)| idx)
+                .collect()
         }
     }
 
@@ -86,9 +182,11 @@ impl RunSession {
 
         // \n으로 분리하여 각 줄을 별도로 추가
         for single_line in line.split('\n') {
-            // 라인 제한 초과 시 오래된 라인 제거 (FIFO)
+            // 라인 제한 초과 시 오래된 라인 제거 (FIFO).
+            // VecDeque이므로 앞에서 제거가 O(1) — 출력 폭주 시 Vec::remove(0)의
+            // O(n) 시프트 비용을 제거한다.
             if self.output_lines.len() >= MAX_OUTPUT_LINES {
-                self.output_lines.remove(0);
+                self.output_lines.pop_front();
             }
 
             // ANSI 색상 코드를 파싱하여 텍스트 세그먼트로 변환
@@ -97,13 +195,58 @@ impl RunSession {
             // 고유 ID와 함께 새 라인 추가
             let line_id = self.next_line_id;
             self.next_line_id += 1;
-            self.output_lines.push((line_id, segments));
+            self.output_lines.push_back((line_id, segments));
         }
     }
 
     /// 출력 버퍼 초기화
     pub fn clear_output(&mut self) {
         self.output_lines.clear();
+    }
+
+    /// 현재 세션 상태(배지용)를 판별.
+    pub fn status_kind(&self) -> SessionStatusKind {
+        if self.is_running {
+            SessionStatusKind::Running
+        } else {
+            match self.exit_code {
+                Some(0) => SessionStatusKind::Succeeded,
+                Some(code) => SessionStatusKind::Failed(code),
+                None => SessionStatusKind::Stopped,
+            }
+        }
+    }
+
+    /// 완료된 세션의 실행 소요 시간 (실행 중이거나 종료 시각이 없으면 None).
+    pub fn run_duration(&self) -> Option<Duration> {
+        self.finished_at
+            .and_then(|finished| finished.duration_since(self.started_at).ok())
+    }
+
+    /// 상태 배지에 표시할 짧은 라벨 (예: "✓ 1.2s", "✕ exit 1", "Stopped", "Running").
+    pub fn status_badge_label(&self) -> String {
+        match self.status_kind() {
+            SessionStatusKind::Running => String::from("Running"),
+            SessionStatusKind::Succeeded => self.run_duration().map_or_else(
+                || String::from("✓ done"),
+                |d| format!("✓ {}", format_duration(d)),
+            ),
+            SessionStatusKind::Failed(code) => format!("✕ exit {code}"),
+            SessionStatusKind::Stopped => String::from("Stopped"),
+        }
+    }
+}
+
+/// `Duration`을 짧은 사람용 문자열로 변환 ("820ms" / "1.2s" / "3m 04s").
+pub fn format_duration(duration: Duration) -> String {
+    let millis = duration.as_millis();
+    if millis < 1000 {
+        format!("{millis}ms")
+    } else if duration.as_secs() < 60 {
+        format!("{:.1}s", duration.as_secs_f64())
+    } else {
+        let secs = duration.as_secs();
+        format!("{}m {:02}s", secs / 60, secs % 60)
     }
 }
 
@@ -222,5 +365,61 @@ mod tests {
 
         assert_eq!(session.output_lines.len(), 0);
         assert!(session.output_lines.is_empty());
+    }
+
+    #[test]
+    fn status_kind_reflects_state() {
+        let mut session = RunSession::new("x".to_string());
+        assert_eq!(session.status_kind(), SessionStatusKind::Running);
+
+        session.is_running = false;
+        session.exit_code = Some(0);
+        assert_eq!(session.status_kind(), SessionStatusKind::Succeeded);
+
+        session.exit_code = Some(2);
+        assert_eq!(session.status_kind(), SessionStatusKind::Failed(2));
+
+        session.exit_code = None; // 사용자 중지
+        assert_eq!(session.status_kind(), SessionStatusKind::Stopped);
+    }
+
+    #[test]
+    fn search_match_indices_is_case_insensitive_substring() {
+        let mut session = RunSession::new("x".to_string());
+        session.add_output_line("Starting build");
+        session.add_output_line("ERROR: boom");
+        session.add_output_line("warning: minor");
+        session.add_output_line("error again");
+
+        assert_eq!(session.search_match_indices("", false), Vec::<usize>::new());
+        assert_eq!(session.search_match_indices("error", false), vec![1, 3]);
+        assert_eq!(session.search_match_indices("WARN", false), vec![2]);
+        assert_eq!(
+            session.search_match_indices("zzz", false),
+            Vec::<usize>::new()
+        );
+    }
+
+    #[test]
+    fn search_match_indices_supports_regex_case_insensitive() {
+        let mut session = RunSession::new("x".to_string());
+        session.add_output_line("error 12");
+        session.add_output_line("warn 3");
+        session.add_output_line("ERROR 999");
+
+        // 대소문자 무시 정규식: "err...<공백><숫자>"
+        assert_eq!(
+            session.search_match_indices(r"err\w* \d+", true),
+            vec![0, 2]
+        );
+        // 잘못된 패턴은 매치 없음 (패닉 없음)
+        assert_eq!(session.search_match_indices("[", true), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn format_duration_is_human_readable() {
+        assert_eq!(format_duration(Duration::from_millis(820)), "820ms");
+        assert_eq!(format_duration(Duration::from_millis(1200)), "1.2s");
+        assert_eq!(format_duration(Duration::from_secs(75)), "1m 15s");
     }
 }

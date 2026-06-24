@@ -1,14 +1,71 @@
 use crate::messages::Message;
 use crate::models::{ConfigTypeData, ExecuteMode, NodeCommand, PackageManager, RunConfiguration};
 use iced::stream;
-use std::collections::HashMap;
+use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::sync::{
-    Arc,
+    Arc, LazyLock, Mutex,
     atomic::{AtomicBool, Ordering},
 };
+use std::time::Duration;
 use tokio::process::{Child, ChildStderr, ChildStdout};
 use uuid::Uuid;
+
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// 현재 실행 중인 자식 프로세스들의 PID 레지스트리.
+///
+/// 시그널 핸들러(Ctrl+C)는 앱 상태(`RunConfigManager`)에 접근할 수 없고
+/// `std::process::exit`는 `Drop`을 실행하지 않으므로, 시그널 경로에서 자식
+/// 프로세스를 정리하려면 전역 레지스트리에서 PID를 읽어 강제 종료해야 한다.
+static RUNNING_PIDS: LazyLock<Mutex<HashSet<u32>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// 실행 시작된 자식 프로세스 PID 등록 (`ProcessStarted` 처리 시 호출).
+pub fn register_running_pid(pid: u32) {
+    if let Ok(mut pids) = RUNNING_PIDS.lock() {
+        pids.insert(pid);
+    }
+}
+
+/// 종료된 자식 프로세스 PID 등록 해제 (`RunCompleted` 처리 시 호출).
+pub fn unregister_running_pid(pid: u32) {
+    if let Ok(mut pids) = RUNNING_PIDS.lock() {
+        pids.remove(&pid);
+    }
+}
+
+/// 등록된 모든 실행 중 프로세스를 강제 종료 (시그널 핸들러 전용).
+pub fn kill_all_running_processes() {
+    let pids: Vec<u32> = RUNNING_PIDS
+        .lock()
+        .map(|pids| pids.iter().copied().collect())
+        .unwrap_or_default();
+    for pid in pids {
+        force_kill_process_tree(pid);
+    }
+}
+
+/// PID로 프로세스 트리를 강제 종료 (비동기 컨텍스트 밖에서도 호출 가능).
+fn force_kill_process_tree(pid: u32) {
+    #[cfg(unix)]
+    unsafe {
+        // process_group(0)으로 생성했으므로 pid == pgid. 그룹 전체에 SIGKILL.
+        libc::killpg(pid as i32, libc::SIGKILL);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let _ = std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output();
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = pid;
+    }
+}
 
 /// 경로에 공백이 포함되어 있으면 따옴표로 감싸기
 fn quote_if_needed(path: &str) -> String {
@@ -31,6 +88,41 @@ fn quote_if_needed(path: &str) -> String {
 ///
 /// # Returns
 /// 실행 중 발생하는 이벤트를 담은 Message 스트림
+/// 스트림 태스크가 RunCompleted를 보내지 못한 채 종료되면(패닉 unwind 등) 세션이
+/// `is_running` 상태로 영구 고착되고 종료 알림/exit code도 영영 오지 않는다. 이 가드는
+/// 정상 종료 시 `disarm`되며, armed인 채로 drop되면 종료 보장용 RunCompleted(Err)를
+/// best-effort(try_send)로 발행한다.
+struct CompletionGuard {
+    output: iced::futures::channel::mpsc::Sender<Message>,
+    session_id: Uuid,
+    armed: bool,
+}
+
+impl CompletionGuard {
+    fn new(output: iced::futures::channel::mpsc::Sender<Message>, session_id: Uuid) -> Self {
+        Self {
+            output,
+            session_id,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CompletionGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.output.try_send(Message::RunCompleted(
+                self.session_id,
+                Err(String::from("Run interrupted unexpectedly")),
+            ));
+        }
+    }
+}
+
 pub fn run_configuration_stream(
     config: RunConfiguration,
     session_id: Uuid,
@@ -39,9 +131,12 @@ pub fn run_configuration_stream(
     stream::channel(
         100,
         move |mut output: iced::futures::channel::mpsc::Sender<Message>| async move {
-            let command_str = build_command_string(&config);
-            let mut cmd = create_process_command(&config, &command_str);
-            send_command_info(&mut output, session_id, &config, &command_str).await;
+            // 종료 보장 가드: 정상 경로의 끝에서 disarm한다.
+            let mut completion = CompletionGuard::new(output.clone(), session_id);
+
+            let (command_str, extra_env) = build_command(&config);
+            let mut cmd = create_process_command(&config, &command_str, &extra_env);
+            send_command_info(&mut output, session_id, &config, &command_str, &extra_env).await;
 
             match cmd.spawn() {
                 Ok(child) => {
@@ -56,17 +151,33 @@ pub fn run_configuration_stream(
                     .await;
                 }
             }
+
+            completion.disarm();
         },
     )
 }
 
-fn build_command_string(config: &RunConfiguration) -> String {
+/// PowerShell 실행 파일 탐지(LazyLock)를 미리 초기화한다. 이 탐지는 한 번 blocking
+/// subprocess(pwsh 스폰+대기)를 수행하므로, 앱 시작 시 메인 스레드에서 미리 호출해
+/// 두면 첫 구성 실행이 tokio 워커에서 블로킹되는 것을 방지한다. Windows 외에는 no-op.
+pub fn prewarm_shell_detection() {
+    #[cfg(windows)]
+    {
+        let _ = windows_powershell_exe();
+    }
+}
+
+/// 구성으로부터 셸에서 실행할 명령 문자열과, 프로세스에 직접 주입할 환경변수 목록을 생성.
+///
+/// 환경변수는 셸 명령 문자열에 보간하지 않고 `Command::env`로 전달한다. 이렇게 하면
+/// 따옴표 이스케이프 누락이나 셸 메타문자 재해석으로 인한 명령 주입을 원천 차단할 수 있다.
+fn build_command(config: &RunConfiguration) -> (String, Vec<(String, String)>) {
     match &config.type_data {
         ConfigTypeData::Application { command, arguments } => {
-            build_application_command(&config.environment_variables, command, arguments)
+            (build_application_command(command, arguments), Vec::new())
         }
         ConfigTypeData::ShellScript { execute_mode } => {
-            build_shell_script_command(&config.environment_variables, execute_mode)
+            (build_shell_script_command(execute_mode), Vec::new())
         }
         ConfigTypeData::Node {
             project_directory: _,
@@ -76,45 +187,93 @@ fn build_command_string(config: &RunConfiguration) -> String {
             script_name,
             arguments,
             node_options,
-        } => build_node_command(
-            &config.environment_variables,
-            NodeCommandParts {
+        } => {
+            let command_str = build_node_command(NodeCommandParts {
                 package_manager,
                 node_runtime_path: node_runtime_path.as_ref(),
                 command: *command,
                 script_name: script_name.as_ref(),
                 arguments,
-                node_options,
                 working_directory: &config.working_directory,
-            },
-        ),
+            });
+            // NODE_OPTIONS도 셸 보간 대신 환경변수로 전달.
+            let extra_env = if node_options.is_empty() {
+                Vec::new()
+            } else {
+                vec![(String::from("NODE_OPTIONS"), node_options.clone())]
+            };
+            (command_str, extra_env)
+        }
+        // Compound 구성은 셸 명령이 없다 — app.rs가 멤버별로 펼쳐 실행하므로
+        // 이 스트림 경로에는 도달하지 않는다 (방어적으로 빈 명령 반환).
+        ConfigTypeData::Compound { .. } => (String::new(), Vec::new()),
     }
 }
 
-fn create_process_command(config: &RunConfiguration, command_str: &str) -> tokio::process::Command {
+/// Windows에서 사용할 PowerShell 실행 파일을 결정한다 (세션당 1회 감지 후 캐시).
+///
+/// PowerShell 7+(`pwsh`)는 `&&`/`||` 체이닝을 네이티브 지원하므로 우선 사용하고,
+/// 설치되어 있지 않으면 Windows PowerShell 5.x(`powershell`)로 폴백한다.
+#[cfg(windows)]
+fn windows_powershell_exe() -> &'static str {
+    use std::os::windows::process::CommandExt;
+
+    static EXE: LazyLock<&'static str> = LazyLock::new(|| {
+        let pwsh_available = std::process::Command::new("pwsh")
+            .args(["-NoProfile", "-Command", "exit"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .map(|out| out.status.success())
+            .unwrap_or(false);
+
+        if pwsh_available { "pwsh" } else { "powershell" }
+    });
+
+    *EXE
+}
+
+/// Windows PowerShell 5.x는 `&&`를 지원하지 않으므로 `;`(순차 실행)로 대체한다.
+/// 단락 평가(앞 명령 실패 시 중단)는 보존되지 않는 최선의 폴백이며, pwsh 7이 감지되면
+/// 이 변환은 호출되지 않는다.
+#[cfg(windows)]
+fn rewrite_chaining_for_legacy_powershell(command_str: &str) -> String {
+    command_str.replace(" && ", "; ")
+}
+
+fn create_process_command(
+    config: &RunConfiguration,
+    command_str: &str,
+    extra_env: &[(String, String)],
+) -> tokio::process::Command {
     use std::process::Stdio;
     use tokio::process::Command;
 
-    let mut cmd = if cfg!(target_os = "windows") {
-        let mut c = Command::new("powershell");
+    #[cfg(windows)]
+    let mut cmd = {
+        let exe = windows_powershell_exe();
+        // pwsh(7+)는 && 를 네이티브 지원하므로 변환하지 않는다. 5.x 폴백 시에만 변환.
+        let adapted = if exe == "pwsh" {
+            command_str.to_string()
+        } else {
+            rewrite_chaining_for_legacy_powershell(command_str)
+        };
+        let mut c = Command::new(exe);
         c.args([
             "-NoProfile",
             "-NonInteractive",
             "-Command",
-            &format!("[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; {command_str}"),
+            &format!("[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; {adapted}"),
         ]);
+        c.creation_flags(CREATE_NO_WINDOW);
         c
-    } else {
+    };
+
+    #[cfg(not(windows))]
+    let mut cmd = {
         let mut c = Command::new("sh");
         c.args(["-l", "-c", command_str]);
         c
     };
-
-    #[cfg(windows)]
-    {
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
 
     #[cfg(unix)]
     {
@@ -122,6 +281,9 @@ fn create_process_command(config: &RunConfiguration, command_str: &str) -> tokio
     }
 
     cmd.current_dir(&config.working_directory);
+    // 환경변수는 셸 문자열이 아닌 프로세스 환경으로 직접 주입 (이스케이프/주입 방지).
+    cmd.envs(config.environment_variables.iter());
+    cmd.envs(extra_env.iter().map(|(k, v)| (k, v)));
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -133,18 +295,35 @@ async fn send_command_info(
     session_id: Uuid,
     config: &RunConfiguration,
     command_str: &str,
+    extra_env: &[(String, String)],
 ) {
     use iced::futures::SinkExt;
 
     let mut command_info = String::new();
     command_info.push_str("═══════════════════════════════════════════════════════\n");
     let _ = writeln!(command_info, "Configuration: {}", config.name);
-    let _ = writeln!(command_info, "Type: {:?}", config.config_type);
+    let _ = writeln!(command_info, "Type: {:?}", config.config_type());
     let _ = writeln!(
         command_info,
         "Working Directory: {}",
         config.working_directory
     );
+    // 환경변수는 더 이상 Command 문자열에 보이지 않으므로 별도 라인으로 표시해 가시성 유지.
+    if !config.environment_variables.is_empty() || !extra_env.is_empty() {
+        let mut pairs: Vec<(String, String)> = config
+            .environment_variables
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        pairs.sort_by(|a, b| a.0.cmp(&b.0));
+        pairs.extend(extra_env.iter().cloned());
+        let rendered = pairs
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        let _ = writeln!(command_info, "Environment: {rendered}");
+    }
     let _ = writeln!(command_info, "Command: {command_str}");
     command_info.push_str("═══════════════════════════════════════════════════════\n");
     let _ = output
@@ -161,20 +340,27 @@ async fn handle_spawned_process(
     send_process_started(output, session_id, &child).await;
     let (mut stdout_reader, mut stderr_reader) = take_process_streams(&mut child);
 
-    if process_output_loop(
+    let cancelled = process_output_loop(
         output,
         session_id,
-        &mut child,
         &mut stdout_reader,
         &mut stderr_reader,
         &cancel_flag,
     )
-    .await
-    {
-        return;
-    }
+    .await;
 
-    wait_for_process(output, session_id, &mut child).await;
+    if cancelled {
+        // 시그널 전송 후 반드시 wait로 reap (Unix 좀비 방지) + SIGTERM 무시 시 SIGKILL 에스컬레이션.
+        terminate_and_reap(&mut child).await;
+        send_run_result(
+            output,
+            session_id,
+            Err(String::from("Process stopped by user")),
+        )
+        .await;
+    } else {
+        wait_for_process(output, session_id, &mut child, &cancel_flag).await;
+    }
 }
 
 async fn send_process_started(
@@ -203,39 +389,36 @@ fn take_process_streams(
     )
 }
 
-async fn process_output_loop(
+/// 출력 펌프 루프. 취소되면 `true`, stdout/stderr가 모두 닫혀 정상 종료되면 `false` 반환.
+/// 실제 프로세스 종료(kill/reap)는 호출자(`handle_spawned_process`)가 담당한다.
+async fn process_output_loop<O, E>(
     output: &mut iced::futures::channel::mpsc::Sender<Message>,
     session_id: Uuid,
-    child: &mut Child,
-    stdout_reader: &mut Option<tokio::io::BufReader<ChildStdout>>,
-    stderr_reader: &mut Option<tokio::io::BufReader<ChildStderr>>,
+    stdout_reader: &mut Option<tokio::io::BufReader<O>>,
+    stderr_reader: &mut Option<tokio::io::BufReader<E>>,
     cancel_flag: &Arc<AtomicBool>,
-) -> bool {
+) -> bool
+where
+    O: tokio::io::AsyncRead + Unpin,
+    E: tokio::io::AsyncRead + Unpin,
+{
     loop {
         tokio::select! {
+            // 취소 신호를 출력 읽기보다 우선 처리.
+            biased;
             () = wait_for_cancel(cancel_flag) => {
-                #[cfg(any(unix, windows))]
-                {
-                    stop_process(child);
-                }
-                #[cfg(not(any(unix, windows)))]
-                {
-                    stop_process(child).await;
-                }
-                send_run_result(
-                    output,
-                    session_id,
-                    Err(String::from("Process stopped by user")),
-                )
-                .await;
                 return true;
             }
-            result = read_next_line(stdout_reader) => {
+            // `if .is_some()` 전제조건 필수: reader가 None이면 read_next_line이 즉시
+            // Ok(None)을 반환해, biased select가 매 루프마다 이 분기만 선택하고 다른
+            // reader를 영영 폴링하지 않는 livelock(한쪽 EOF 후 CPU 100% busy-spin,
+            // RunCompleted 미발송)이 발생한다. 전제조건으로 None 분기를 비활성화한다.
+            result = read_next_line(stdout_reader), if stdout_reader.is_some() => {
                 if handle_line_result(output, session_id, result).await {
                     *stdout_reader = None;
                 }
             }
-            result = read_next_line(stderr_reader) => {
+            result = read_next_line(stderr_reader), if stderr_reader.is_some() => {
                 if handle_line_result(output, session_id, result).await {
                     *stderr_reader = None;
                 }
@@ -248,12 +431,15 @@ async fn process_output_loop(
     }
 }
 
+/// 취소 플래그를 50ms 주기로 폴링. Stop 반영까지 최대 ~50ms 지연은 의도된 것이며
+/// (OS 프로세스 teardown 시간에 비하면 무시 가능) cancel_flag 외 공유 상태가 없어
+/// `Ordering::Relaxed`로 충분하다.
 async fn wait_for_cancel(cancel_flag: &Arc<AtomicBool>) {
     loop {
         if cancel_flag.load(Ordering::Relaxed) {
             break;
         }
-        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 
@@ -265,11 +451,60 @@ where
 {
     use tokio::io::AsyncBufReadExt;
 
-    if let Some(reader) = reader.as_mut() {
-        reader.lines().next_line().await
-    } else {
-        Ok(None)
+    // 줄당 누적 상한. 개행 없이 대량 출력하는 자식(progress bar의 \r-only 출력,
+    // `yes | tr -d '\n'` 등)이 버퍼를 무한히 키워 OOM으로 앱 전체가 죽는 것을 막는다.
+    // 상한 도달 시 개행을 기다리지 않고 현재까지의 청크를 한 줄로 flush한다. 검사는
+    // fill_buf 청크 단위로 이루어지므로 실제 flush 크기는 상한 + 최대 한 버퍼 청크까지
+    // 살짝 초과할 수 있다(메모리는 여전히 상수 상한으로 묶임).
+    const MAX_LINE_BYTES: usize = 1024 * 1024;
+
+    let Some(reader) = reader.as_mut() else {
+        return Ok(None);
+    };
+
+    // 바이트 단위로 한 줄을 읽어 lossy 디코딩한다. AsyncBufReadExt::lines()는 유효한
+    // UTF-8만 허용해, 비UTF-8 로케일(LANG=C, ISO-8859, Shift-JIS 등) 출력의 첫
+    // 유효하지 않은 바이트에서 Err를 반환 → 호출부가 EOF로 처리해 이후 출력이 전부
+    // 유실된다. fill_buf/consume로 직접 읽고 from_utf8_lossy로 변환하면 유실 없이
+    // 표시하면서 줄 길이 상한도 강제할 수 있다.
+    let mut buf = Vec::new();
+    let mut found_newline = false;
+    loop {
+        let consumed = {
+            let available = reader.fill_buf().await?;
+            if available.is_empty() {
+                break; // EOF
+            }
+            match available.iter().position(|&b| b == b'\n') {
+                Some(pos) => {
+                    buf.extend_from_slice(&available[..=pos]);
+                    found_newline = true;
+                    pos + 1
+                }
+                None => {
+                    buf.extend_from_slice(available);
+                    available.len()
+                }
+            }
+        };
+        reader.consume(consumed);
+        if found_newline || buf.len() >= MAX_LINE_BYTES {
+            break;
+        }
     }
+
+    if buf.is_empty() {
+        return Ok(None); // EOF, 더 읽을 것 없음
+    }
+
+    // 개행은 호출부에서 다시 부여하므로 트림한다 (CRLF/LF). 상한으로 잘린 청크는
+    // 개행이 없으므로 트림하지 않는다.
+    if found_newline {
+        while matches!(buf.last(), Some(b'\n' | b'\r')) {
+            buf.pop();
+        }
+    }
+    Ok(Some(String::from_utf8_lossy(&buf).into_owned()))
 }
 
 async fn handle_line_result(
@@ -293,19 +528,35 @@ async fn wait_for_process(
     output: &mut iced::futures::channel::mpsc::Sender<Message>,
     session_id: Uuid,
     child: &mut Child,
+    cancel_flag: &Arc<AtomicBool>,
 ) {
-    match child.wait().await {
-        Ok(status) => {
-            send_run_result(output, session_id, Ok(status.code().unwrap_or(-1))).await;
-        }
-        Err(e) => {
+    // 종료 대기 중에도 cancel_flag를 관찰한다. 자식이 stdout/stderr를 닫았지만(EOF로
+    // process_output_loop가 빠져나옴) 아직 종료하지 않은 경우, cancel 관찰이 없으면
+    // child.wait()가 영원히 블록되어 Stop이 무반응이 되고 세션이 is_running에 고착된다.
+    tokio::select! {
+        biased;
+        () = wait_for_cancel(cancel_flag) => {
+            terminate_and_reap(child).await;
             send_run_result(
                 output,
                 session_id,
-                Err(format!("Failed to wait for process: {e}")),
+                Err(String::from("Process stopped by user")),
             )
             .await;
         }
+        wait_result = child.wait() => match wait_result {
+            Ok(status) => {
+                send_run_result(output, session_id, Ok(status.code().unwrap_or(-1))).await;
+            }
+            Err(e) => {
+                send_run_result(
+                    output,
+                    session_id,
+                    Err(format!("Failed to wait for process: {e}")),
+                )
+                .await;
+            }
+        },
     }
 }
 
@@ -319,93 +570,63 @@ async fn send_run_result(
     let _ = output.send(Message::RunCompleted(session_id, result)).await;
 }
 
-#[cfg(any(unix, windows))]
-fn stop_process(child: &mut Child) {
+/// 취소된 프로세스를 종료하고 반드시 reap한다.
+///
+/// Unix: SIGTERM → 최대 2초 대기 → 여전히 살아있으면 SIGKILL (Stop 경로에도 강제 종료 보장).
+/// Windows: taskkill /T /F로 트리 강제 종료 후 reap.
+async fn terminate_and_reap(child: &mut Child) {
     #[cfg(unix)]
     {
-        if let Some(pid) = child.id() {
+        // SIGTERM 전에 PID를 보존한다. wait가 프로세스를 reap한 뒤에는 child.id()가
+        // None을 반환할 수 있어, 보존하지 않으면 SIGKILL이 누락될 수 있다.
+        let pid = child.id();
+        if let Some(p) = pid {
             unsafe {
-                libc::killpg(pid as i32, libc::SIGTERM);
+                libc::killpg(p as i32, libc::SIGTERM);
             }
         }
+        if tokio::time::timeout(Duration::from_secs(2), child.wait())
+            .await
+            .is_err()
+        {
+            // SIGTERM 무시 → SIGKILL 에스컬레이션 후 reap.
+            if let Some(p) = pid {
+                unsafe {
+                    libc::killpg(p as i32, libc::SIGKILL);
+                }
+            }
+            let _ = child.wait().await;
+        }
     }
+
     #[cfg(windows)]
     {
         if let Some(pid) = child.id() {
-            use std::os::windows::process::CommandExt;
-            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-            let _ = std::process::Command::new("taskkill")
-                .args(["/PID", &pid.to_string(), "/T", "/F"])
-                .creation_flags(CREATE_NO_WINDOW)
-                .output();
+            force_kill_process_tree(pid);
         }
-    }
-}
-
-#[cfg(not(any(unix, windows)))]
-async fn stop_process(child: &mut Child) {
-    let _ = child.kill().await;
-}
-
-/// 환경 변수를 플랫폼별 설정 명령어로 변환
-fn build_env_prefix(env_vars: &HashMap<String, String>) -> String {
-    if env_vars.is_empty() {
-        return String::new();
+        let _ = child.wait().await;
     }
 
-    #[cfg(target_os = "windows")]
+    #[cfg(not(any(unix, windows)))]
     {
-        env_vars
-            .iter()
-            .map(|(k, v)| {
-                // 값에 따옴표가 있을 경우 이스케이프 처리
-                let escaped_value = v.replace('\'', "''");
-                format!("$env:{k}='{escaped_value}'")
-            })
-            .collect::<Vec<_>>()
-            .join("; ")
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    {
-        env_vars
-            .iter()
-            .map(|(k, v)| format!("export {k}='{v}'"))
-            .collect::<Vec<_>>()
-            .join("; ")
+        let _ = child.kill().await;
     }
 }
 
-/// Application 타입의 명령어 생성
-fn build_application_command(
-    env_vars: &HashMap<String, String>,
-    command: &str,
-    arguments: &str,
-) -> String {
-    let env_prefix = build_env_prefix(env_vars);
-
-    let command_with_args = if arguments.is_empty() {
+/// Application 타입의 명령어 생성.
+///
+/// `&&` 등 셸 체이닝은 변환하지 않고 그대로 둔다 — Windows PowerShell 5.x 폴백 시의
+/// `&&` → `;` 변환은 `create_process_command`에서 모든 구성 타입에 일관 적용된다.
+fn build_application_command(command: &str, arguments: &str) -> String {
+    if arguments.is_empty() {
         command.to_string()
     } else {
         format!("{command} {arguments}")
-    };
-
-    // PowerShell 5.x는 && 연산자를 지원하지 않으므로 ; 로 변환
-    #[cfg(target_os = "windows")]
-    let command_with_args = command_with_args.replace(" && ", "; ");
-
-    if env_prefix.is_empty() {
-        command_with_args
-    } else {
-        format!("{env_prefix}; {command_with_args}")
     }
 }
 
 /// Shell Script 타입의 명령어 생성
-fn build_shell_script_command(
-    env_vars: &HashMap<String, String>,
-    execute_mode: &ExecuteMode,
-) -> String {
+fn build_shell_script_command(execute_mode: &ExecuteMode) -> String {
     match execute_mode {
         ExecuteMode::ScriptFile {
             script_path,
@@ -413,19 +634,17 @@ fn build_shell_script_command(
             interpreter_path,
             interpreter_options,
         } => build_script_file_command(
-            env_vars,
             script_path,
             script_options,
             interpreter_path.as_deref(),
             interpreter_options.as_deref(),
         ),
-        ExecuteMode::ScriptText { script_text } => build_script_text_command(env_vars, script_text),
+        ExecuteMode::ScriptText { script_text } => script_text.clone(),
     }
 }
 
 /// Script File 모드의 명령어 생성
 fn build_script_file_command(
-    env_vars: &HashMap<String, String>,
     script_path: &str,
     script_options: &str,
     interpreter_path: Option<&str>,
@@ -433,33 +652,77 @@ fn build_script_file_command(
 ) -> String {
     use std::path::Path;
 
-    let env_prefix = build_env_prefix(env_vars);
-    let script_extension = Path::new(script_path)
-        .extension()
-        .and_then(|ext| ext.to_str());
-
-    // 인터프리터 자동 감지
-    let interpreter_base = interpreter_path.unwrap_or_else(|| {
-        if script_extension.is_some_and(|ext| ext.eq_ignore_ascii_case("py")) {
-            "python"
-        } else if script_extension.is_some_and(|ext| ext.eq_ignore_ascii_case("js")) {
-            "node"
-        } else if script_extension.is_some_and(|ext| ext.eq_ignore_ascii_case("rb")) {
-            "ruby"
-        } else if script_extension.is_some_and(|ext| ext.eq_ignore_ascii_case("ps1")) {
-            "powershell"
-        } else if script_extension
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("bat") || ext.eq_ignore_ascii_case("cmd"))
-        {
-            "cmd"
-        } else {
-            "sh"
-        }
-    });
-
-    // 공백이 포함된 경로 처리
-    let interpreter = quote_if_needed(interpreter_base);
     let script_path_quoted = quote_if_needed(script_path);
+    let interp_opts = interpreter_options.unwrap_or("");
+
+    // 사용자가 인터프리터를 명시하면 자동 감지를 건너뛰고 그대로 사용.
+    if let Some(interpreter) = interpreter_path {
+        return generic_interpreter_command(
+            interpreter,
+            interp_opts,
+            &script_path_quoted,
+            script_options,
+        );
+    }
+
+    // 확장자 기반 인터프리터 자동 감지
+    let extension = Path::new(script_path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(str::to_ascii_lowercase);
+
+    match extension.as_deref() {
+        Some("py") => {
+            // Windows는 `python` 런처, 그 외(Linux/macOS)는 `python3`가 표준.
+            // (Ubuntu는 python3만 제공, macOS 12.3+는 /usr/bin/python 제거)
+            #[cfg(target_os = "windows")]
+            const PYTHON: &str = "python";
+            #[cfg(not(target_os = "windows"))]
+            const PYTHON: &str = "python3";
+            generic_interpreter_command(PYTHON, interp_opts, &script_path_quoted, script_options)
+        }
+        Some("js") => {
+            generic_interpreter_command("node", interp_opts, &script_path_quoted, script_options)
+        }
+        Some("rb") => {
+            generic_interpreter_command("ruby", interp_opts, &script_path_quoted, script_options)
+        }
+        // .ps1: -File로 스크립트를 실행하고, 미서명 스크립트 차단을 피하기 위해 ExecutionPolicy Bypass.
+        // Windows는 Windows PowerShell(powershell), 그 외 플랫폼은 PowerShell Core(pwsh).
+        Some("ps1") => {
+            #[cfg(target_os = "windows")]
+            {
+                format!(
+                    "powershell -NoProfile -ExecutionPolicy Bypass -File {script_path_quoted} {script_options}"
+                )
+                .trim()
+                .to_string()
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                format!("pwsh -NoProfile -File {script_path_quoted} {script_options}")
+                    .trim()
+                    .to_string()
+            }
+        }
+        // .bat/.cmd: cmd.exe는 /c 없이는 배치 파일을 실행하지 않는다 (Windows 전용).
+        // 비-Windows에서는 의미가 없으므로 기본 분기(sh)로 폴백한다.
+        #[cfg(target_os = "windows")]
+        Some("bat" | "cmd") => format!("cmd /c {script_path_quoted} {script_options}")
+            .trim()
+            .to_string(),
+        _ => generic_interpreter_command("sh", interp_opts, &script_path_quoted, script_options),
+    }
+}
+
+/// `<interpreter> <opts> <script> <script_opts>` 형태의 일반 인터프리터 명령 생성.
+fn generic_interpreter_command(
+    interpreter_base: &str,
+    interpreter_options: &str,
+    script_path_quoted: &str,
+    script_options: &str,
+) -> String {
+    let interpreter = quote_if_needed(interpreter_base);
 
     // Windows PowerShell에서는 공백이 포함된 경로를 & "경로" 형태로 실행
     #[cfg(target_os = "windows")]
@@ -472,28 +735,9 @@ fn build_script_file_command(
     #[cfg(not(target_os = "windows"))]
     let interpreter_cmd = interpreter;
 
-    let interp_opts = interpreter_options.unwrap_or("");
-
-    let command = format!("{interpreter_cmd} {interp_opts} {script_path_quoted} {script_options}")
+    format!("{interpreter_cmd} {interpreter_options} {script_path_quoted} {script_options}")
         .trim()
-        .to_string();
-
-    if env_prefix.is_empty() {
-        command
-    } else {
-        format!("{env_prefix}; {command}")
-    }
-}
-
-/// Script Text 모드의 명령어 생성
-fn build_script_text_command(env_vars: &HashMap<String, String>, script_text: &str) -> String {
-    let env_prefix = build_env_prefix(env_vars);
-
-    if env_prefix.is_empty() {
-        script_text.to_string()
-    } else {
-        format!("{env_prefix}; {script_text}")
-    }
+        .to_string()
 }
 
 /// Node package manager 타입의 명령어 생성
@@ -504,11 +748,10 @@ struct NodeCommandParts<'a> {
     command: NodeCommand,
     script_name: Option<&'a String>,
     arguments: &'a str,
-    node_options: &'a str,
     working_directory: &'a str,
 }
 
-fn build_node_command(env_vars: &HashMap<String, String>, parts: NodeCommandParts<'_>) -> String {
+fn build_node_command(parts: NodeCommandParts<'_>) -> String {
     use crate::utils::detect_package_manager;
     use std::path::Path;
 
@@ -526,11 +769,11 @@ fn build_node_command(env_vars: &HashMap<String, String>, parts: NodeCommandPart
     let package_manager_cmd = if package_manager.starts_with('"') {
         format!("& {package_manager}")
     } else {
-        package_manager.clone()
+        package_manager
     };
 
     #[cfg(not(target_os = "windows"))]
-    let package_manager_cmd = package_manager.clone();
+    let package_manager_cmd = package_manager;
 
     let mut cmd_parts = vec![package_manager_cmd];
     cmd_parts.extend(package_manager_command_args(
@@ -544,37 +787,7 @@ fn build_node_command(env_vars: &HashMap<String, String>, parts: NodeCommandPart
         cmd_parts.push(parts.arguments.to_string());
     }
 
-    let base_command = cmd_parts.join(" ");
-
-    // 환경 변수 추가
-    let env_prefix = build_env_prefix(env_vars);
-
-    // NODE_OPTIONS 처리
-    let node_opts_env = if parts.node_options.is_empty() {
-        String::new()
-    } else {
-        #[cfg(target_os = "windows")]
-        {
-            format!("$env:NODE_OPTIONS='{}'", parts.node_options)
-        }
-
-        #[cfg(not(target_os = "windows"))]
-        {
-            format!("export NODE_OPTIONS='{}'", parts.node_options)
-        }
-    };
-
-    // 조합
-    let mut parts = Vec::new();
-    if !env_prefix.is_empty() {
-        parts.push(env_prefix);
-    }
-    if !node_opts_env.is_empty() {
-        parts.push(node_opts_env);
-    }
-    parts.push(base_command);
-
-    parts.join("; ")
+    cmd_parts.join(" ")
 }
 
 fn resolve_package_manager_executable(pm_type: &str, node_runtime_path: Option<&String>) -> String {
@@ -644,6 +857,65 @@ mod tests {
         );
     }
 
+    /// 회귀 방지: 한쪽 reader가 먼저 EOF(None)가 돼도 출력 루프가 정상 종료해야 한다.
+    /// 과거 `tokio::select! { biased; ... }`가 None reader 분기(즉시 Ok(None))만 계속
+    /// 선택해 다른 reader를 영영 폴링하지 않는 livelock이 있었다 (CPU 100%, RunCompleted
+    /// 미발송 → 알림/exit code 미표시). `if reader.is_some()` 전제조건으로 해소됨.
+    #[tokio::test]
+    async fn output_loop_terminates_when_one_reader_eofs_first() {
+        use tokio::io::BufReader;
+
+        let (mut tx, _rx) = iced::futures::channel::mpsc::channel::<Message>(100);
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        // stdout: 데이터 후 EOF / stderr: 즉시 EOF (실제 "echo 후 종료" 시나리오 재현).
+        let stdout_data: &[u8] = b"out1\nout2\n";
+        let stderr_data: &[u8] = b"";
+        let mut stdout = Some(BufReader::new(stdout_data));
+        let mut stderr = Some(BufReader::new(stderr_data));
+
+        let completed = tokio::time::timeout(
+            Duration::from_secs(5),
+            process_output_loop(&mut tx, Uuid::new_v4(), &mut stdout, &mut stderr, &cancel),
+        )
+        .await
+        .expect("output loop livelocked (timed out) — biased select starvation regressed");
+
+        assert!(
+            !completed,
+            "both readers at EOF should report normal completion (false), not cancel"
+        );
+        assert!(
+            stdout.is_none() && stderr.is_none(),
+            "both readers should be drained to None"
+        );
+    }
+
+    /// 회귀 방지: 개행 없는 대량 출력이 줄당 상한(1 MiB)에서 flush되어야 한다
+    /// (무한 버퍼 증가 → OOM 방지). 상한으로 잘려도 바이트 유실은 없어야 한다.
+    #[tokio::test]
+    async fn read_next_line_caps_unbounded_newlineless_output() {
+        use tokio::io::BufReader;
+
+        let big = vec![b'x'; 1024 * 1024 + 5000]; // 개행 없는 1 MiB + 5000 바이트
+        let mut reader = Some(BufReader::new(big.as_slice()));
+
+        // 첫 호출: 상한에서 잘린 청크 (정확히 상한이거나 한 버퍼 청크 이내 초과).
+        let chunk = read_next_line(&mut reader).await.unwrap().unwrap();
+        assert!(
+            chunk.len() >= 1024 * 1024,
+            "줄당 상한에서 flush되어야 함 (got {})",
+            chunk.len()
+        );
+
+        // 나머지는 다음 호출에서 반환 — 합치면 원본 전체 (유실 없음).
+        let rest = read_next_line(&mut reader).await.unwrap().unwrap();
+        assert_eq!(chunk.len() + rest.len(), big.len(), "바이트 유실 없어야 함");
+
+        // 그 다음은 EOF.
+        assert!(read_next_line(&mut reader).await.unwrap().is_none());
+    }
+
     #[test]
     fn bun_start_and_test_use_package_scripts() {
         assert_eq!(
@@ -679,6 +951,92 @@ mod tests {
         assert_eq!(
             package_manager_executable_candidates("bun"),
             vec![String::from("bun")]
+        );
+    }
+
+    #[test]
+    fn application_command_joins_command_and_arguments() {
+        assert_eq!(build_application_command("ls", ""), "ls");
+        assert_eq!(
+            build_application_command("echo", "hello world"),
+            "echo hello world"
+        );
+    }
+
+    #[test]
+    fn application_command_preserves_chaining_operator() {
+        // && 는 빌드 단계에서 변환하지 않는다. (pwsh는 네이티브 지원, 5.x 폴백 변환은
+        // create_process_command가 모든 타입에 일관 적용)
+        assert_eq!(
+            build_application_command("npm i", "&& npm test"),
+            "npm i && npm test"
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn legacy_powershell_rewrites_and_to_semicolon() {
+        assert_eq!(
+            rewrite_chaining_for_legacy_powershell("npm i && npm test"),
+            "npm i; npm test"
+        );
+        // && 가 없으면 그대로
+        assert_eq!(rewrite_chaining_for_legacy_powershell("echo hi"), "echo hi");
+    }
+
+    #[test]
+    fn script_text_mode_runs_verbatim() {
+        let mode = ExecuteMode::ScriptText {
+            script_text: String::from("echo hi"),
+        };
+        assert_eq!(build_shell_script_command(&mode), "echo hi");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn bat_script_is_launched_via_cmd_slash_c() {
+        let cmd = build_script_file_command("build.bat", "", None, None);
+        assert_eq!(cmd, "cmd /c build.bat");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn ps1_script_uses_file_and_bypass_policy() {
+        let cmd = build_script_file_command("deploy.ps1", "", None, None);
+        assert_eq!(
+            cmd,
+            "powershell -NoProfile -ExecutionPolicy Bypass -File deploy.ps1"
+        );
+    }
+
+    #[test]
+    fn explicit_interpreter_overrides_extension_detection() {
+        let cmd = build_script_file_command("script.py", "--flag", Some("python3"), Some("-u"));
+        assert_eq!(cmd, "python3 -u script.py --flag");
+    }
+
+    #[test]
+    fn node_options_routed_to_env_not_command_string() {
+        let config = RunConfiguration {
+            type_data: ConfigTypeData::Node {
+                project_directory: String::from("."),
+                package_manager: PackageManager::Npm,
+                node_runtime_path: None,
+                command: NodeCommand::Run,
+                script_name: Some(String::from("dev")),
+                arguments: String::new(),
+                node_options: String::from("--max-old-space-size=4096"),
+            },
+            ..RunConfiguration::default()
+        };
+        let (command_str, extra_env) = build_command(&config);
+        assert!(!command_str.contains("NODE_OPTIONS"));
+        assert_eq!(
+            extra_env,
+            vec![(
+                String::from("NODE_OPTIONS"),
+                String::from("--max-old-space-size=4096")
+            )]
         );
     }
 }

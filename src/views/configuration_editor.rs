@@ -16,6 +16,7 @@ use iced::{
     },
 };
 use std::fmt::Display;
+use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy)]
 pub struct EditorLoadingState {
@@ -154,18 +155,25 @@ pub fn view_configuration_editor<'a>(
                 is_loading_project_directory: loading.node.project_directory,
             },
         ),
+        ConfigTypeData::Compound { members } => {
+            view_compound_fields(members, configurations, index)
+        }
     };
 
     let mut basics = column![
         view_name_row(&config.name),
         Space::new().height(12),
-        view_type_row(&config.config_type, select_state),
+        view_type_row(config.config_type(), select_state),
         Space::new().height(12),
         type_specific_fields,
     ]
     .width(Length::Fill);
 
-    if !matches!(config.config_type, ConfigurationType::Node) {
+    // 작업 디렉터리는 Node(프로젝트 경로로 대체)와 Compound(멤버가 각자 보유)에서 숨긴다.
+    if !matches!(
+        config.config_type(),
+        ConfigurationType::Node | ConfigurationType::Compound
+    ) {
         basics = basics
             .push(Space::new().height(12))
             .push(view_working_directory_row(
@@ -174,14 +182,21 @@ pub fn view_configuration_editor<'a>(
             ));
     }
 
-    column![
-        view_section_block("Basics", basics.into()),
-        Space::new().height(16),
-        view_section_block("Environment", view_environment_bulk_input(env_bulk_text)),
-    ]
-    .width(Length::Fill)
-    .padding(Padding::new(0.0).right(10.0).bottom(14.0))
-    .into()
+    let mut sections = column![view_section_block("Basics", basics.into())].width(Length::Fill);
+
+    // 환경변수는 멤버 구성이 각자 보유하므로 Compound에는 표시하지 않는다.
+    if !matches!(config.config_type(), ConfigurationType::Compound) {
+        sections = sections
+            .push(Space::new().height(16))
+            .push(view_section_block(
+                "Environment",
+                view_environment_bulk_input(env_bulk_text),
+            ));
+    }
+
+    sections
+        .padding(Padding::new(0.0).right(10.0).bottom(14.0))
+        .into()
 }
 
 fn view_empty_configuration_editor() -> Element<'static, Message> {
@@ -291,7 +306,7 @@ fn editor_input<'a>(placeholder: &'a str, value: &'a str) -> iced::widget::TextI
 fn editor_combo_box<'a, T, MessageFn>(
     state: &'a combo_box::State<T>,
     placeholder: &'a str,
-    selected: Option<&'a T>,
+    selected: Option<&T>,
     on_selected: MessageFn,
 ) -> iced::widget::ComboBox<'a, T, Message, Theme>
 where
@@ -386,16 +401,16 @@ fn view_name_row(name: &str) -> iced::widget::Row<'_, Message> {
     )
 }
 
-fn view_type_row<'a>(
-    config_type: &'a ConfigurationType,
-    select_state: &'a EditorSelectState,
-) -> iced::widget::Row<'a, Message> {
+fn view_type_row(
+    config_type: ConfigurationType,
+    select_state: &EditorSelectState,
+) -> iced::widget::Row<'_, Message> {
     view_editor_row(
         "Type:",
         editor_combo_box(
             &select_state.config_type,
             "Select type",
-            Some(config_type),
+            Some(&config_type),
             Message::TypeChanged,
         )
         .into(),
@@ -467,6 +482,119 @@ fn view_environment_bulk_input(env_bulk_text: &str) -> Element<'_, Message> {
     .align_y(Alignment::Center)
     .width(Length::Fill)
     .into()
+}
+
+/// Compound 구성 편집: 함께 실행할 멤버를 토글로 선택.
+///
+/// 멤버는 동시 실행되므로 순서가 무의미하다 → 적격 구성(자기 자신·다른 Compound 제외)을
+/// 나열하고 클릭으로 추가/제거하는 토글 리스트로 충분하다.
+fn view_compound_fields<'a>(
+    members: &'a [Uuid],
+    configurations: &'a [RunConfiguration],
+    self_index: usize,
+) -> Element<'a, Message> {
+    let mut rows = Column::new().spacing(5);
+    let mut eligible = 0usize;
+    let mut member_count = 0usize;
+
+    for (i, candidate) in configurations.iter().enumerate() {
+        if i == self_index || matches!(candidate.type_data, ConfigTypeData::Compound { .. }) {
+            continue;
+        }
+        eligible += 1;
+        let is_member = members.contains(&candidate.id);
+        if is_member {
+            member_count += 1;
+        }
+
+        let toggle = if is_member {
+            Message::CompoundMemberRemoved(candidate.id)
+        } else {
+            Message::CompoundMemberAdded(candidate.id)
+        };
+
+        let row_content = row![
+            container(text(if is_member { "✓" } else { "+" }).size(13)).width(Length::Fixed(18.0)),
+            text(candidate.name.as_str()).size(13),
+            Space::new().width(Length::Fill),
+            text(candidate.config_type().to_string())
+                .size(11)
+                .style(muted_text_style),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center)
+        .width(Length::Fill);
+
+        rows = rows.push(
+            button(row_content)
+                .padding([6, 10])
+                .width(Length::Fill)
+                .on_press(toggle)
+                .style(move |theme: &Theme, status| {
+                    compound_member_row_style(theme, status, is_member)
+                }),
+        );
+    }
+
+    if eligible == 0 {
+        return view_editor_row(
+            "Tasks:",
+            text("Create other configurations first, then add them here.")
+                .size(13)
+                .style(muted_text_style)
+                .into(),
+        )
+        .into();
+    }
+
+    column![
+        text(format!(
+            "{member_count} selected — click to add/remove. Members run together when this compound runs."
+        ))
+        .size(12)
+        .style(muted_text_style),
+        Space::new().height(10),
+        rows,
+    ]
+    .width(Length::Fill)
+    .into()
+}
+
+fn compound_member_row_style(
+    theme: &Theme,
+    status: button::Status,
+    is_member: bool,
+) -> button::Style {
+    let palette = theme.extended_palette();
+    let member_bg = Color {
+        a: 0.18,
+        ..palette.primary.base.color
+    };
+    let background = match status {
+        button::Status::Hovered | button::Status::Pressed => Some(Background::Color(Color {
+            a: if is_member { 0.28 } else { 0.08 },
+            ..palette.primary.base.color
+        })),
+        _ if is_member => Some(Background::Color(member_bg)),
+        _ => None,
+    };
+
+    button::Style {
+        background,
+        text_color: Color {
+            a: if is_member { 0.95 } else { 0.78 },
+            ..palette.background.base.text
+        },
+        border: Border {
+            radius: 6.0.into(),
+            width: 1.0,
+            color: Color {
+                a: if is_member { 0.0 } else { 0.08 },
+                ..palette.background.base.text
+            },
+        },
+        ..button::Style::default()
+    }
 }
 
 /// 환경변수 편집 모달 props.

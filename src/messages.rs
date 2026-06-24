@@ -1,5 +1,5 @@
 use crate::models::{
-    ConfigurationType, DropZone, ExecuteModeType, NodeCommand, PackageManager, RunConfiguration,
+    ConfigurationType, ExecuteModeType, NodeCommand, PackageManager, RunConfiguration,
 };
 use crate::widgets::pane_grid;
 use iced::window;
@@ -28,6 +28,8 @@ pub enum Message {
     AddConfiguration,
     /// 지정된 구성 삭제
     DeleteConfiguration(Option<usize>),
+    /// 지정된 구성 복제 (옵션을 그대로 복사한 새 구성 생성)
+    CloneConfiguration(Option<usize>),
     /// 지정된 구성 실행
     RunConfiguration(Option<usize>),
     /// 구성 리스트 드래그 시작
@@ -42,6 +44,10 @@ pub enum Message {
     NameChanged(String),
     /// 구성 타입 변경
     TypeChanged(ConfigurationType),
+    /// Compound 구성에 멤버(다른 구성 id) 추가
+    CompoundMemberAdded(Uuid),
+    /// Compound 구성에서 멤버 제거
+    CompoundMemberRemoved(Uuid),
     /// 명령어 변경
     CommandChanged(String),
     /// 인자 변경
@@ -76,6 +82,9 @@ pub enum Message {
     ProjectDirectorySelected(Result<String, String>),
     /// Node `package.json` 스캔 완료 (`config_id`, `project_directory`, 상대 경로 목록)
     PackageJsonsScanned(Uuid, String, Vec<String>),
+    /// Node 메타데이터 비동기 로드 완료 — 파일 로드/열기 시 UI 스레드 블로킹을 피하기
+    /// 위해 백그라운드 스캔 결과를 전달 (`config_id`, package.json 상대경로, scripts)
+    NodeMetadataLoaded(Uuid, Vec<String>, Vec<String>),
     /// Node package.json 드롭다운 선택 변경 (상대 경로)
     PackageJsonDropdownChanged(String),
     /// Node Runtime 감지 완료
@@ -154,17 +163,23 @@ pub enum Message {
     /// 프로세스 실행 완료 (세션 ID, 종료 코드 또는 에러 메시지)
     RunCompleted(Uuid, Result<i32, String>),
 
-    // 세션 관리 메시지
-    /// 세션 재실행 (`session_index`)
-    RerunSession(usize),
-    /// 실행 중인 세션 중지 (`session_index`)
-    StopSession(usize),
-    /// 세션 종료 및 제거 (`session_index`)
-    RemoveSession(usize),
-    /// 세션을 현재 워크스페이스에서 열기/focus (`session_index`)
-    OpenSessionInWorkspace(usize),
-    /// 세션 리스트 항목 hover 상태 변경
+    // 세션 관리 메시지 (세션은 안정적인 `Uuid`로 식별 — stale 인덱스 방지)
+    /// 세션 재실행 (`session_id`)
+    RerunSession(Uuid),
+    /// 실행 중인 세션 중지 (`session_id`)
+    StopSession(Uuid),
+    /// 세션 종료 및 제거 (`session_id`)
+    RemoveSession(Uuid),
+    /// 세션을 현재 워크스페이스에서 열기/focus (`session_id`)
+    OpenSessionInWorkspace(Uuid),
+    /// 세션 리스트 항목 hover 상태 변경 (표시용 인덱스)
     SessionListItemHovered(Option<usize>),
+    /// 실행 중인 모든 세션 중지
+    StopAllSessions,
+    /// 모든 세션 재실행
+    RerunAllSessions,
+    /// 실패(0이 아닌 종료 코드)한 세션만 재실행
+    RerunFailedSessions,
 
     // 워크스페이스 탭 관리 메시지
     /// 새 워크스페이스 탭 추가
@@ -206,24 +221,35 @@ pub enum Message {
     /// 자동 스크롤 토글 (세션 ID)
     ToggleAutoScroll(Uuid),
 
+    // 출력 검색/필터 (세션 ID로 식별)
+    /// 검색바 열기/포커스 (`session_id`)
+    OpenSessionSearch(Uuid),
+    /// 검색바 닫기 (`session_id`)
+    CloseSessionSearch(Uuid),
+    /// 검색어 변경 (`session_id`, 새 검색어)
+    SessionSearchChanged(Uuid, String),
+    /// 다음 매치로 이동 (`session_id`)
+    SessionSearchNext(Uuid),
+    /// 이전 매치로 이동 (`session_id`)
+    SessionSearchPrev(Uuid),
+    /// 필터 모드 토글(매치 라인만 표시) (`session_id`)
+    ToggleSessionSearchFilter(Uuid),
+    /// 정규식 모드 토글 (`session_id`)
+    ToggleSessionSearchRegex(Uuid),
+    /// 활성 pane의 세션에 검색바 열기 (Ctrl+F — 대상 세션은 핸들러가 해석)
+    OpenSearchInActivePane,
+    /// 활성 검색바 닫기 (ESC — 대상 세션은 핸들러가 해석)
+    CloseActiveSearch,
+    /// 세션 출력을 파일로 내보내기 (`session_id`)
+    ExportSessionOutput(Uuid),
+    /// 출력 내보내기 완료 (저장 경로 또는 에러/취소)
+    SessionOutputExported(Result<PathBuf, String>),
+
     // URL 처리
     /// URL을 기본 브라우저로 열기
     OpenUrl(String),
 
-    // 탭 드래그 앤 드롭
-    /// Pane 위에 마우스 진입 (드래그 중 hover 추적용)
-    PaneHovered(pane_grid::Pane),
-    /// Pane에서 마우스 이탈
-    PaneUnhovered(pane_grid::Pane),
-    /// 드롭 존 위에 마우스 진입 (`pane_id`, `zone`)
-    DropZoneHovered(pane_grid::Pane, DropZone),
-    /// 드롭 존에서 마우스 이탈
-    DropZoneUnhovered,
-    /// 외부 드롭 존 위에 마우스 진입 (`pane_grid` 바깥 가장자리)
-    OuterDropZoneHovered(DropZone),
-    /// 외부 드롭 존에서 마우스 이탈
-    OuterDropZoneUnhovered,
-    /// 마우스 릴리즈 (드래그 중이면 드롭 완료)
+    /// 마우스 릴리즈 (구성 리스트 드래그 중이면 드롭 완료)
     MouseReleased,
     /// 커서 이동 (`pane_grid` 드래그 중 위치 추적)
     CursorMoved(iced::Point),
@@ -237,6 +263,8 @@ pub enum Message {
     WindowResized(window::Id, iced::Size),
     /// 윈도우 최대화 상태 동기화
     WindowMaximized(bool),
+    /// 윈도우 포커스 변경 (백그라운드 완료 알림 판단용)
+    WindowFocusChanged(bool),
     /// 커스텀 타이틀바에서 창 드래그 시작
     StartWindowDrag,
     /// 커스텀 프레임에서 창 리사이즈 시작
