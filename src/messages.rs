@@ -264,6 +264,14 @@ pub enum Message {
     /// Configuration 화면 `pane_grid` 리사이즈 이벤트 처리
     ConfigurationPaneResized(pane_grid::ResizeEvent),
 
+    // 업데이트 확인
+    /// 최신 버전 확인 수동 트리거 (상태바 버전 라벨 클릭)
+    CheckForUpdates,
+    /// 최신 버전 확인 완료 (최신/업데이트 가능 또는 에러)
+    UpdateCheckCompleted(Result<crate::services::UpdateOutcome, String>),
+    /// 확인 중 로딩 스피너 프레임 진행 (타이머 tick)
+    UpdateSpinnerTick,
+
     // 윈도우 chrome 제어
     /// 메인 윈도우가 열림
     WindowOpened(window::Id),

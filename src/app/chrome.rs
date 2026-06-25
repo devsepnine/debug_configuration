@@ -67,6 +67,38 @@ pub(crate) fn status_bar_style(theme: &Theme) -> container::Style {
     }
 }
 
+/// 상태바 우측 버전/업데이트 버튼 스타일. 배경 없는 텍스트 링크 형태이며,
+/// 새 버전이 있으면 강조색(primary)으로, 없으면 흐린 텍스트색으로 표시한다.
+pub(crate) fn status_bar_version_style(
+    theme: &Theme,
+    status: button::Status,
+    has_update: bool,
+) -> button::Style {
+    let palette = theme.extended_palette();
+    let base = if has_update {
+        palette.primary.base.color
+    } else {
+        Color {
+            a: 0.5,
+            ..palette.background.base.text
+        }
+    };
+    let text_color = match status {
+        button::Status::Hovered | button::Status::Pressed => Color { a: 1.0, ..base },
+        _ => base,
+    };
+
+    button::Style {
+        background: None,
+        text_color,
+        border: Border {
+            radius: 4.0.into(),
+            ..Border::default()
+        },
+        ..button::Style::default()
+    }
+}
+
 pub(crate) fn status_bar_top_border_style(theme: &Theme) -> container::Style {
     container::Style {
         background: Some(Background::Color(chrome_border_color(theme))),

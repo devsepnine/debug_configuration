@@ -4,9 +4,9 @@ use crate::models::{
     RunConfiguration, RunSession, SearchState, SessionStatusKind, WorkspaceTab,
 };
 use crate::services::{
-    AppSettings, export_text, load_from_path, load_settings, open_configurations,
-    register_running_pid, run_configuration_stream, save_configurations, save_settings,
-    unregister_running_pid,
+    AppSettings, UpdateOutcome, check_latest_release, export_text, load_from_path, load_settings,
+    open_configurations, register_running_pid, run_configuration_stream, save_configurations,
+    save_settings, unregister_running_pid,
 };
 use crate::utils::{DIALOG_CANCELLED, ICON_DELETE, ICON_PLAY, ICON_REFRESH, ICON_STOP};
 use crate::views::shared::icon_tooltip;
@@ -28,7 +28,7 @@ use rfd::AsyncFileDialog;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 use uuid::Uuid;
 
 mod chrome;
@@ -40,9 +40,9 @@ use chrome::{
     SessionActionKind, empty_workspace_content_style, session_action_button_style,
     session_action_icon_style, session_empty_state_style, session_list_item_container_style,
     session_list_panel_style, session_list_status_dot_style, status_bar_style,
-    status_bar_top_border_style, window_border_overlay_style, window_chrome_style, window_radius,
-    workspace_content_island_style, workspace_content_surface_style,
-    workspace_tab_bar_island_style,
+    status_bar_top_border_style, status_bar_version_style, window_border_overlay_style,
+    window_chrome_style, window_radius, workspace_content_island_style,
+    workspace_content_surface_style, workspace_tab_bar_island_style,
 };
 
 /// 세션 리스트의 상태 배지 고정 폭 — 레이아웃 계산과 실제 렌더링이 공유한다.
@@ -248,6 +248,22 @@ fn notify_run_finished(name: &str, result: Result<i32, &str>) {
     });
 }
 
+/// 새 버전 발견 시 OS 데스크톱 알림을 표시한다. 토스트 클릭으로 링크를 여는
+/// 동작은 플랫폼별 편차가 커 신뢰할 수 없으므로, 알림은 안내용으로만 쓰고
+/// 실제 다운로드 진입점은 상태바의 클릭 가능한 링크가 영속적으로 제공한다.
+/// UI 스레드를 막지 않도록 별도 스레드에서 발행하고 실패는 조용히 무시한다.
+fn notify_update_available(latest: &str, url: &str) {
+    let summary = String::from("Update available");
+    let body = format!("Version {latest} is available.\n{url}");
+
+    std::thread::spawn(move || {
+        let _ = notify_rust::Notification::new()
+            .summary(&summary)
+            .body(&body)
+            .show();
+    });
+}
+
 /// Node 구성에서 (`config_id`, `project_directory`, `working_directory`)를 추출.
 /// Node 타입이 아니거나 `project_directory`가 비어 있으면 `None`.
 fn node_paths(config: &RunConfiguration) -> Option<(Uuid, String, String)> {
@@ -355,7 +371,19 @@ pub struct RunConfigManager {
     is_window_focused: bool,
     /// 마지막으로 사용한 구성 파일 경로 (Open/Save)
     last_file_path: Option<PathBuf>,
+    /// 사용 가능한 새 버전 `(latest, release_url)`. 없으면 `None`.
+    /// 상태바의 업데이트 링크 표시에 사용한다.
+    update_available: Option<(String, String)>,
+    /// 업데이트 확인이 진행 중인지. 상태바에 로딩 스피너를 표시하고
+    /// 스피너 타이머 subscription을 활성화하는 데 쓴다.
+    is_checking_update: bool,
+    /// 로딩 스피너 프레임 인덱스 (확인 중 타이머 tick마다 증가).
+    update_spinner_frame: usize,
 }
+
+/// 상태바 업데이트 확인 로딩 스피너 프레임. D2Coding(모노스페이스)에서 항상
+/// 렌더되도록 ASCII만 사용한다.
+const UPDATE_SPINNER_FRAMES: [&str; 4] = ["|", "/", "-", "\\"];
 
 impl RunConfigManager {
     /// 새로운 애플리케이션 인스턴스 생성 및 초기화
@@ -406,6 +434,10 @@ impl RunConfigManager {
             is_window_maximized: false,
             is_window_focused: true,
             last_file_path: last_file_path.clone(),
+            update_available: None,
+            // 아래에서 시작 시 자동 체크 Task를 큐잉하므로 스피너를 켠 상태로 시작.
+            is_checking_update: true,
+            update_spinner_frame: 0,
         };
 
         // 초기화 Task들
@@ -426,6 +458,12 @@ impl RunConfigManager {
                 Message::ConfigurationsLoaded,
             ));
         }
+
+        // 3. 최신 버전 확인 (백그라운드, 실패는 비치명적)
+        tasks.push(Task::perform(
+            check_latest_release(),
+            Message::UpdateCheckCompleted,
+        ));
 
         (app, Task::batch(tasks))
     }
@@ -535,7 +573,10 @@ impl RunConfigManager {
             | Message::SearchNextInActivePane
             | Message::SearchPrevInActivePane
             | Message::ExportSessionOutput(_)
-            | Message::SessionOutputExported(_) => self.handle_session_messages(message),
+            | Message::SessionOutputExported(_)
+            | Message::CheckForUpdates
+            | Message::UpdateCheckCompleted(_)
+            | Message::UpdateSpinnerTick => self.handle_session_messages(message),
             Message::AddWorkspaceTab
             | Message::CloseTab(_)
             | Message::TabNameClicked(_)
@@ -681,6 +722,9 @@ impl RunConfigManager {
             Message::RerunFailedSessions => self.handle_rerun_failed_sessions(),
             Message::CopyToClipboard(text) => iced::clipboard::write(text),
             Message::OpenUrl(url) => self.handle_open_url(&url),
+            Message::CheckForUpdates => self.handle_check_for_updates(),
+            Message::UpdateCheckCompleted(result) => self.handle_update_check_completed(result),
+            Message::UpdateSpinnerTick => self.handle_update_spinner_tick(),
             Message::SessionScrollChanged(session_id, progress, at_bottom) => {
                 self.handle_session_scroll_changed(session_id, progress, at_bottom)
             }
@@ -2017,6 +2061,48 @@ impl RunConfigManager {
         Task::none()
     }
 
+    /// 최신 버전 수동 확인 트리거 (상태바 버전 라벨 클릭).
+    /// 이미 확인 중이면 중복 요청을 무시한다.
+    fn handle_check_for_updates(&mut self) -> Task<Message> {
+        if self.is_checking_update {
+            return Task::none();
+        }
+        self.status_message = String::from("Checking for updates…");
+        self.is_checking_update = true;
+        self.update_spinner_frame = 0;
+        Task::perform(check_latest_release(), Message::UpdateCheckCompleted)
+    }
+
+    /// 로딩 스피너 프레임 진행 (확인 중 타이머 tick).
+    fn handle_update_spinner_tick(&mut self) -> Task<Message> {
+        self.update_spinner_frame = self.update_spinner_frame.wrapping_add(1);
+        Task::none()
+    }
+
+    /// 최신 버전 확인 결과 처리. 새 버전이면 상태를 저장하고 OS 알림을 발행한다.
+    /// 시작 시 자동 체크의 실패는 상태바 메시지로만 조용히 알린다.
+    fn handle_update_check_completed(
+        &mut self,
+        result: Result<UpdateOutcome, String>,
+    ) -> Task<Message> {
+        self.is_checking_update = false;
+        match result {
+            Ok(UpdateOutcome::Available { latest, url, .. }) => {
+                self.status_message = format!("Update available: v{latest}");
+                self.update_available = Some((latest.clone(), url.clone()));
+                notify_update_available(&latest, &url);
+            }
+            Ok(UpdateOutcome::UpToDate { current }) => {
+                self.status_message = format!("You're on the latest version (v{current})");
+                self.update_available = None;
+            }
+            Err(error) => {
+                self.status_message = format!("Update check failed: {error}");
+            }
+        }
+        Task::none()
+    }
+
     fn handle_session_scroll_changed(
         &mut self,
         session_id: Uuid,
@@ -2784,14 +2870,54 @@ impl RunConfigManager {
                     .width(Length::Fill)
                     .height(1)
                     .style(status_bar_top_border_style),
-                container(text(&self.status_message).size(12))
-                    .padding(padding)
-                    .width(Length::Fill),
+                container(
+                    row![
+                        text(&self.status_message).size(12),
+                        Space::new().width(Length::Fill),
+                        self.view_status_bar_version(),
+                    ]
+                    .align_y(Alignment::Center)
+                    .spacing(8),
+                )
+                .padding(padding)
+                .width(Length::Fill),
             ]
             .spacing(0),
         )
         .width(Length::Fill)
         .style(status_bar_style)
+    }
+
+    /// 상태바 우측의 버전 라벨/업데이트 링크.
+    /// 새 버전이 있으면 `v{현재} → v{최신} ⬆`를 눌러 릴리스 페이지를 열고,
+    /// 없으면 `v{현재}`를 눌러 수동 업데이트 확인을 트리거한다.
+    fn view_status_bar_version(&self) -> Element<'_, Message> {
+        let current = crate::services::CURRENT_VERSION;
+
+        // 확인 중에는 회전 스피너를 표시하고 버튼을 비활성화(on_press 생략)한다.
+        if self.is_checking_update {
+            let frame =
+                UPDATE_SPINNER_FRAMES[self.update_spinner_frame % UPDATE_SPINNER_FRAMES.len()];
+            return button(text(format!("{frame} checking")).size(12))
+                .padding([1, 6])
+                .style(move |theme: &Theme, status| status_bar_version_style(theme, status, false))
+                .into();
+        }
+
+        let (label, on_press) = match &self.update_available {
+            Some((latest, url)) => (
+                format!("v{current} → v{latest} ⬆"),
+                Message::OpenUrl(url.clone()),
+            ),
+            None => (format!("v{current}"), Message::CheckForUpdates),
+        };
+        let has_update = self.update_available.is_some();
+
+        button(text(label).size(12))
+            .padding([1, 6])
+            .on_press(on_press)
+            .style(move |theme: &Theme, status| status_bar_version_style(theme, status, has_update))
+            .into()
     }
 
     fn view_configuration_panel_shell<'a>(
@@ -3597,6 +3723,13 @@ impl RunConfigManager {
             Subscription::none()
         };
 
+        // 업데이트 확인 중에만 스피너 애니메이션 tick을 발행한다.
+        let update_spinner_subscription = if self.is_checking_update {
+            iced::time::every(Duration::from_millis(120)).map(|_| Message::UpdateSpinnerTick)
+        } else {
+            Subscription::none()
+        };
+
         Subscription::batch([
             cursor_subscription,
             configuration_release_subscription,
@@ -3607,6 +3740,7 @@ impl RunConfigManager {
             search_open_subscription,
             search_close_subscription,
             search_nav_subscription,
+            update_spinner_subscription,
             window::open_events().map(Message::WindowOpened),
             window::resize_events().map(|(id, size)| Message::WindowResized(id, size)),
         ])
