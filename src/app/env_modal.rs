@@ -69,8 +69,9 @@ impl RunConfigManager {
         // raw text는 버퍼에 보존해 정규화(serialize)는 submit 시에만 수행 → 타이핑을 방해하지
         // 않으면서, Enter 없이 Run/Save해도 environment_variables가 항상 최신이도록 보장한다.
         if let Some(config) = self.configurations.iter_mut().find(|c| c.id == config_id) {
-            config.environment_variables =
-                crate::env_string::parse_env_string(&text).into_iter().collect();
+            config.environment_variables = crate::env_string::parse_env_string(&text)
+                .into_iter()
+                .collect();
         }
         self.env_bulk_inputs.insert(config_id, text);
         Task::none()

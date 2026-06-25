@@ -2,8 +2,9 @@ use crate::messages::Message;
 use crate::models::RunSession;
 use iced::{
     Border, Color, Element, Event, Length, Point, Rectangle, Renderer, Theme, border, keyboard,
-    mouse, window,
+    mouse,
     widget::{Canvas, canvas, container},
+    window,
 };
 use std::collections::HashSet;
 use unicode_width::UnicodeWidthChar;
@@ -440,7 +441,11 @@ impl<'a> TerminalCanvas<'a> {
     ///
     /// 조건: 가로폭 동일 + 필터/검색어 동일 + 필터 off(필터 on이면 표시 줄이 line_id 비연속
     /// 부분집합이라 추론 불가) + 이전 line_id 캐시 존재 + 정합성(추론한 길이 == 실제 줄 수).
-    fn try_incremental_wrap_update(&self, state: &mut ScrollState, max_chars: usize) -> Option<usize> {
+    fn try_incremental_wrap_update(
+        &self,
+        state: &mut ScrollState,
+        max_chars: usize,
+    ) -> Option<usize> {
         if state.cached_max_chars != max_chars
             || self.render_key.filter
             || state.cached_render_key.filter != self.render_key.filter
@@ -2022,7 +2027,10 @@ mod tests {
         let redraw = Event::Window(window::Event::RedrawRequested(std::time::Instant::now()));
         let _ = canvas.update(&mut state, &redraw, bounds, cursor_inside());
 
-        assert_eq!(state.offset, 10.0, "auto_scroll=false면 재고정하지 않아야 함");
+        assert_eq!(
+            state.offset, 10.0,
+            "auto_scroll=false면 재고정하지 않아야 함"
+        );
     }
 
     /// 회귀 방지(이슈 2): auto_scroll 해제는 비율이 아닌 절대 거리로 판정해야 한다. 대량
@@ -2143,11 +2151,18 @@ mod tests {
 
         // 정상 비율(절반 가시)은 비율 그대로 적용.
         let half = TerminalCanvas::scrollbar_thumb_height(50.0, 100.0, 400.0);
-        assert!((half - 200.0).abs() < 1e-3, "절반 가시 → 트랙 절반 (half={half})");
+        assert!(
+            (half - 200.0).abs() < 1e-3,
+            "절반 가시 → 트랙 절반 (half={half})"
+        );
     }
 
     /// line_id 범위를 지정한 테스트용 캔버스(증분 wrap 갱신·offset 보정 검증용). 필터 off.
-    fn canvas_with_ids(texts: Vec<String>, first_id: usize, content_version: u64) -> TerminalCanvas<'static> {
+    fn canvas_with_ids(
+        texts: Vec<String>,
+        first_id: usize,
+        content_version: u64,
+    ) -> TerminalCanvas<'static> {
         let n = texts.len();
         let last_id = first_id + n.saturating_sub(1);
         TerminalCanvas {
@@ -2213,7 +2228,10 @@ mod tests {
         c2_full.rebuild_wrap_cache_if_needed(&mut state_full, mc);
 
         assert_eq!(incremental, state_full.line_counts, "증분 == 전체 재빌드");
-        assert_eq!(state.cached_total, state_full.cached_total, "총 행 수도 동일");
+        assert_eq!(
+            state.cached_total, state_full.cached_total,
+            "총 행 수도 동일"
+        );
     }
 
     /// 회귀 방지(②): 위로 스크롤된 상태에서 앞 줄이 evict되면 offset을 그만큼 당겨 보던
@@ -2256,10 +2274,7 @@ mod tests {
         // 짧은 줄 5개(wrap 1행씩) 캐시.
         let c1 = canvas_with_ids(vec!["x".repeat(40); 5], 0, 1);
         c1.rebuild_wrap_cache_if_needed(&mut state, mc);
-        assert!(
-            state.line_counts.iter().all(|&c| c == 1),
-            "짧은 줄은 1행"
-        );
+        assert!(state.line_counts.iter().all(|&c| c == 1), "짧은 줄은 1행");
 
         // 같은 line_id 범위(0..5)지만 내용이 긴 줄로 교체 + content_version만 증가.
         // 증분이 스킵되고 전체 재빌드돼야 wrap 행 수가 갱신된다.

@@ -986,7 +986,10 @@ mod tests {
         )
         .await
         .expect("output loop timed out");
-        assert!(!completed, "both readers at EOF → normal completion (false)");
+        assert!(
+            !completed,
+            "both readers at EOF → normal completion (false)"
+        );
 
         // 송신측 drop 후 수신 스트림을 모두 수집.
         drop(tx);
@@ -1004,7 +1007,10 @@ mod tests {
             }
         }
         let expected: String = (0..200).map(|i| format!("line{i}\n")).collect();
-        assert_eq!(reconstructed, expected, "배치 후에도 줄 내용/순서가 보존되어야 함");
+        assert_eq!(
+            reconstructed, expected,
+            "배치 후에도 줄 내용/순서가 보존되어야 함"
+        );
 
         // 배치 효과: 200줄이 줄 수보다 훨씬 적은 메시지로 묶여야 한다 (64줄 임계 → 약 4개;
         // 인메모리 read는 즉시 완료되어 16ms 타이머가 거의 발화하지 않으므로 여유 상한 20).
@@ -1012,7 +1018,10 @@ mod tests {
             .iter()
             .filter(|m| matches!(m, Message::OutputReceived(_, _)))
             .count();
-        assert!(output_msgs < 200, "배치로 메시지 수가 줄어야 함 (got {output_msgs})");
+        assert!(
+            output_msgs < 200,
+            "배치로 메시지 수가 줄어야 함 (got {output_msgs})"
+        );
         assert!(
             output_msgs <= 20,
             "200줄이 배치로 크게 줄어야 함 (got {output_msgs})"

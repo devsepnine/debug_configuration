@@ -423,7 +423,10 @@ mod tests {
 
         assert_eq!(session.output_lines.len(), 0);
         assert!(session.output_lines.is_empty());
-        assert_eq!(session.total_bytes, 0, "clear는 바이트 카운터도 0으로 되돌려야 함");
+        assert_eq!(
+            session.total_bytes, 0,
+            "clear는 바이트 카운터도 0으로 되돌려야 함"
+        );
     }
 
     #[test]
@@ -484,10 +487,7 @@ mod tests {
             "바이트 예산으로 오래된 줄이 제거되어야 함 (len={})",
             session.output_lines.len()
         );
-        assert!(
-            !session.output_lines.is_empty(),
-            "최소 1줄은 유지되어야 함"
-        );
+        assert!(!session.output_lines.is_empty(), "최소 1줄은 유지되어야 함");
     }
 
     #[test]
