@@ -1,11 +1,15 @@
 # Run/Debug Configuration Manager - RUNBOOK
 
 > 운영 및 배포 가이드
-> Last Updated: 2026-01-30
+> Last Updated: 2026-06-25
 
 ## 배포 절차
 
-### 1. 릴리스 빌드
+> **정식 배포는 GitHub Actions로 수행한다.** 릴리스 파이프라인(트리거, job 흐름,
+> 산출물, 릴리스 수행 절차)은 [`DEPLOYMENT.md`](./DEPLOYMENT.md)를 참고한다.
+> 아래 절차는 **로컬 개발/수동 빌드**용 참고 자료다.
+
+### 1. 릴리스 빌드 (로컬)
 
 #### Windows
 ```bash
@@ -236,6 +240,26 @@ ls -la package-lock.json yarn.lock pnpm-lock.yaml
 **해결**:
 - 이미 수정됨 (call operator `&` 추가)
 - 여전히 문제 발생 시: 경로에 특수문자 확인
+
+### 7. 업데이트 알림이 뜨지 않음
+
+**증상**: 새 릴리스를 올렸는데 앱 상태바/알림에 업데이트가 표시되지 않음
+
+**원인**:
+- 릴리스가 아직 **드래프트**이거나 **프리릴리스**로 표시됨 (`/releases/latest`가 제외)
+- 태그가 `vX.Y.Z` 형식이 아님 (버전 비교 실패)
+- 네트워크 차단/오프라인 (`api.github.com` 접근 불가) — 비치명적으로 처리되어 상태바에만 표시
+
+**해결**:
+```bash
+# 최신 정식 릴리스가 무엇으로 보이는지 직접 확인
+curl -s https://api.github.com/repos/devsepnine/debug_configuration/releases/latest | grep tag_name
+
+# 드래프트면 GitHub UI에서 Publish, 프리릴리스 체크 해제
+# 상태바 버전 라벨을 클릭하면 수동 재확인 가능
+```
+
+자세한 내용은 [`DEPLOYMENT.md`](./DEPLOYMENT.md)의 "인앱 업데이트 체커와의 관계" 참고.
 
 ## Rollback 절차
 
