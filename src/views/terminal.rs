@@ -46,6 +46,10 @@ const SCROLLBAR_MARGIN: f32 = 12.0;
 /// 스크롤바 히트 영역 추가 패딩 (픽셀) - 클릭하기 쉽게
 const SCROLLBAR_HIT_PADDING: f32 = 5.0;
 
+/// 스크롤바 thumb의 최소 높이(px). 대량 버퍼(예: 5만 줄)에서 (가시/전체) 비율로만 계산하면
+/// thumb이 1px 미만으로 사라져 보이지도 잡히지도 않는다. 브라우저처럼 하한을 둔다.
+const MIN_SCROLLBAR_THUMB: f32 = 24.0;
+
 /// 텍스트 색상
 const TEXT_COLOR: Color = Color::WHITE;
 
@@ -664,6 +668,14 @@ impl<'a> TerminalCanvas<'a> {
     ///
     /// # Returns
     /// (x, y, width, height)
+    /// 스크롤바 thumb 높이. (가시 행/전체 행) × 트랙 높이를 기본으로 하되, 대량 버퍼에서
+    /// thumb이 사라지지 않도록 `MIN_SCROLLBAR_THUMB`로 하한을 둔다(트랙 높이는 넘지 않음).
+    /// draw/hit-test/drag 세 곳이 공유해 위치·드래그 매핑의 일관성을 유지한다.
+    fn scrollbar_thumb_height(visible_lines_f: f32, total_lines_f: f32, track_height: f32) -> f32 {
+        let raw = (visible_lines_f / total_lines_f) * track_height;
+        raw.clamp(MIN_SCROLLBAR_THUMB.min(track_height), track_height)
+    }
+
     fn calculate_scrollbar_bounds(
         &self,
         state: &ScrollState,
@@ -677,7 +689,8 @@ impl<'a> TerminalCanvas<'a> {
         let total_lines_f = Self::usize_to_f32(total_wrapped_lines);
         let visible_lines_f = Self::usize_to_f32(visible_lines);
 
-        let scrollbar_height = (visible_lines_f / total_lines_f) * bounds.height;
+        let scrollbar_height =
+            Self::scrollbar_thumb_height(visible_lines_f, total_lines_f, bounds.height);
         let max_scroll = total_lines_f - visible_lines_f;
         let scrollbar_y = if max_scroll > 0.0 {
             (offset / max_scroll) * (bounds.height - scrollbar_height)
@@ -885,9 +898,11 @@ impl<'a> TerminalCanvas<'a> {
         let cursor_position = Point::new(position.x - bounds.x, position.y - bounds.y);
 
         if state.is_dragging_scrollbar && metrics.total_wrapped_lines > metrics.visible_lines {
-            let scrollbar_height = (metrics.visible_lines_f
-                / Self::usize_to_f32(metrics.total_wrapped_lines))
-                * bounds.height;
+            let scrollbar_height = Self::scrollbar_thumb_height(
+                metrics.visible_lines_f,
+                Self::usize_to_f32(metrics.total_wrapped_lines),
+                bounds.height,
+            );
             let scrollable_height = bounds.height - scrollbar_height;
             let mouse_delta = cursor_position.y - state.drag_start_y;
             let scroll_delta = (mouse_delta / scrollable_height) * metrics.max_scroll;
@@ -1461,8 +1476,9 @@ impl<'a> TerminalCanvas<'a> {
         let total_lines_f = Self::usize_to_f32(total_wrapped_lines);
         let visible_lines_f = Self::usize_to_f32(visible_lines);
 
-        // 스크롤바 높이 계산
-        let scrollbar_height = (visible_lines_f / total_lines_f) * bounds.height;
+        // 스크롤바 높이 계산 (대량 버퍼에서 사라지지 않도록 최소 높이 적용)
+        let scrollbar_height =
+            Self::scrollbar_thumb_height(visible_lines_f, total_lines_f, bounds.height);
 
         // 스크롤바 위치 계산
         let max_scroll = total_lines_f - visible_lines_f;
@@ -2026,6 +2042,22 @@ mod tests {
             "scroll_target=3 → 앞 3줄 누적 래핑 행 offset (offset={}, expected={expected})",
             state.offset
         );
+    }
+
+    /// 회귀 방지: 대량 버퍼에서 scrollbar thumb이 사라지지 않도록 최소 높이를 보장한다.
+    #[test]
+    fn scrollbar_thumb_clamps_to_minimum_in_huge_buffer() {
+        // 5만 줄, 가시 30줄, 트랙 400px → 원래 약 0.24px.
+        let h = TerminalCanvas::scrollbar_thumb_height(30.0, 50_000.0, 400.0);
+        assert!(
+            h >= MIN_SCROLLBAR_THUMB,
+            "거대 버퍼에서도 최소 thumb 높이 보장 (h={h})"
+        );
+        assert!(h <= 400.0, "트랙 높이를 넘지 않음 (h={h})");
+
+        // 정상 비율(절반 가시)은 비율 그대로 적용.
+        let half = TerminalCanvas::scrollbar_thumb_height(50.0, 100.0, 400.0);
+        assert!((half - 200.0).abs() < 1e-3, "절반 가시 → 트랙 절반 (half={half})");
     }
 
     // ── S1/S3: 가상화 wrap 수학 (순수 함수) ─────────────────────────────────
