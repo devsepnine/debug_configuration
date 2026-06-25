@@ -62,30 +62,34 @@ impl ModalCell {
 
 impl RunConfigManager {
     pub(super) fn handle_env_bulk_input_changed(&mut self, text: String) -> Task<Message> {
-        if let Some(config_id) = self.selected_config_id() {
-            self.env_bulk_inputs.insert(config_id, text);
+        let Some(config_id) = self.selected_config_id() else {
+            return Task::none();
+        };
+        // 다른 편집 필드(command/arguments 등)와 동일하게 입력 즉시 모델에 반영한다.
+        // raw text는 버퍼에 보존해 정규화(serialize)는 submit 시에만 수행 → 타이핑을 방해하지
+        // 않으면서, Enter 없이 Run/Save해도 environment_variables가 항상 최신이도록 보장한다.
+        if let Some(config) = self.configurations.iter_mut().find(|c| c.id == config_id) {
+            config.environment_variables =
+                crate::env_string::parse_env_string(&text).into_iter().collect();
         }
+        self.env_bulk_inputs.insert(config_id, text);
         Task::none()
     }
 
     pub(super) fn handle_env_bulk_input_submitted(&mut self) -> Task<Message> {
-        let Some(index) = self.selected_config_index else {
+        let Some(config_id) = self.selected_config_id() else {
             return Task::none();
         };
-        let Some(config) = self.configurations.get_mut(index) else {
-            return Task::none();
-        };
-        let config_id = config.id;
-        let raw = self
-            .env_bulk_inputs
-            .get(&config_id)
-            .cloned()
-            .unwrap_or_default();
-        let entries = crate::env_string::parse_env_string(&raw);
-        config.environment_variables = entries.into_iter().collect();
-        // raw text는 정렬된 형태로 normalize하여 표시 일관성 유지
-        let normalized = crate::env_string::serialize_env_map(&config.environment_variables);
-        self.env_bulk_inputs.insert(config_id, normalized);
+        // environment_variables는 입력 시점(changed)에 이미 반영됨. 여기서는 표시용 raw text를
+        // 정렬된 형태로 normalize해 일관성만 유지한다.
+        let normalized = self
+            .configurations
+            .iter()
+            .find(|c| c.id == config_id)
+            .map(|config| crate::env_string::serialize_env_map(&config.environment_variables));
+        if let Some(normalized) = normalized {
+            self.env_bulk_inputs.insert(config_id, normalized);
+        }
         Task::none()
     }
 
@@ -97,23 +101,13 @@ impl RunConfigManager {
             return Task::none();
         };
         let config_id = config.id;
-        // 사용자가 메인 input에 타이핑 후 Enter 누르지 않은 raw text가 남아 있으면
-        // 그 결과를 staging으로 사용 (데이터 손실 방지). 일치하면 environment_variables 그대로.
-        let serialized = crate::env_string::serialize_env_map(&config.environment_variables);
-        let raw = self
-            .env_bulk_inputs
-            .get(&config_id)
-            .cloned()
-            .unwrap_or_default();
-        let mut entries: Vec<(String, String)> = if raw == serialized {
-            config
-                .environment_variables
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect()
-        } else {
-            crate::env_string::parse_env_string(&raw)
-        };
+        // environment_variables는 메인 input 입력 시점(`changed`)에 항상 최신화되므로,
+        // 모달은 이를 직접 staging entries로 읽는다. 키 기준 정렬로 표시 일관성을 유지.
+        let mut entries: Vec<(String, String)> = config
+            .environment_variables
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
         entries.sort_by(|a, b| a.0.cmp(&b.0));
         self.env_modal = Some(EnvModalState {
             config_id,
@@ -259,6 +253,28 @@ impl RunConfigManager {
 #[cfg(test)]
 mod tests {
     use super::{ModalCell, ModalCellKind};
+    use crate::app::RunConfigManager;
+    use crate::models::RunConfiguration;
+
+    /// 회귀: 메인 env 텍스트 입력은 Enter(submit) 없이도 즉시 `environment_variables`에
+    /// 반영되어야 한다. 입력 직후 Run/Save 시 환경변수가 누락되던 버그를 방지한다.
+    #[test]
+    fn bulk_input_applied_immediately_without_submit() {
+        let (mut app, _task) = RunConfigManager::new();
+        assert!(
+            app.configurations.is_empty(),
+            "RunConfigManager::new() must start with no configurations"
+        );
+        app.configurations.push(RunConfiguration::default());
+        app.selected_config_index = Some(0);
+
+        let _ = app.handle_env_bulk_input_changed("FOO=bar;BAZ=qux".to_string());
+
+        let env = &app.configurations[0].environment_variables;
+        assert_eq!(env.get("FOO").map(String::as_str), Some("bar"));
+        assert_eq!(env.get("BAZ").map(String::as_str), Some("qux"));
+        assert_eq!(env.len(), 2);
+    }
 
     #[test]
     fn modal_cell_linear_index_round_trips() {
