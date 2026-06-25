@@ -251,3 +251,9 @@ cargo run --release
 - [ ] 구성 그룹화 및 태그 기능
 - [ ] 키보드 단축키 커스터마이징
 - [ ] 테마 선택 기능
+- [ ] stdin 인터랙티브 입력 (실행 중 세션에 키 입력 전달 — 프롬프트형 CLI/REPL 지원)
+- [ ] Before-launch tasks (실행 전 다른 구성을 순차 선행 실행, 예: build → run)
+- [ ] Cargo (Rust) 타입 추가 (Cargo.toml의 bin/example/test 타겟 자동 인식)
+- [ ] Make / Just 타입 추가 (Makefile/justfile 타겟 picklist)
+- [ ] .env 파일 지원 (환경변수 파일 로드 및 병합)
+- [ ] 변수/매크로 치환 ($PROJECT_DIR$ 등 동적 변수)
