@@ -531,6 +531,8 @@ impl RunConfigManager {
             | Message::ToggleSessionSearchRegex(_)
             | Message::OpenSearchInActivePane
             | Message::CloseActiveSearch
+            | Message::SearchNextInActivePane
+            | Message::SearchPrevInActivePane
             | Message::ExportSessionOutput(_)
             | Message::SessionOutputExported(_) => self.handle_session_messages(message),
             Message::AddWorkspaceTab
@@ -702,6 +704,14 @@ impl RunConfigManager {
             },
             Message::CloseActiveSearch => match self.focused_search_session_id() {
                 Some(session_id) => self.handle_close_session_search(session_id),
+                None => Task::none(),
+            },
+            Message::SearchNextInActivePane => match self.focused_search_session_id() {
+                Some(session_id) => self.handle_session_search_step(session_id, 1),
+                None => Task::none(),
+            },
+            Message::SearchPrevInActivePane => match self.focused_search_session_id() {
+                Some(session_id) => self.handle_session_search_step(session_id, -1),
                 None => Task::none(),
             },
             Message::ExportSessionOutput(session_id) => {
@@ -2140,6 +2150,17 @@ impl RunConfigManager {
         Task::none()
     }
 
+    /// 검색 네비게이션 키 → 메시지. Enter = 다음 매치, Shift+Enter = 이전 매치.
+    /// 대상 세션은 핸들러가 active pane에서 해석한다(`event::listen_with`는 fn 포인터만
+    /// 받아 세션 id를 캡처할 수 없다). subscription과 단위 테스트가 공유한다.
+    fn search_nav_message(shift: bool) -> Message {
+        if shift {
+            Message::SearchPrevInActivePane
+        } else {
+            Message::SearchNextInActivePane
+        }
+    }
+
     /// Ctrl+F/ESC가 대상으로 삼을 세션. 활성 탭의 leaf pane 중 이미 검색바가 열린
     /// 세션을 우선, 없으면 첫 세션 pane (다중 pane에서 정확한 대상은 pane의 검색 버튼 사용).
     fn focused_search_session_id(&self) -> Option<Uuid> {
@@ -3496,6 +3517,28 @@ impl RunConfigManager {
             } else {
                 Subscription::none()
             };
+        // 검색바가 열려 있을 때 Enter = 다음 매치, Shift+Enter = 이전 매치. text_input의
+        // on_submit은 modifiers를 몰라 Shift를 구분하지 못하므로 여기서 처리하고 on_submit은
+        // 제거했다. 대상은 active pane의 "검색이 열린" 세션. tab 이름 편집 중에는 Enter가
+        // 이름 제출과 겹치지 않도록 비활성화한다.
+        // 대상 세션을 캡처하지 않는다(listen_with는 fn 포인터만 받음 — 위 search_open/close와
+        // 동일하게 핸들러가 active pane에서 해석). tab 이름 편집 중에는 Enter가 이름 제출과
+        // 겹치지 않도록 비활성화한다.
+        let search_nav_active = sessions_active
+            && self.tab_ui.editing_tab_name.is_none()
+            && self.sessions.iter().any(|s| s.search.is_some());
+        let search_nav_subscription = if search_nav_active {
+            event::listen_with(|event, _status, _id| match event {
+                Event::Keyboard(keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Named(keyboard::key::Named::Enter),
+                    modifiers,
+                    ..
+                }) => Some(Self::search_nav_message(modifiers.shift())),
+                _ => None,
+            })
+        } else {
+            Subscription::none()
+        };
 
         Subscription::batch([
             cursor_subscription,
@@ -3506,6 +3549,7 @@ impl RunConfigManager {
             window_focus_subscription,
             search_open_subscription,
             search_close_subscription,
+            search_nav_subscription,
             window::open_events().map(Message::WindowOpened),
             window::resize_events().map(|(id, size)| Message::WindowResized(id, size)),
         ])
@@ -3914,6 +3958,24 @@ mod tests {
         assert_eq!(app.sessions[0].search.as_ref().unwrap().current, 0);
         let _ = app.handle_session_search_step(sid, -1);
         assert_eq!(app.sessions[0].search.as_ref().unwrap().current, 1);
+    }
+
+    #[test]
+    fn search_nav_enter_next_shift_enter_prev() {
+        assert!(
+            matches!(
+                RunConfigManager::search_nav_message(false),
+                Message::SearchNextInActivePane
+            ),
+            "Enter → 다음 매치"
+        );
+        assert!(
+            matches!(
+                RunConfigManager::search_nav_message(true),
+                Message::SearchPrevInActivePane
+            ),
+            "Shift+Enter → 이전 매치"
+        );
     }
 
     #[test]

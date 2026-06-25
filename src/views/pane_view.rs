@@ -438,7 +438,6 @@ fn view_session_search_bar(session: &RunSession) -> Element<'_, Message> {
     let input = text_input("Find in output...", &search.query)
         .id(session_search_input_id(session_id))
         .on_input(move |value| Message::SessionSearchChanged(session_id, value))
-        .on_submit(Message::SessionSearchNext(session_id))
         .size(12)
         .padding([2, 6])
         .width(Length::Fill);
@@ -466,7 +465,7 @@ fn view_session_search_bar(session: &RunSession) -> Element<'_, Message> {
     let controls = row![
         glyph_button(
             "<",
-            "Previous match",
+            "Previous match (Shift+Enter)",
             Message::SessionSearchPrev(session_id),
             IconButtonState::Active
         ),

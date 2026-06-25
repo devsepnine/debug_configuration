@@ -242,6 +242,10 @@ pub enum Message {
     OpenSearchInActivePane,
     /// 활성 검색바 닫기 (ESC — 대상 세션은 핸들러가 해석)
     CloseActiveSearch,
+    /// 활성 pane 검색의 다음 매치로 이동 (Enter — 대상 세션은 핸들러가 해석)
+    SearchNextInActivePane,
+    /// 활성 pane 검색의 이전 매치로 이동 (Shift+Enter — 대상 세션은 핸들러가 해석)
+    SearchPrevInActivePane,
     /// 세션 출력을 파일로 내보내기 (`session_id`)
     ExportSessionOutput(Uuid),
     /// 출력 내보내기 완료 (저장 경로 또는 에러/취소)
