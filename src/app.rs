@@ -461,6 +461,7 @@ impl RunConfigManager {
             | Message::TypeChanged(_)
             | Message::CompoundMemberAdded(_)
             | Message::CompoundMemberRemoved(_)
+            | Message::CompoundWorkspaceChanged(_)
             | Message::CommandChanged(_)
             | Message::ArgumentsChanged(_)
             | Message::ExecuteModeChanged(_)
@@ -578,6 +579,9 @@ impl RunConfigManager {
             Message::CompoundMemberAdded(member_id) => self.handle_compound_member_added(member_id),
             Message::CompoundMemberRemoved(member_id) => {
                 self.handle_compound_member_removed(member_id)
+            }
+            Message::CompoundWorkspaceChanged(value) => {
+                self.handle_compound_workspace_changed(value)
             }
             Message::CommandChanged(command) => self.handle_command_changed(command),
             Message::ArgumentsChanged(arguments) => self.handle_arguments_changed(arguments),
@@ -1037,10 +1041,11 @@ impl RunConfigManager {
             self.selected_config_index = Some(idx);
 
             // Compound 구성: 멤버들을 각자의 세션/페인으로 동시 실행
-            if let ConfigTypeData::Compound { members } = &config.type_data {
+            if let ConfigTypeData::Compound { members, workspace } = &config.type_data {
                 let compound_name = config.name.clone();
                 let members = members.clone();
-                return self.run_compound(&compound_name, &members);
+                let workspace = workspace.clone();
+                return self.run_compound(&compound_name, &members, workspace.as_deref());
             }
 
             let config = config.clone();
@@ -1071,14 +1076,17 @@ impl RunConfigManager {
 
     /// Compound 구성 실행: 각 멤버를 자신의 세션/페인으로 펼쳐 동시 실행한다.
     /// 누락된(삭제된) 멤버와 중첩 Compound 멤버는 건너뛴다.
-    fn run_compound(&mut self, compound_name: &str, members: &[Uuid]) -> Task<Message> {
-        self.ensure_workspace_tab();
-        self.current_view = ViewMode::Sessions;
-
-        let mut tasks = Vec::new();
+    fn run_compound(
+        &mut self,
+        compound_name: &str,
+        members: &[Uuid],
+        workspace: Option<&str>,
+    ) -> Task<Message> {
+        // 먼저 실행 가능한 멤버를 수집한다(삭제/중첩 멤버는 스킵). 탭 생성·전환은 실행할
+        // 멤버가 있을 때만 하여, 멤버 0개 compound가 빈 탭을 남기지 않게 한다(None 경로의
+        // ensure_workspace_tab과 동일한 "빈 탭 안 만듦" 동작).
+        let mut runnable = Vec::new();
         let mut skipped = 0usize;
-        let aspect = self.workspace_content_aspect();
-
         for &member_id in members {
             let Some(member) = self.configurations.iter().find(|c| c.id == member_id) else {
                 skipped += 1; // 삭제된 멤버
@@ -1088,8 +1096,29 @@ impl RunConfigManager {
                 skipped += 1; // 중첩 방지
                 continue;
             }
+            runnable.push(member.clone());
+        }
 
-            let config = member.clone();
+        if runnable.is_empty() {
+            self.status_message = format!("Compound '{compound_name}' has no runnable members");
+            return Task::none();
+        }
+
+        // 실행할 멤버가 있으니 대상 탭을 정한다. workspace 이름이 지정되면 그 이름으로 새 탭을
+        // 만들어(동명 충돌 시 넘버링) 전환하고, 비어 있으면 현재 활성 탭에서 실행한다.
+        match workspace.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(base) => {
+                let name = self.unique_workspace_name(base);
+                self.workspace_tabs.push(WorkspaceTab::empty(name));
+                self.selected_tab_index = self.workspace_tabs.len() - 1;
+            }
+            None => self.ensure_workspace_tab(),
+        }
+        self.current_view = ViewMode::Sessions;
+
+        let aspect = self.workspace_content_aspect();
+        let mut tasks = Vec::new();
+        for config in runnable {
             let session = RunSession::new(config.name.clone());
             let session_id = session.id;
             let cancel_flag = session.cancel_flag.clone();
@@ -1106,9 +1135,7 @@ impl RunConfigManager {
         }
 
         let launched = tasks.len();
-        self.status_message = if launched == 0 {
-            format!("Compound '{compound_name}' has no runnable members")
-        } else if skipped > 0 {
+        self.status_message = if skipped > 0 {
             format!("Running compound '{compound_name}': {launched} task(s), {skipped} skipped")
         } else {
             format!("Running compound '{compound_name}': {launched} task(s)")
@@ -1138,6 +1165,17 @@ impl RunConfigManager {
             .and_then(ConfigTypeData::compound_members_mut)
         {
             members.retain(|id| *id != member_id);
+        }
+        Task::none()
+    }
+
+    fn handle_compound_workspace_changed(&mut self, value: String) -> Task<Message> {
+        if let Some(workspace) = self
+            .selected_type_data_mut()
+            .and_then(ConfigTypeData::compound_workspace_mut)
+        {
+            // 빈/공백 입력은 None으로 정규화 — "현재 탭에서 실행"과 같은 의미.
+            *workspace = Some(value).filter(|v| !v.trim().is_empty());
         }
         Task::none()
     }
@@ -1260,6 +1298,7 @@ impl RunConfigManager {
                     },
                     ConfigurationType::Compound => ConfigTypeData::Compound {
                         members: Vec::new(),
+                        workspace: None,
                     },
                 };
             }
@@ -2492,6 +2531,24 @@ impl RunConfigManager {
                 .enumerate()
                 .any(|(i, tab)| Some(i) != exclude && tab.name == candidate);
             if !taken {
+                return candidate;
+            }
+            n += 1;
+        }
+    }
+
+    /// base 이름으로 고유한 workspace 탭 이름을 만든다. 미사용이면 base 그대로, 충돌하면
+    /// "base 2", "base 3"... 으로 빈 번호를 찾는다(`next_workspace_name`과 같은 gap-fill 방식).
+    /// base 자체가 "1번"이므로 번호는 2부터 시작한다("base 1"은 어색하므로).
+    fn unique_workspace_name(&self, base: &str) -> String {
+        let exists = |name: &str| self.workspace_tabs.iter().any(|t| t.name == name);
+        if !exists(base) {
+            return base.to_string();
+        }
+        let mut n: usize = 2;
+        loop {
+            let candidate = format!("{base} {n}");
+            if !exists(&candidate) {
                 return candidate;
             }
             n += 1;
@@ -3863,6 +3920,7 @@ mod tests {
         let b_id = app.configurations[1].id;
         app.configurations[2].type_data = ConfigTypeData::Compound {
             members: vec![a_id, b_id],
+            workspace: None,
         };
         let _ = app.handle_run_configuration(Some(2));
         assert_eq!(app.sessions.len(), 2);
@@ -3878,10 +3936,14 @@ mod tests {
     fn run_compound_skips_missing_and_nested_members() {
         let mut app = manager_with_configs(&["A", "Inner", "Bundle"]);
         let a_id = app.configurations[0].id;
-        app.configurations[1].type_data = ConfigTypeData::Compound { members: vec![] };
+        app.configurations[1].type_data = ConfigTypeData::Compound {
+            members: vec![],
+            workspace: None,
+        };
         let inner_id = app.configurations[1].id;
         app.configurations[2].type_data = ConfigTypeData::Compound {
             members: vec![a_id, inner_id, Uuid::new_v4()],
+            workspace: None,
         };
         let _ = app.handle_run_configuration(Some(2));
         assert_eq!(app.sessions.len(), 1); // 중첩 Compound와 누락 멤버는 건너뜀
@@ -3893,12 +3955,15 @@ mod tests {
         let mut app = manager_with_configs(&["A", "Bundle"]);
         let a_id = app.configurations[0].id;
         let bundle_id = app.configurations[1].id;
-        app.configurations[1].type_data = ConfigTypeData::Compound { members: vec![] };
+        app.configurations[1].type_data = ConfigTypeData::Compound {
+            members: vec![],
+            workspace: None,
+        };
         app.selected_config_index = Some(1);
         let _ = app.handle_compound_member_added(a_id);
         let _ = app.handle_compound_member_added(a_id); // 중복 무시
         let _ = app.handle_compound_member_added(bundle_id); // 자기 자신 무시
-        let ConfigTypeData::Compound { members } = &app.configurations[1].type_data else {
+        let ConfigTypeData::Compound { members, .. } = &app.configurations[1].type_data else {
             panic!("expected compound");
         };
         assert_eq!(members, &vec![a_id]);
@@ -3911,6 +3976,7 @@ mod tests {
         let b_id = app.configurations[1].id;
         app.configurations[2].type_data = ConfigTypeData::Compound {
             members: vec![a_id, b_id],
+            workspace: None,
         };
         app.selected_config_index = Some(2);
         let _ = app.handle_compound_member_removed(b_id);
@@ -3920,13 +3986,51 @@ mod tests {
             .iter()
             .find(|c| matches!(c.type_data, ConfigTypeData::Compound { .. }))
             .expect("compound still present");
-        let ConfigTypeData::Compound { members } = &compound.type_data else {
+        let ConfigTypeData::Compound { members, .. } = &compound.type_data else {
             unreachable!()
         };
         assert!(
             members.is_empty(),
             "deleted ids must be stripped from members"
         );
+    }
+
+    #[test]
+    fn unique_workspace_name_keeps_base_then_numbers_on_collision() {
+        let mut app = manager_with_configs(&["A"]);
+        // 기본 탭은 "Workspace 1" → "Backend"는 미사용이므로 그대로.
+        assert_eq!(app.unique_workspace_name("Backend"), "Backend");
+        app.workspace_tabs
+            .push(WorkspaceTab::empty("Backend".to_string()));
+        assert_eq!(app.unique_workspace_name("Backend"), "Backend 2");
+        app.workspace_tabs
+            .push(WorkspaceTab::empty("Backend 2".to_string()));
+        assert_eq!(app.unique_workspace_name("Backend"), "Backend 3");
+    }
+
+    #[test]
+    fn run_compound_with_workspace_opens_new_named_tab() {
+        let mut app = manager_with_configs(&["A", "B", "Bundle"]);
+        let a_id = app.configurations[0].id;
+        let b_id = app.configurations[1].id;
+        app.configurations[2].type_data = ConfigTypeData::Compound {
+            members: vec![a_id, b_id],
+            workspace: Some("Backend".to_string()),
+        };
+        let tabs_before = app.workspace_tabs.len();
+
+        let _ = app.handle_run_configuration(Some(2));
+
+        assert_eq!(
+            app.workspace_tabs.len(),
+            tabs_before + 1,
+            "workspace 지정 시 새 탭 생성"
+        );
+        assert_eq!(
+            app.workspace_tabs[app.selected_tab_index].name, "Backend",
+            "지정한 이름의 탭으로 전환"
+        );
+        assert_eq!(app.sessions.len(), 2, "멤버 2개가 실행됨");
     }
 
     #[test]

@@ -369,6 +369,10 @@ pub enum ConfigTypeData {
         /// 함께 실행할 멤버 구성들의 id (실행 순서는 무의미 — 동시 실행)
         #[serde(default)]
         members: Vec<Uuid>,
+        /// 실행 대상 workspace 탭의 base 이름. `None`/빈 문자열이면 현재 활성 탭에서 실행하고,
+        /// 지정하면 그 이름으로 새 탭을 만들어(동명 충돌 시 넘버링) 거기서 실행한다.
+        #[serde(default)]
+        workspace: Option<String>,
     },
 }
 
@@ -478,8 +482,17 @@ impl ConfigTypeData {
 
     /// Compound 변형이면 멤버 id 목록의 가변 참조 반환.
     pub fn compound_members_mut(&mut self) -> Option<&mut Vec<Uuid>> {
-        if let ConfigTypeData::Compound { members } = self {
+        if let ConfigTypeData::Compound { members, .. } = self {
             Some(members)
+        } else {
+            None
+        }
+    }
+
+    /// Compound 변형이면 실행 대상 workspace 탭 이름(Option)의 가변 참조 반환.
+    pub fn compound_workspace_mut(&mut self) -> Option<&mut Option<String>> {
+        if let ConfigTypeData::Compound { workspace, .. } = self {
+            Some(workspace)
         } else {
             None
         }

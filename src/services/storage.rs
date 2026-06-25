@@ -87,7 +87,8 @@ struct ConfigFile {
 /// 버전 envelope을 현재 스키마로 마이그레이션.
 ///
 /// 현재까지의 변경은 구조 수준에서 forward-compatible(미지 필드 무시, 누락 옵션 기본값)
-/// 하므로 데이터 변환은 없다. 향후 호환 불가 변경 시 버전별 변환을 여기에 추가한다.
+/// 하므로 데이터 변환은 없다. 예: `Compound.workspace`(Option, serde default) 추가는 구·신
+/// 버전 양방향 호환된다. 향후 호환 불가 변경 시 버전별 변환을 여기에 추가한다.
 /// 앱이 지원하는 버전보다 새 파일은 손상시키지 않도록 명확한 에러로 거부한다.
 fn migrate_config_file(file: ConfigFile) -> Result<Vec<RunConfiguration>, String> {
     if file.version > CURRENT_CONFIG_VERSION {

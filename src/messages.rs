@@ -48,6 +48,8 @@ pub enum Message {
     CompoundMemberAdded(Uuid),
     /// Compound 구성에서 멤버 제거
     CompoundMemberRemoved(Uuid),
+    /// Compound 구성의 실행 대상 workspace 탭 이름 변경 (빈 문자열이면 현재 탭에서 실행)
+    CompoundWorkspaceChanged(String),
     /// 명령어 변경
     CommandChanged(String),
     /// 인자 변경

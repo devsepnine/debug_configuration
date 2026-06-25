@@ -155,8 +155,8 @@ pub fn view_configuration_editor<'a>(
                 is_loading_project_directory: loading.node.project_directory,
             },
         ),
-        ConfigTypeData::Compound { members } => {
-            view_compound_fields(members, configurations, index)
+        ConfigTypeData::Compound { members, workspace } => {
+            view_compound_fields(members, workspace.as_deref(), configurations, index)
         }
     };
 
@@ -490,6 +490,7 @@ fn view_environment_bulk_input(env_bulk_text: &str) -> Element<'_, Message> {
 /// 나열하고 클릭으로 추가/제거하는 토글 리스트로 충분하다.
 fn view_compound_fields<'a>(
     members: &'a [Uuid],
+    workspace: Option<&'a str>,
     configurations: &'a [RunConfiguration],
     self_index: usize,
 ) -> Element<'a, Message> {
@@ -547,7 +548,18 @@ fn view_compound_fields<'a>(
         .into();
     }
 
+    let workspace_input = text_input(
+        "(optional) run in a workspace tab named…",
+        workspace.unwrap_or(""),
+    )
+    .on_input(Message::CompoundWorkspaceChanged)
+    .size(13)
+    .padding([6, 10])
+    .width(Length::Fill);
+
     column![
+        view_editor_row("Workspace:", workspace_input.into()),
+        Space::new().height(12),
         text(format!(
             "{member_count} selected — click to add/remove. Members run together when this compound runs."
         ))
