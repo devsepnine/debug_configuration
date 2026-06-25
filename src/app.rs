@@ -111,8 +111,8 @@ fn configuration_name_max_width(window_size: Size, split_ratio: f32) -> usize {
     const SELECTION_BAR_WIDTH: f32 = 2.0; // selection_bar 고정 폭
     const ACTION_BUTTONS_WIDTH: f32 = 72.0; // action button 24px × 3개 (Run/Clone/Delete)
     const SUMMARY_HORIZONTAL_PADDING: f32 = 16.0; // summary container padding [2, 8] 좌우
-    const TYPE_BADGE_WIDTH: f32 = 44.0; // 타입 배지 최대 폭 (보수적)
-    const BADGE_NAME_GAP: f32 = 8.0; // 배지-이름 사이 Space
+    const TYPE_ICON_WIDTH: f32 = 14.0; // 타입 아이콘 박스 폭 (type_icon BOX_SIZE)
+    const ICON_NAME_GAP: f32 = 6.0; // 아이콘-이름 사이 Space
     const SCROLLBAR_WIDTH: f32 = 4.0; // 세로 스크롤바 폭
 
     let list_reserved_width = ITEM_AREA_PADDING
@@ -120,8 +120,8 @@ fn configuration_name_max_width(window_size: Size, split_ratio: f32) -> usize {
         + SELECTION_BAR_WIDTH
         + ACTION_BUTTONS_WIDTH
         + SUMMARY_HORIZONTAL_PADDING
-        + TYPE_BADGE_WIDTH
-        + BADGE_NAME_GAP
+        + TYPE_ICON_WIDTH
+        + ICON_NAME_GAP
         + SCROLLBAR_WIDTH;
 
     // 이름 텍스트는 D2Coding 모노스페이스로 렌더되므로 측정 폭 = 실제 렌더 폭.

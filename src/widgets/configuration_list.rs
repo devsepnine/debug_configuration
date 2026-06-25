@@ -1,6 +1,9 @@
 use crate::messages::{ConfigurationDropPosition, Message};
 use crate::models::{ConfigurationType, RunConfiguration};
-use crate::utils::{ICON_COPY, ICON_DELETE, ICON_PLAY, truncate_text};
+use crate::utils::{
+    ICON_COPY, ICON_DELETE, ICON_PLAY, ICON_TYPE_APPLICATION, ICON_TYPE_COMPOUND, ICON_TYPE_NODE,
+    ICON_TYPE_SHELL, truncate_text,
+};
 use iced::{
     Alignment::{self},
     Background, Border, Color, Element, Length, Padding, Shadow, Theme, Vector,
@@ -285,8 +288,8 @@ fn view_configuration_summary(
 
     container(
         row![
-            container(type_label(config.config_type(), is_selected)).center_y(Length::Fill),
-            Space::new().width(8),
+            container(type_icon(config.config_type(), is_selected)).center_y(Length::Fill),
+            Space::new().width(6),
             name_with_tooltip,
         ]
         .align_y(Alignment::Center)
@@ -299,41 +302,46 @@ fn view_configuration_summary(
     .into()
 }
 
-fn type_label(
+/// 구성 타입을 나타내는 아이콘 뱃지. 배경 없이 아이콘 자체에 타입별 색을 입혀
+/// (APP=primary, SH=success, Node=danger, Multi=secondary) 한눈에 구분되게 한다.
+fn type_icon(
     config_type: ConfigurationType,
     is_selected: bool,
 ) -> iced::widget::Container<'static, Message> {
-    let label = match config_type {
-        ConfigurationType::Application => "APP",
-        ConfigurationType::ShellScript => "SH",
-        ConfigurationType::Node => "Node",
-        ConfigurationType::Compound => "Multi",
+    const ICON_SIZE: u16 = 14;
+    // 박스는 아이콘과 동일 크기(여백 없음). 둘을 같이 키우려면 ICON_SIZE만 조정한다.
+    const BOX_SIZE: u16 = ICON_SIZE;
+
+    let icon = match config_type {
+        ConfigurationType::Application => ICON_TYPE_APPLICATION,
+        ConfigurationType::ShellScript => ICON_TYPE_SHELL,
+        ConfigurationType::Node => ICON_TYPE_NODE,
+        ConfigurationType::Compound => ICON_TYPE_COMPOUND,
     };
 
-    container(themed_badge_text(label, is_selected))
-        .padding([2, 6])
-        .style(move |theme: &Theme| {
-            let palette = theme.extended_palette();
-            let base_color = match config_type {
-                ConfigurationType::Application => palette.primary.base.color,
-                ConfigurationType::ShellScript => palette.success.base.color,
-                ConfigurationType::Node => palette.danger.base.color,
-                ConfigurationType::Compound => palette.secondary.base.color,
-            };
+    container(
+        svg(svg::Handle::from_memory(icon))
+            .width(u32::from(ICON_SIZE))
+            .height(u32::from(ICON_SIZE))
+            .style(move |theme: &Theme, _status| {
+                let palette = theme.extended_palette();
+                let base_color = match config_type {
+                    ConfigurationType::Application => palette.primary.base.color,
+                    ConfigurationType::ShellScript => palette.success.base.color,
+                    ConfigurationType::Node => palette.danger.base.color,
+                    ConfigurationType::Compound => palette.secondary.base.color,
+                };
 
-            container::Style {
-                background: Some(Background::Color(Color {
-                    a: if is_selected { 0.32 } else { 0.24 },
-                    ..base_color
-                })),
-                border: Border {
-                    radius: 999.0.into(),
-                    width: 0.0,
-                    color: Color::TRANSPARENT,
-                },
-                ..container::Style::default()
-            }
-        })
+                svg::Style {
+                    color: Some(Color {
+                        a: if is_selected { 0.95 } else { 0.72 },
+                        ..base_color
+                    }),
+                }
+            }),
+    )
+    .width(u32::from(BOX_SIZE))
+    .height(u32::from(BOX_SIZE))
 }
 
 /// 이름 전체를 보여주는 hover 툴팁. `box_width`는 anchor 이름 영역 폭과 맞춰
@@ -427,17 +435,6 @@ fn themed_name_text(label: String, is_selected: bool) -> iced::widget::Text<'sta
         .style(move |theme: &Theme| iced::widget::text::Style {
             color: Some(Color {
                 a: if is_selected { 0.94 } else { 0.74 },
-                ..theme.extended_palette().background.base.text
-            }),
-        })
-}
-
-fn themed_badge_text(label: &'static str, is_selected: bool) -> iced::widget::Text<'static, Theme> {
-    text(label)
-        .size(10)
-        .style(move |theme: &Theme| iced::widget::text::Style {
-            color: Some(Color {
-                a: if is_selected { 0.86 } else { 0.64 },
                 ..theme.extended_palette().background.base.text
             }),
         })

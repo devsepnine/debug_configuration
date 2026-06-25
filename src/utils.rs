@@ -90,6 +90,12 @@ pub fn truncate_text(name: &str, max_width: usize) -> String {
 // Configuration List
 pub const ICON_PLAY: &[u8] = include_bytes!("../assets/mingcute--play-fill.svg");
 
+// Configuration List - 구성 타입 뱃지 아이콘
+pub const ICON_TYPE_APPLICATION: &[u8] = include_bytes!("../assets/app--type-application.svg");
+pub const ICON_TYPE_SHELL: &[u8] = include_bytes!("../assets/app--type-shell.svg");
+pub const ICON_TYPE_NODE: &[u8] = include_bytes!("../assets/app--type-node.svg");
+pub const ICON_TYPE_COMPOUND: &[u8] = include_bytes!("../assets/app--type-compound.svg");
+
 // Pane View
 pub const ICON_REFRESH: &[u8] = include_bytes!("../assets/mingcute--refresh-1-fill.svg");
 pub const ICON_STOP: &[u8] = include_bytes!("../assets/mingcute--stop-fill.svg");
