@@ -124,6 +124,11 @@ struct ScrollState {
     cached_max_chars: usize,
     /// 캐시를 만든 콘텐츠/필터 키. 불일치 시 재생성.
     cached_render_key: RenderKey,
+    /// 캐시를 만든 시점의 첫/마지막 표시 줄 line_id. 필터 off 스트리밍에서 line_id 범위
+    /// 변화로 evict/append 줄 수를 추론해 wrap 캐시를 증분 갱신(③)하고, evict된 만큼
+    /// offset을 보정(②)하는 데 쓴다. None이면 증분 불가(전체 재빌드).
+    cached_first_line_id: Option<usize>,
+    cached_last_line_id: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -156,6 +161,10 @@ struct TerminalCanvas<'a> {
     /// 검색 점프 1회성 목표(논리줄 인덱스). `Some`이면 update()에서 wrapped offset으로
     /// 변환해 스크롤하고, publish로 app측 목표를 클리어한다(이슈 1).
     scroll_target: Option<usize>,
+    /// 현재 표시 줄들의 첫/마지막 line_id(빈 버퍼면 None). 필터 off일 때 line_id 범위로
+    /// evict/append를 추론해 wrap 캐시를 증분 갱신(③)하고 offset을 보정(②)한다.
+    first_line_id: Option<usize>,
+    last_line_id: Option<usize>,
     /// 가상화 wrap 캐시 무효화 키. 이 키가 같으면 `prepare_lines` 결과(=`lines`)도
     /// 동일하므로 캐시를 재사용한다.
     render_key: RenderKey,
@@ -400,10 +409,18 @@ impl<'a> TerminalCanvas<'a> {
 
     /// 키(가로폭/콘텐츠·필터 버전)가 바뀌었을 때만 줄별 래핑 행 수 캐시를 재생성한다.
     /// `update()`에서 `&mut State`로 매 프레임 호출되며, 키가 같으면 즉시 반환한다.
-    fn rebuild_wrap_cache_if_needed(&self, state: &mut ScrollState, max_chars: usize) {
+    /// wrap 캐시를 최신화하고, 이번에 앞에서 evict된 줄들의 래핑 행 수 합을 반환한다.
+    /// (호출자가 위로 스크롤된 offset을 그만큼 당겨 보던 위치를 유지하는 데 쓴다 — ②.)
+    /// 캐시가 이미 유효하거나 전체 재빌드한 경우 0.
+    fn rebuild_wrap_cache_if_needed(&self, state: &mut ScrollState, max_chars: usize) -> usize {
         if self.wrap_cache_valid(state, max_chars) {
-            return;
+            return 0;
         }
+        // 필터 off 스트리밍처럼 줄 집합이 앞에서 evict + 뒤로 append로만 바뀐 경우 증분 갱신(③).
+        if let Some(evicted_wrapped) = self.try_incremental_wrap_update(state, max_chars) {
+            return evicted_wrapped;
+        }
+        // 그 외(가로폭/필터/검색어 변경, clear, 캐시 없음)는 전체 재생성.
         state.line_counts = self
             .lines
             .iter()
@@ -412,6 +429,59 @@ impl<'a> TerminalCanvas<'a> {
         state.cached_total = Self::wrapped_total(&state.line_counts);
         state.cached_max_chars = max_chars;
         state.cached_render_key = self.render_key.clone();
+        state.cached_first_line_id = self.first_line_id;
+        state.cached_last_line_id = self.last_line_id;
+        0
+    }
+
+    /// 줄 집합이 "앞에서 evict + 뒤로 append"로만 바뀌었는지 line_id 범위로 판정하고, 그렇다면
+    /// `line_counts`를 증분 갱신한다(전체 O(n) 재계산 대신 추가된 줄만 wrap 계산 — ③).
+    /// 반환: 앞에서 제거된 줄들의 래핑 행 수 합(offset 보정용). 증분 불가면 None(전체 재빌드).
+    ///
+    /// 조건: 가로폭 동일 + 필터/검색어 동일 + 필터 off(필터 on이면 표시 줄이 line_id 비연속
+    /// 부분집합이라 추론 불가) + 이전 line_id 캐시 존재 + 정합성(추론한 길이 == 실제 줄 수).
+    fn try_incremental_wrap_update(&self, state: &mut ScrollState, max_chars: usize) -> Option<usize> {
+        if state.cached_max_chars != max_chars
+            || self.render_key.filter
+            || state.cached_render_key.filter != self.render_key.filter
+            || state.cached_render_key.query != self.render_key.query
+        {
+            return None;
+        }
+        let cached_first = state.cached_first_line_id?;
+        let cached_last = state.cached_last_line_id?;
+        let cur_first = self.first_line_id?;
+        let cur_last = self.last_line_id?;
+
+        // line_id는 단조 증가하고 evict는 앞에서만 일어난다. 범위 변화로 evict/append 수를 구한다.
+        let evicted = cur_first.checked_sub(cached_first)?;
+        let appended = cur_last.checked_sub(cached_last)?;
+        // 줄 범위 변화가 전혀 없는데 캐시 미스(content_version 변경)로 여기 도달한 경우:
+        // 기존 줄의 in-place 변경이거나 세션 전환/재시작으로 line_id가 우연히 겹친 경우다.
+        // 증분으로는 그 변화를 반영할 수 없으므로(stale 캐시 위험) 전체 재빌드에 맡긴다.
+        if evicted == 0 && appended == 0 {
+            return None;
+        }
+        let old_len = state.line_counts.len();
+        // 정합성: 추론한 새 길이가 실제 표시 줄 수와 같아야 한다(아니면 clear/재배열 → 전체 재빌드).
+        let expected_len = old_len.checked_sub(evicted)?.checked_add(appended)?;
+        if expected_len != self.lines.len() {
+            return None;
+        }
+
+        // 앞에서 evicted개 제거(그 행 수 합이 offset 보정량), 뒤에 append된 줄만 wrap 계산.
+        let evicted_wrapped: usize = state.line_counts.drain(..evicted).map(|c| c as usize).sum();
+        let appended_start = self.lines.len() - appended;
+        for line in &self.lines[appended_start..] {
+            state
+                .line_counts
+                .push(Self::calculate_wrapped_count(line, max_chars) as u32);
+        }
+        state.cached_total = Self::wrapped_total(&state.line_counts);
+        state.cached_render_key = self.render_key.clone();
+        state.cached_first_line_id = self.first_line_id;
+        state.cached_last_line_id = self.last_line_id;
+        Some(evicted_wrapped)
     }
 
     /// 한 줄의 최대 display width 계산
@@ -532,7 +602,13 @@ impl<'a> canvas::Program<Message> for TerminalCanvas<'a> {
             let available_width = bounds.width - (HORIZONTAL_PADDING * 2.0);
             Self::calculate_max_chars(available_width, get_char_width())
         };
-        self.rebuild_wrap_cache_if_needed(state, max_chars);
+        let evicted_wrapped = self.rebuild_wrap_cache_if_needed(state, max_chars);
+        // 위로 스크롤된 상태에서 앞 줄이 evict되면(스트리밍) 같은 offset이 다른 줄을 가리켜
+        // 화면이 점프한다(②). evict된 행 수만큼 offset을 당겨 보던 위치를 유지한다. auto_scroll
+        // 중에는 어차피 맨 아래로 재고정되므로 보정하지 않는다.
+        if !self.auto_scroll && evicted_wrapped > 0 {
+            state.offset = (state.offset - evicted_wrapped as f32).max(0.0);
+        }
 
         if let Some(action) = self.initialize_scroll_state(state, bounds) {
             return Some(action);
@@ -742,6 +818,10 @@ impl<'a> TerminalCanvas<'a> {
 
         state.last_session_id = Some(self.session_id);
         state.is_initialized = true;
+        // wrap 캐시(line_counts·cached_first/last_line_id)는 여기서 리셋하지 않는다. 세션이
+        // 바뀌면 content_version/줄 수가 달라 rebuild_wrap_cache_if_needed가 캐시 미스로
+        // 전체 재빌드하며 자연스럽게 새 세션 기준으로 갱신되고, 증분 경로도 line_id 범위
+        // 불일치(checked_sub None / 변화 0 가드)로 차단되므로 명시적 리셋이 불필요하다.
 
         let metrics = self.scroll_metrics(state, bounds);
         state.offset =
@@ -1729,6 +1809,8 @@ pub fn view_terminal_for_session(session: &RunSession, is_dragging: bool) -> Ele
         initial_scroll_progress: session.scroll_progress,
         auto_scroll: session.auto_scroll,
         scroll_target: session.scroll_target,
+        first_line_id: session.output_lines.front().map(|(id, _)| *id),
+        last_line_id: session.output_lines.back().map(|(id, _)| *id),
         render_key: render_key_for(session),
     })
     .width(Length::Fill)
@@ -1849,6 +1931,8 @@ mod tests {
                 initial_scroll_progress: 1.0,
                 auto_scroll,
                 scroll_target: None,
+                first_line_id: None,
+                last_line_id: None,
                 render_key: RenderKey::default(),
             },
             id,
@@ -2017,6 +2101,8 @@ mod tests {
             initial_scroll_progress: 0.0,
             auto_scroll: false,
             scroll_target: Some(3),
+            first_line_id: None,
+            last_line_id: None,
             render_key: RenderKey::default(),
         };
         let bounds = test_bounds();
@@ -2058,6 +2144,134 @@ mod tests {
         // 정상 비율(절반 가시)은 비율 그대로 적용.
         let half = TerminalCanvas::scrollbar_thumb_height(50.0, 100.0, 400.0);
         assert!((half - 200.0).abs() < 1e-3, "절반 가시 → 트랙 절반 (half={half})");
+    }
+
+    /// line_id 범위를 지정한 테스트용 캔버스(증분 wrap 갱신·offset 보정 검증용). 필터 off.
+    fn canvas_with_ids(texts: Vec<String>, first_id: usize, content_version: u64) -> TerminalCanvas<'static> {
+        let n = texts.len();
+        let last_id = first_id + n.saturating_sub(1);
+        TerminalCanvas {
+            lines: texts
+                .into_iter()
+                .map(|t| LineRef::Owned(vec![TextSegment::new(t)]))
+                .collect(),
+            highlights: vec![LineHighlight::None; n],
+            session_id: Uuid::new_v4(),
+            initial_scroll_progress: 1.0,
+            auto_scroll: false,
+            scroll_target: None,
+            first_line_id: Some(first_id),
+            last_line_id: Some(last_id),
+            render_key: RenderKey {
+                content_version,
+                filter: false,
+                query: String::new(),
+            },
+        }
+    }
+
+    fn test_max_chars() -> usize {
+        TerminalCanvas::calculate_max_chars(
+            test_bounds().width - HORIZONTAL_PADDING * 2.0,
+            get_char_width(),
+        )
+    }
+
+    /// 줄마다 길이를 달리해 wrap 행 수가 줄별로 다르도록 한다.
+    fn varied_texts(range: std::ops::Range<usize>) -> Vec<String> {
+        range.map(|i| "x".repeat((i % 4 + 1) * 40)).collect()
+    }
+
+    /// 회귀 방지(③): 앞 evict + 뒤 append만 일어난 경우 증분 갱신이 전체 재빌드와 동일한
+    /// line_counts/total을 만들고, 반환한 evicted_wrapped가 제거된 앞 줄들의 행 합과 같다.
+    #[test]
+    fn incremental_wrap_update_matches_full_rebuild() {
+        let mc = test_max_chars();
+
+        let mut state = ScrollState::default();
+        let c1 = canvas_with_ids(varied_texts(0..5), 0, 1);
+        assert_eq!(
+            c1.rebuild_wrap_cache_if_needed(&mut state, mc),
+            0,
+            "첫 빌드는 evict 없음"
+        );
+        let evicted_first_two: usize = state.line_counts[..2].iter().map(|&c| c as usize).sum();
+
+        // [2..7]: id 0,1 evict + id 5,6 append.
+        let c2 = canvas_with_ids(varied_texts(2..7), 2, 2);
+        let evicted_wrapped = c2.rebuild_wrap_cache_if_needed(&mut state, mc);
+        let incremental = state.line_counts.clone();
+
+        assert_eq!(
+            evicted_wrapped, evicted_first_two,
+            "evicted_wrapped == 제거된 앞 2줄의 wrap 행 합"
+        );
+
+        // 동일 내용을 처음부터 전체 재빌드한 결과와 일치해야 한다.
+        let mut state_full = ScrollState::default();
+        let c2_full = canvas_with_ids(varied_texts(2..7), 2, 2);
+        c2_full.rebuild_wrap_cache_if_needed(&mut state_full, mc);
+
+        assert_eq!(incremental, state_full.line_counts, "증분 == 전체 재빌드");
+        assert_eq!(state.cached_total, state_full.cached_total, "총 행 수도 동일");
+    }
+
+    /// 회귀 방지(②): 위로 스크롤된 상태에서 앞 줄이 evict되면 offset을 그만큼 당겨 보던
+    /// 위치를 유지한다(eviction-jump 방지).
+    #[test]
+    fn eviction_shifts_offset_up_to_preserve_view() {
+        let bounds = test_bounds();
+        let mc = test_max_chars();
+
+        let mut state = ScrollState::default();
+        let c1 = canvas_with_ids(varied_texts(0..60), 0, 1);
+        c1.rebuild_wrap_cache_if_needed(&mut state, mc);
+        let evicted_rows: f32 = state.line_counts[..2].iter().map(|&c| c as f32).sum();
+
+        // [2..62]: id 0,1 evict. auto_scroll=false(위로 스크롤한 상태) + 초기화 완료로 표시.
+        let c2 = canvas_with_ids(varied_texts(2..62), 2, 2);
+        state.last_session_id = Some(c2.session_id);
+        state.is_initialized = true;
+        state.offset = 20.0;
+
+        let redraw = Event::Window(window::Event::RedrawRequested(std::time::Instant::now()));
+        let _ = c2.update(&mut state, &redraw, bounds, cursor_inside());
+
+        assert!(
+            (state.offset - (20.0 - evicted_rows)).abs() < 1e-3,
+            "evict된 행 수만큼 offset이 당겨져야 함 (offset={}, expected={})",
+            state.offset,
+            20.0 - evicted_rows
+        );
+    }
+
+    /// 회귀 방지(CRITICAL 방어): line_id 범위가 그대로인데 내용만 바뀐 비정상 입력에서는
+    /// 증분을 건너뛰고 전체 재빌드해야 한다(stale wrap 캐시 방지). 실제 add_output_line
+    /// 모델에선 발생하지 않지만, in-place 변경/세션 전환 우연 일치에 대한 안전장치.
+    #[test]
+    fn incremental_skips_and_rebuilds_when_line_id_range_unchanged() {
+        let mc = test_max_chars();
+        let mut state = ScrollState::default();
+
+        // 짧은 줄 5개(wrap 1행씩) 캐시.
+        let c1 = canvas_with_ids(vec!["x".repeat(40); 5], 0, 1);
+        c1.rebuild_wrap_cache_if_needed(&mut state, mc);
+        assert!(
+            state.line_counts.iter().all(|&c| c == 1),
+            "짧은 줄은 1행"
+        );
+
+        // 같은 line_id 범위(0..5)지만 내용이 긴 줄로 교체 + content_version만 증가.
+        // 증분이 스킵되고 전체 재빌드돼야 wrap 행 수가 갱신된다.
+        let c2 = canvas_with_ids(vec!["x".repeat(400); 5], 0, 2);
+        let evicted = c2.rebuild_wrap_cache_if_needed(&mut state, mc);
+
+        assert_eq!(evicted, 0, "범위 변화 없음 → evict 0");
+        assert_eq!(state.line_counts.len(), 5, "줄 수 유지");
+        assert!(
+            state.line_counts.iter().all(|&c| c > 1),
+            "내용 변경이 전체 재빌드로 반영돼 wrap 행 수가 갱신돼야 함(stale 아님)"
+        );
     }
 
     // ── S1/S3: 가상화 wrap 수학 (순수 함수) ─────────────────────────────────
