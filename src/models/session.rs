@@ -97,6 +97,10 @@ pub struct RunSession {
     pub process_pid: Option<u32>,
     /// 출력 검색/필터 상태 (검색바가 열려 있으면 `Some`)
     pub search: Option<SearchState>,
+    /// 검색 점프 1회성 목표 (논리줄 인덱스). 터미널 뷰가 이 값을 읽어 wrapped offset으로
+    /// 변환해 스크롤한 뒤, `SessionScrollChanged` 핸들러에서 `None`으로 클리어한다.
+    /// (app→terminal 역방향 스크롤 명령 경로 — 비율 기반으론 매치로 점프가 안 됐다)
+    pub scroll_target: Option<usize>,
 }
 
 impl std::fmt::Debug for RunSession {
@@ -140,6 +144,7 @@ impl RunSession {
             auto_scroll: true,    // 기본값: 자동 스크롤 활성화
             process_pid: None,
             search: None,
+            scroll_target: None,
         }
     }
 

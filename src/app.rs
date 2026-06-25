@@ -520,7 +520,7 @@ impl RunConfigManager {
             | Message::RerunFailedSessions
             | Message::CopyToClipboard(_)
             | Message::OpenUrl(_)
-            | Message::SessionScrollChanged(_, _)
+            | Message::SessionScrollChanged(_, _, _)
             | Message::ToggleAutoScroll(_)
             | Message::OpenSessionSearch(_)
             | Message::CloseSessionSearch(_)
@@ -675,8 +675,8 @@ impl RunConfigManager {
             Message::RerunFailedSessions => self.handle_rerun_failed_sessions(),
             Message::CopyToClipboard(text) => iced::clipboard::write(text),
             Message::OpenUrl(url) => self.handle_open_url(&url),
-            Message::SessionScrollChanged(session_id, progress) => {
-                self.handle_session_scroll_changed(session_id, progress)
+            Message::SessionScrollChanged(session_id, progress, at_bottom) => {
+                self.handle_session_scroll_changed(session_id, progress, at_bottom)
             }
             Message::ToggleAutoScroll(session_id) => self.handle_toggle_auto_scroll(session_id),
             Message::OpenSessionSearch(session_id) => self.handle_open_session_search(session_id),
@@ -1968,11 +1968,24 @@ impl RunConfigManager {
         Task::none()
     }
 
-    fn handle_session_scroll_changed(&mut self, session_id: Uuid, progress: f32) -> Task<Message> {
+    fn handle_session_scroll_changed(
+        &mut self,
+        session_id: Uuid,
+        progress: f32,
+        at_bottom: bool,
+    ) -> Task<Message> {
         if let Some(session) = self.session_by_id_mut(session_id) {
-            let clamped_progress = progress.clamp(0.0, 1.0);
-            session.scroll_progress = clamped_progress;
-            session.auto_scroll = clamped_progress >= 0.99;
+            session.scroll_progress = progress.clamp(0.0, 1.0);
+            // 검색 점프(scroll_target)가 아직 소비되지 않은 publish라면 auto_scroll을 건드리지
+            // 않는다. 마지막 매치가 바닥이면 at_bottom=true로 와서 자동 추적이 의도와 달리
+            // 켜지기 때문(점프는 search_step에서 auto_scroll=false로 둔다 — 이슈 1).
+            if session.scroll_target.is_none() {
+                // auto_scroll은 절대 거리 기반 at_bottom으로 판정한다(이슈 2). 사용자가 바닥에서
+                // 몇 줄만 위로 올려도 자동 추적이 풀려야 로그를 읽을 수 있다.
+                session.auto_scroll = at_bottom;
+            }
+            // 1회성 점프 목표 소비 완료 처리(이슈 1).
+            session.scroll_target = None;
         }
 
         Task::none()
@@ -2112,8 +2125,9 @@ impl RunConfigManager {
             };
             search.current
         };
-        // 매치 라인의 상대 위치로 스크롤하고 자동 스크롤은 해제.
-        // 0..=N-1 인덱스를 0.0..=1.0(1.0=맨 아래)로 매핑 (마지막 라인이 정확히 1.0).
+        // 매치 라인으로 점프한다. 논리줄 인덱스를 scroll_target에 실어 보내면 터미널 뷰가
+        // wrapped offset으로 변환해 스크롤한다(이슈 1). 비율 기반은 wrapping과 어긋날뿐더러
+        // 같은 세션에서는 offset에 반영조차 되지 않았다. 자동 추적은 해제.
         let Some(line) = session
             .search
             .as_ref()
@@ -2121,8 +2135,7 @@ impl RunConfigManager {
         else {
             return Task::none();
         };
-        let denom = session.output_lines.len().saturating_sub(1).max(1);
-        session.scroll_progress = (line as f32 / denom as f32).clamp(0.0, 1.0);
+        session.scroll_target = Some(line);
         session.auto_scroll = false;
         Task::none()
     }
@@ -3890,10 +3903,10 @@ mod tests {
         assert_eq!(search.matches, vec![1, 3]);
         assert_eq!(search.current, 0);
 
-        // next: current 0->1, scroll to match line 3 (3 / (4-1) = 1.0), auto_scroll off
+        // next: current 0->1, 매치 라인 3을 scroll_target으로 설정, auto_scroll off
         let _ = app.handle_session_search_step(sid, 1);
         assert_eq!(app.sessions[0].search.as_ref().unwrap().current, 1);
-        assert!((app.sessions[0].scroll_progress - 1.0).abs() < 1e-6);
+        assert_eq!(app.sessions[0].scroll_target, Some(3));
         assert!(!app.sessions[0].auto_scroll);
 
         // next wraps 1->0, prev wraps 0->1

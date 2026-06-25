@@ -149,6 +149,9 @@ struct TerminalCanvas<'a> {
     session_id: Uuid,
     initial_scroll_progress: f32,
     auto_scroll: bool,
+    /// 검색 점프 1회성 목표(논리줄 인덱스). `Some`이면 update()에서 wrapped offset으로
+    /// 변환해 스크롤하고, publish로 app측 목표를 클리어한다(이슈 1).
+    scroll_target: Option<usize>,
     /// 가상화 wrap 캐시 무효화 키. 이 키가 같으면 `prepare_lines` 결과(=`lines`)도
     /// 동일하므로 캐시를 재사용한다.
     render_key: RenderKey,
@@ -543,6 +546,10 @@ impl<'a> canvas::Program<Message> for TerminalCanvas<'a> {
         // auto_scroll=true이고 새 줄마다 max_scroll이 커져 항상 Some(재고정)을 반환했기에,
         // 휠 등 입력 이벤트가 match에 닿기 전에 영구히 선점되어 스크롤 자체가 불가능했다.
         if let Event::Window(window::Event::RedrawRequested(_)) = event {
+            // 검색 점프 목표가 있으면 auto_scroll 재고정보다 먼저 적용한다(이슈 1).
+            if let Some(action) = self.apply_scroll_target(state, metrics) {
+                return Some(action);
+            }
             return self.apply_auto_scroll(state, metrics);
         }
 
@@ -743,10 +750,49 @@ impl<'a> TerminalCanvas<'a> {
         Some(canvas::Action::request_redraw())
     }
 
+    /// 검색 점프 1회성 목표를 적용한다(이슈 1). 논리줄 인덱스를 `line_counts`로 wrapped
+    /// offset에 변환해 `offset`을 설정하고, app측 목표를 클리어하도록 `SessionScrollChanged`를
+    /// 발행한다. 목표가 없으면 None.
+    ///
+    /// 불변식: `line_counts`는 update 선두의 `rebuild_wrap_cache_if_needed`로 항상 `lines`와
+    /// 길이가 일치하므로 슬라이스 경계가 안전하다.
+    /// 한계: `scroll_target`은 `output_lines`의 현재 인덱스라, 실행 중 스트리밍으로 앞쪽 줄이
+    /// evict되면 stale해져 점프가 어긋날 수 있다(드묾·비치명적). 근본 해결은 line_id 기반
+    /// 앵커(deferred)로 다룬다.
+    fn apply_scroll_target(
+        &self,
+        state: &mut ScrollState,
+        metrics: ScrollMetrics,
+    ) -> Option<canvas::Action<Message>> {
+        let target_line = self.scroll_target?;
+        // 목표 줄 앞쪽 줄들의 래핑 행 수 합 = 목표 줄이 시작하는 wrapped offset.
+        let clamped_line = target_line.min(state.line_counts.len());
+        let wrapped_offset: usize = state.line_counts[..clamped_line]
+            .iter()
+            .map(|&c| c as usize)
+            .sum();
+        state.offset = (wrapped_offset as f32).clamp(0.0, metrics.max_scroll);
+        Some(self.publish_scroll_progress(state.offset, metrics.max_scroll))
+    }
+
+    /// offset이 바닥(맨 아래)에 충분히 가까운지 — 절대 거리로 판정한다(이슈 2). 비율
+    /// 임계치는 버퍼가 커질수록 바닥 근처 수백 줄을 "바닥"으로 오판해 auto_scroll이 풀리지
+    /// 않았다. 절대 거리면 바닥에서 한 줄만 올려도 false가 된다.
+    ///
+    /// `apply_auto_scroll`의 0.01과는 목적이 다르다: 여기 `BOTTOM_EPSILON`(0.5)은 "사용자가
+    /// 바닥을 벗어났는가"(auto_scroll 해제) 판정이고, 0.01은 "이미 바닥이라 재고정 불필요"
+    /// (부동소수점 흡수)라 값이 다르다.
+    fn is_at_bottom(offset: f32, max_scroll: f32) -> bool {
+        // 바닥으로 간주할 최대 거리(래핑 행).
+        const BOTTOM_EPSILON: f32 = 0.5;
+        max_scroll <= 0.0 || (max_scroll - offset).abs() <= BOTTOM_EPSILON
+    }
+
     fn publish_scroll_progress(&self, offset: f32, max_scroll: f32) -> canvas::Action<Message> {
         canvas::Action::publish(Message::SessionScrollChanged(
             self.session_id,
             Self::scroll_progress(offset, max_scroll),
+            Self::is_at_bottom(offset, max_scroll),
         ))
     }
 
@@ -1666,6 +1712,7 @@ pub fn view_terminal_for_session(session: &RunSession, is_dragging: bool) -> Ele
         session_id: session.id,
         initial_scroll_progress: session.scroll_progress,
         auto_scroll: session.auto_scroll,
+        scroll_target: session.scroll_target,
         render_key: render_key_for(session),
     })
     .width(Length::Fill)
@@ -1785,6 +1832,7 @@ mod tests {
                 session_id: id,
                 initial_scroll_progress: 1.0,
                 auto_scroll,
+                scroll_target: None,
                 render_key: RenderKey::default(),
             },
             id,
@@ -1875,6 +1923,109 @@ mod tests {
         let _ = canvas.update(&mut state, &redraw, bounds, cursor_inside());
 
         assert_eq!(state.offset, 10.0, "auto_scroll=false면 재고정하지 않아야 함");
+    }
+
+    /// 회귀 방지(이슈 2): auto_scroll 해제는 비율이 아닌 절대 거리로 판정해야 한다. 대량
+    /// 버퍼에서 비율 임계치(과거 0.99)는 바닥 근처 수백 줄을 모두 "바닥"으로 오판해, 위로
+    /// 스크롤해도 자동 추적이 풀리지 않았다.
+    #[test]
+    fn at_bottom_uses_absolute_distance_not_ratio() {
+        let max_scroll = 50_000.0; // 5만 래핑 행
+
+        assert!(
+            TerminalCanvas::is_at_bottom(max_scroll, max_scroll),
+            "정확히 바닥은 at_bottom"
+        );
+        assert!(
+            TerminalCanvas::is_at_bottom(max_scroll - 0.4, max_scroll),
+            "0.4행 위는 바닥으로 간주(부동소수점 여유)"
+        );
+        assert!(
+            !TerminalCanvas::is_at_bottom(max_scroll - 1.0, max_scroll),
+            "1행만 위로 올려도 바닥 아님 → auto_scroll 해제"
+        );
+        assert!(
+            !TerminalCanvas::is_at_bottom(max_scroll - 500.0, max_scroll),
+            "500행 위(비율로는 progress=0.99 → 과거 '바닥' 오판 구간)는 바닥 아님"
+        );
+        assert!(
+            TerminalCanvas::is_at_bottom(0.0, 0.0),
+            "스크롤 불가 버퍼는 항상 바닥"
+        );
+    }
+
+    /// 회귀 방지(이슈 1): 검색 점프(scroll_target)는 논리줄 인덱스를 wrapped offset으로
+    /// 변환해 실제 offset에 반영해야 한다. 과거엔 scroll_progress만 바뀌고 offset에 반영되는
+    /// 경로가 없어 화면이 움직이지 않았다.
+    #[test]
+    fn scroll_target_jumps_to_logical_line_offset() {
+        // 짧은 줄(래핑 없음) 200개 → 줄당 1행이므로 논리줄 인덱스 == wrapped offset.
+        let (mut canvas, id) = canvas_with_lines(200, false);
+        let bounds = test_bounds();
+        let mut state = ready_state(id);
+
+        let max_scroll = canvas.scroll_metrics(&state, bounds).max_scroll;
+        assert!(max_scroll > 10.0, "테스트 전제: 10행 위로 점프 가능한 버퍼");
+
+        canvas.scroll_target = Some(10);
+        let redraw = Event::Window(window::Event::RedrawRequested(std::time::Instant::now()));
+        let action = canvas.update(&mut state, &redraw, bounds, cursor_inside());
+
+        assert!(
+            action.is_some(),
+            "점프 시 SessionScrollChanged를 발행해 app측 목표를 클리어해야 함"
+        );
+        assert!(
+            (state.offset - 10.0).abs() < 1e-6,
+            "scroll_target=10 → offset 10.0 (offset={})",
+            state.offset
+        );
+    }
+
+    /// 회귀 방지(이슈 1): 줄이 여러 행으로 래핑될 때, scroll_target은 단순 논리줄 인덱스가
+    /// 아니라 앞쪽 줄들의 누적 래핑 행 수(line_counts 합)로 변환돼야 한다. 1:1 케이스만으론
+    /// 변환 로직(논리줄→wrapped offset)이 검증되지 않는다.
+    #[test]
+    fn scroll_target_jumps_to_wrapped_offset_with_multiline_wrapping() {
+        let id = Uuid::new_v4();
+        // test_bounds(800px 폭)에서 여러 행으로 래핑되는 긴 줄 30개.
+        let long = "x".repeat(600);
+        let lines: Vec<LineRef<'static>> = (0..30)
+            .map(|_| LineRef::Owned(vec![TextSegment::new(long.clone())]))
+            .collect();
+        let highlights = vec![LineHighlight::None; 30];
+        let canvas = TerminalCanvas {
+            lines,
+            highlights,
+            session_id: id,
+            initial_scroll_progress: 0.0,
+            auto_scroll: false,
+            scroll_target: Some(3),
+            render_key: RenderKey::default(),
+        };
+        let bounds = test_bounds();
+        let mut state = ready_state(id);
+
+        let redraw = Event::Window(window::Event::RedrawRequested(std::time::Instant::now()));
+        let _ = canvas.update(&mut state, &redraw, bounds, cursor_inside());
+
+        // 모든 줄이 동일 길이 → 줄당 래핑 행 수 동일. 1보다 커야(실제 래핑) 의미가 있다.
+        let per_line = state.line_counts[0] as f32;
+        assert!(
+            per_line > 1.0,
+            "테스트 전제: 줄이 여러 행으로 래핑돼야 함 (per_line={per_line})"
+        );
+        let max_scroll = canvas.scroll_metrics(&state, bounds).max_scroll;
+        let expected = state.line_counts[..3]
+            .iter()
+            .map(|&c| c as f32)
+            .sum::<f32>()
+            .clamp(0.0, max_scroll);
+        assert!(
+            (state.offset - expected).abs() < 1e-3,
+            "scroll_target=3 → 앞 3줄 누적 래핑 행 offset (offset={}, expected={expected})",
+            state.offset
+        );
     }
 
     // ── S1/S3: 가상화 wrap 수학 (순수 함수) ─────────────────────────────────

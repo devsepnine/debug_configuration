@@ -216,8 +216,10 @@ pub enum Message {
     CopyToClipboard(String),
 
     // 스크롤 위치 관리
-    /// 세션의 스크롤 위치 변경 (세션 ID, 스크롤 진행률 0.0~1.0)
-    SessionScrollChanged(Uuid, f32),
+    /// 세션의 스크롤 위치 변경 (세션 ID, 스크롤 진행률 0.0~1.0, 바닥 도달 여부)
+    /// `at_bottom`은 terminal이 절대 거리로 판정한다. 비율 임계치는 대량 버퍼에서
+    /// 바닥 근처 수백 줄을 모두 "바닥"으로 오판해 auto_scroll 해제가 안 됐다.
+    SessionScrollChanged(Uuid, f32, bool),
     /// 자동 스크롤 토글 (세션 ID)
     ToggleAutoScroll(Uuid),
 
