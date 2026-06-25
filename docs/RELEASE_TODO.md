@@ -13,21 +13,11 @@ This document tracks release work intentionally left after the initial GitHub Ac
 - macOS DMG packaging on macOS runners.
 - Linux tarball packaging with desktop entry, icon, and install script.
 - GPL-3.0 license metadata and `LICENSE` file.
+- Release quality gate: `release.yml` runs `check`, `clippy --all-targets -D warnings`, `test`, and `fmt --check` in a `quality` job, and packaging is gated on it via `needs: [validate, quality]`. (The per-OS `build` job keeps only `check` for fast platform-specific failure; the OS-agnostic `fmt` check is not duplicated there.)
 
 ## Remaining Work
 
-### 1. Add Release Quality Gate
-
-Mirror the `build.yml` quality job in `release.yml` before packaging:
-
-- `cargo check --locked`
-- `cargo clippy --locked --all-targets -- -D warnings`
-- `cargo test --locked`
-- `cargo fmt --all -- --check`
-
-Reason: manual releases should fail before OS packaging if the tagged source is not clean.
-
-### 2. Improve macOS Distribution
+### 1. Improve macOS Distribution
 
 - Add Apple code signing support.
 - Add notarization support.
@@ -36,7 +26,7 @@ Reason: manual releases should fail before OS packaging if the tagged source is 
 
 Reason: unsigned DMGs work for development distribution, but users will see Gatekeeper warnings.
 
-### 3. Improve Windows Installer Metadata
+### 2. Improve Windows Installer Metadata
 
 - Add a proper application icon.
 - Add `ARPPRODUCTICON` for Windows Apps & Features.
@@ -46,7 +36,7 @@ Reason: unsigned DMGs work for development distribution, but users will see Gate
 
 Reason: the current MSI is installable but still minimal.
 
-### 4. Improve Linux Packaging
+### 3. Improve Linux Packaging
 
 - Validate the release tarball on an Ubuntu runner after packaging.
 - Consider adding AppImage.
@@ -55,7 +45,7 @@ Reason: the current MSI is installable but still minimal.
 
 Reason: tarballs are useful for GitHub Releases, but Linux users often expect distro-style package channels.
 
-### 5. Version and Release Notes
+### 4. Version and Release Notes
 
 - Decide release versioning convention (`v0.1.0` or calendar-based).
 - Add a changelog process.
@@ -63,7 +53,7 @@ Reason: tarballs are useful for GitHub Releases, but Linux users often expect di
 
 Reason: the current workflow can publish releases, but the release process is still lightweight.
 
-### 6. Dependency and Security Checks
+### 5. Dependency and Security Checks
 
 - Add `cargo audit` or equivalent advisory scanning.
 - Add scheduled security workflow.

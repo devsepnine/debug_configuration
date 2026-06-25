@@ -159,9 +159,8 @@ jobs:
             desktop-file-utils \
             pkg-config
 
-      - name: Check formatting
-        run: cargo fmt --all -- --check
-
+      # fmt는 OS 무관이라 quality job(ubuntu)에서 이미 게이트했다. 여기선 OS별 컴파일을
+      # 빠르게 검증하는 check만 남긴다(바로 뒤 release 빌드보다 일찍 실패).
       - name: Check
         run: cargo check --locked
 
