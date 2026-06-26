@@ -25,7 +25,7 @@ Grab the latest pre-built binary for your platform from the [Releases page](http
 
 ### Configuration Management
 - Create, edit, clone, and delete run configurations
-- Select configuration type (Application, Shell Script, Node, Compound)
+- Select configuration type (Application, Shell Script, Node, Kotlin, Compound)
 - Compound type runs several configurations together as one group
 - Set command, arguments, and working directory
 - Manage environment variables (add, edit, delete)
@@ -38,6 +38,11 @@ Grab the latest pre-built binary for your platform from the [Releases page](http
 - Auto-scan package.json and parse scripts
 - Select or auto-detect package manager (npm, yarn, pnpm, bun)
 - Async initialization for fast app startup
+
+### Kotlin Support
+- Run Kotlin/JVM apps through `java` — Main class or JAR launch mode
+- Set VM options (e.g., `-Xmx2g`) and program arguments
+- Auto-detect JDKs (JAVA_HOME, SDKMAN, standard macOS/Linux/Windows locations) with manual override
 
 ### Execution Session Management
 - Run multiple sessions simultaneously

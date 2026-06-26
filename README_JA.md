@@ -25,7 +25,7 @@ Rust と iced GUI フレームワークで開発されたクロスプラット�
 
 ### 構成管理
 - 実行構成の作成、編集、複製、削除
-- 構成タイプの選択 (Application, Shell Script, Node, Compound)
+- 構成タイプの選択 (Application, Shell Script, Node, Kotlin, Compound)
 - Compound タイプは複数の構成をまとめて一括実行
 - コマンド、引数、作業ディレクトリの設定
 - 環境変数の管理 (追加、編集、削除)
@@ -38,6 +38,11 @@ Rust と iced GUI フレームワークで開発されたクロスプラット�
 - package.json の自動スキャンとスクリプトの解析
 - パッケージマネージャーの選択または自動検出 (npm, yarn, pnpm, bun)
 - 非同期初期化による高速起動
+
+### Kotlin サポート
+- `java` 経由で Kotlin/JVM アプリを実行 — Main class または JAR 起動モード
+- VM options (例: `-Xmx2g`) とプログラム引数の設定
+- JDK の自動検出 (JAVA_HOME, SDKMAN, macOS/Linux/Windows の標準的な場所) と手動指定
 
 ### 実行セッション管理
 - 複数セッションの同時実行

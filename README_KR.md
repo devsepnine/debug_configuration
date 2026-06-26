@@ -25,7 +25,7 @@ Rust와 iced GUI 프레임워크로 개발되었으며, 여러 프로그램 실�
 
 ### 구성 관리
 - 실행 구성 생성, 수정, 복제, 삭제
-- 구성 타입 선택 (Application, Shell Script, Node, Compound)
+- 구성 타입 선택 (Application, Shell Script, Node, Kotlin, Compound)
 - Compound 타입은 여러 구성을 묶어 한 번에 실행
 - 명령어, 인자, 작업 디렉토리 설정
 - 환경 변수 관리 (추가, 수정, 삭제)
@@ -38,6 +38,11 @@ Rust와 iced GUI 프레임워크로 개발되었으며, 여러 프로그램 실�
 - package.json 자동 스캔 및 scripts 파싱
 - 패키지 매니저 선택 또는 자동 감지 (npm, yarn, pnpm, bun)
 - 비동기 초기화로 빠른 앱 시작
+
+### Kotlin 지원
+- `java`로 Kotlin/JVM 앱 실행 — Main class 또는 JAR 실행 모드
+- VM options(예: `-Xmx2g`)와 프로그램 인자 설정
+- JDK 자동 감지 (JAVA_HOME, SDKMAN, macOS/Linux/Windows 표준 위치) + 수동 지정
 
 ### 실행 세션 관리
 - 다중 세션 동시 실행
