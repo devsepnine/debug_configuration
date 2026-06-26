@@ -2617,7 +2617,7 @@ impl RunConfigManager {
         let Some(line) = session
             .search
             .as_ref()
-            .and_then(|s| s.matches.get(new_current).copied())
+            .and_then(|s| s.matches.get(new_current).map(|m| m.line_idx))
         else {
             return Task::none();
         };
@@ -4743,7 +4743,14 @@ mod tests {
         let _ = app.handle_session_search_changed(sid, "error".to_string());
 
         let search = app.sessions[0].search.as_ref().unwrap();
-        assert_eq!(search.matches, vec![1, 3]);
+        assert_eq!(
+            search
+                .matches
+                .iter()
+                .map(|m| m.line_idx)
+                .collect::<Vec<_>>(),
+            vec![1, 3]
+        );
         assert_eq!(search.current, 0);
 
         // next: current 0->1, 매치 라인 3을 scroll_target으로 설정, auto_scroll off
@@ -4801,7 +4808,14 @@ mod tests {
             session.refresh_search_matches();
         }
         let search = app.sessions[0].search.as_ref().unwrap();
-        assert_eq!(search.matches, vec![0]);
+        assert_eq!(
+            search
+                .matches
+                .iter()
+                .map(|m| m.line_idx)
+                .collect::<Vec<_>>(),
+            vec![0]
+        );
         assert_eq!(search.current, 0);
     }
 

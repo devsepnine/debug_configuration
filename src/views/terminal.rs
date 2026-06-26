@@ -1,12 +1,12 @@
 use crate::messages::Message;
-use crate::models::RunSession;
+use crate::models::{RunSession, SearchMatch};
 use iced::{
     Border, Color, Element, Event, Length, Point, Rectangle, Renderer, Theme, border, keyboard,
     mouse,
     widget::{Canvas, canvas, container},
     window,
 };
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use unicode_width::UnicodeWidthChar;
 use uuid::Uuid;
 
@@ -154,8 +154,8 @@ struct TerminalCanvas<'a> {
     /// 렌더링할 줄들. 대부분 세션 버퍼를 빌린다(zero-copy) — `prepare_lines`가 매 view마다
     /// 모든 줄을 deep-clone하던 비용을 제거한다. 합성 줄("No lines match")만 Owned.
     lines: Vec<LineRef<'a>>,
-    /// `lines`와 1:1 대응하는 검색 하이라이트 종류 (매치/현재 매치/없음)
-    highlights: Vec<LineHighlight>,
+    /// `lines`와 1:1 대응하는 라인별 검색 매치 강조(글자 범위 단위)
+    highlights: Vec<LineSearch>,
     session_id: Uuid,
     initial_scroll_progress: f32,
     auto_scroll: bool,
@@ -189,16 +189,21 @@ impl std::ops::Deref for LineRef<'_> {
     }
 }
 
-/// 검색 시 라인 배경 하이라이트 종류.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-enum LineHighlight {
-    /// 하이라이트 없음
-    #[default]
-    None,
-    /// 검색어 매치 라인
-    Match,
-    /// 현재 선택된 매치 라인 (강조)
-    Current,
+/// 한 라인의 검색 매치 강조 정보 (`lines`와 1:1). 라인 전체가 아니라 매칭되는 글자(char
+/// 인덱스 범위)만 강조한다. 매치 없는 라인은 `ranges`가 비고 `current`는 `None`.
+#[derive(Debug, Clone, Default)]
+struct LineSearch {
+    /// 현재 매치를 제외한 일반 매치 char 범위들 (`start..end`, end exclusive)
+    ranges: Vec<(usize, usize)>,
+    /// 이 라인에 현재 선택된 매치가 있으면 그 char 범위 (더 진하게 강조)
+    current: Option<(usize, usize)>,
+}
+
+impl LineSearch {
+    /// 이 라인에 강조할 매치가 하나라도 있는지.
+    fn is_empty(&self) -> bool {
+        self.ranges.is_empty() && self.current.is_none()
+    }
 }
 
 impl<'a> TerminalCanvas<'a> {
@@ -1341,10 +1346,11 @@ impl<'a> TerminalCanvas<'a> {
         match_bg: Color,
         current_match_bg: Color,
     ) {
-        if self.highlights.iter().all(|h| *h == LineHighlight::None) {
+        if self.highlights.iter().all(LineSearch::is_empty) {
             return;
         }
 
+        let char_width = get_char_width();
         let partial_offset = state.offset.fract();
         let target_start_line = Self::f32_floor_to_usize(state.offset);
         let mut current_wrapped_line = 0;
@@ -1365,33 +1371,67 @@ impl<'a> TerminalCanvas<'a> {
                 break;
             }
 
-            let bg = match self.highlights.get(line_idx).copied().unwrap_or_default() {
-                LineHighlight::Current => Some(current_match_bg),
-                LineHighlight::Match => Some(match_bg),
-                LineHighlight::None => None,
-            };
+            let line_hl = self.highlights.get(line_idx);
+            let has_hl = line_hl.is_some_and(|h| !h.is_empty());
 
             if segments.iter().all(|s| s.text.is_empty()) {
-                // 빈 줄: 하이라이트 대상 아님. render_empty_line과 동일하게 카운팅.
+                // 빈 줄: 강조 대상 아님. render_empty_line과 동일하게 카운팅.
                 if current_wrapped_line >= target_start_line {
                     rendered_lines += 1;
                 }
                 current_wrapped_line += 1;
             } else {
+                // 강조가 있는 줄만 chunk를 계산해 매치 글자 위치를 픽셀로 변환한다(텍스트 패스의
+                // chunk 분할과 동일한 max_chars라 정렬이 일치).
+                let chars: Vec<char> = if has_hl {
+                    segments.iter().flat_map(|s| s.text.chars()).collect()
+                } else {
+                    Vec::new()
+                };
+                let chunks = if has_hl {
+                    Self::chunk_ranges(&chars, max_chars)
+                } else {
+                    Vec::new()
+                };
+
                 for chunk_idx in 0..wrapped_count {
                     let this_wrapped_line = current_wrapped_line + chunk_idx;
                     if this_wrapped_line >= target_start_line
                         && this_wrapped_line < target_start_line + visible_lines + 1
                     {
-                        if let Some(bg) = bg {
+                        if let Some(hl) = line_hl.filter(|_| has_hl)
+                            && let Some(&(chunk_start, chunk_end)) = chunks.get(chunk_idx)
+                        {
                             let y =
                                 (Self::usize_to_f32(rendered_lines) - partial_offset) * LINE_HEIGHT;
                             let y_aligned = y.round();
-                            let rect = canvas::Path::rectangle(
-                                Point::new(0.0, y_aligned + HORIZONTAL_PADDING),
-                                iced::Size::new(frame.width(), LINE_HEIGHT),
-                            );
-                            frame.fill(&rect, bg);
+                            // 일반 매치 먼저, 현재 매치를 그 위에 덧칠(더 진하게).
+                            for &(ms, me) in &hl.ranges {
+                                Self::fill_match_rect(
+                                    frame,
+                                    &chars,
+                                    chunk_start,
+                                    chunk_end,
+                                    ms,
+                                    me,
+                                    y_aligned,
+                                    char_width,
+                                    match_bg,
+                                );
+                            }
+                            if let Some((ms, me)) = hl.current {
+                                Self::fill_match_rect(
+                                    frame,
+                                    &chars,
+                                    chunk_start,
+                                    chunk_end,
+                                    ms,
+                                    me,
+                                    y_aligned,
+                                    char_width,
+                                    current_match_bg,
+                                );
+                            }
                         }
                         rendered_lines += 1;
                     }
@@ -1403,6 +1443,59 @@ impl<'a> TerminalCanvas<'a> {
                 break;
             }
         }
+    }
+
+    /// 매치 범위(`match_start..match_end`, char idx)가 chunk(`chunk_start..chunk_end`)와 겹치면
+    /// 그 부분만 배경 사각형으로 칠한다. 겹침이 없으면 아무것도 그리지 않는다.
+    #[allow(clippy::too_many_arguments)]
+    fn fill_match_rect(
+        frame: &mut canvas::Frame,
+        chars: &[char],
+        chunk_start: usize,
+        chunk_end: usize,
+        match_start: usize,
+        match_end: usize,
+        y_aligned: f32,
+        char_width: f32,
+        bg: Color,
+    ) {
+        let Some((x, w)) = Self::match_rect_in_chunk(
+            chars,
+            chunk_start,
+            chunk_end,
+            match_start,
+            match_end,
+            char_width,
+        ) else {
+            return;
+        };
+        let rect = canvas::Path::rectangle(
+            Point::new(x, y_aligned + HORIZONTAL_PADDING),
+            iced::Size::new(w, LINE_HEIGHT),
+        );
+        frame.fill(&rect, bg);
+    }
+
+    /// 매치 범위와 chunk의 겹침을 `(x_offset_px, width_px)`로 변환한다. 겹침이 없으면 `None`.
+    /// x/너비는 디스플레이 폭(unicode width) 기반이라 wide char(한글 등)에서도 정확하다.
+    fn match_rect_in_chunk(
+        chars: &[char],
+        chunk_start: usize,
+        chunk_end: usize,
+        match_start: usize,
+        match_end: usize,
+        char_width: f32,
+    ) -> Option<(f32, f32)> {
+        let overlap_start = match_start.max(chunk_start);
+        let overlap_end = match_end.min(chunk_end);
+        if overlap_start >= overlap_end {
+            return None;
+        }
+        let before: String = chars[chunk_start..overlap_start].iter().collect();
+        let matched: String = chars[overlap_start..overlap_end].iter().collect();
+        let x = HORIZONTAL_PADDING + Self::line_display_width_f32(&before) * char_width;
+        let w = Self::line_display_width_f32(&matched) * char_width;
+        Some((x, w))
     }
 
     fn render_lines(
@@ -1854,8 +1947,8 @@ pub fn view_terminal_for_session(session: &RunSession, is_dragging: bool) -> Ele
 /// 매칭은 대소문자 무시 부분일치(라인 단위). 필터 모드면 매치 라인만, 아니면 보관된 모든
 /// 줄을 표시한다(버퍼가 MAX_OUTPUT_LINES로 상한되고 가상화로 가시 영역만 그리므로 별도
 /// 렌더 상한/"older lines hidden" 헤더는 없다). 줄은 세션 버퍼를 빌려(zero-copy) 전달하며,
-/// 각 출력 라인의 위치 인덱스로 매치/현재 매치를 판정해 `LineHighlight`를 부여한다.
-fn prepare_lines(session: &RunSession) -> (Vec<LineRef<'_>>, Vec<LineHighlight>) {
+/// 각 출력 라인의 매치 글자 범위로 `LineSearch`(매치/현재 매치 강조)를 부여한다.
+fn prepare_lines(session: &RunSession) -> (Vec<LineRef<'_>>, Vec<LineSearch>) {
     use crate::ansi::TextSegment;
 
     let search = session.search.as_ref();
@@ -1863,51 +1956,56 @@ fn prepare_lines(session: &RunSession) -> (Vec<LineRef<'_>>, Vec<LineHighlight>)
     let active = search.is_some() && !query.is_empty();
     let filter = search.is_some_and(|s| s.filter);
 
-    // 매치 위치 인덱스는 app의 update에서 갱신된 캐시(search.matches)를 읽는다
+    // 매치 위치는 app의 update에서 갱신된 캐시(search.matches: 라인+char 범위)를 읽는다
     // (매 프레임 재스캔 방지). 빈 검색어면 캐시도 비어 있다.
-    let matches: &[usize] = search.map_or(&[], |s| s.matches.as_slice());
-    let match_set: HashSet<usize> = matches.iter().copied().collect();
-    let current_output_idx: Option<usize> = if matches.is_empty() {
+    let matches: &[SearchMatch] = search.map_or(&[], |s| s.matches.as_slice());
+    let current_match: Option<SearchMatch> = if matches.is_empty() {
         None
     } else {
         let cur = search.map_or(0, |s| s.current).min(matches.len() - 1);
         Some(matches[cur])
     };
-    let highlight_for = |output_idx: usize| -> LineHighlight {
-        if Some(output_idx) == current_output_idx {
-            LineHighlight::Current
-        } else if match_set.contains(&output_idx) {
-            LineHighlight::Match
+    // 라인별 매치 범위를 미리 그룹화한다(O(매치수)). 라인마다 전체 매치를 스캔하면 큰
+    // 출력에서 O(라인수 × 매치수)가 되므로 피한다. current 매치는 분리해 진하게 강조.
+    let mut by_line: HashMap<usize, LineSearch> = HashMap::new();
+    for m in matches {
+        let entry = by_line.entry(m.line_idx).or_default();
+        if current_match == Some(*m) {
+            entry.current = Some((m.start, m.end));
         } else {
-            LineHighlight::None
+            entry.ranges.push((m.start, m.end));
         }
-    };
+    }
 
     let mut lines: Vec<LineRef<'_>> = Vec::new();
     let mut highlights = Vec::new();
 
     if active && filter {
-        // 필터 모드: 매치 라인만 (출력 인덱스 유지로 현재 매치 강조). 매치가 없으면 안내
-        // 줄(버퍼에 없는 합성 줄)만 Owned로 추가한다.
+        // 필터 모드: 매치된 라인만(같은 라인의 매치가 여러 개여도 한 줄만, 입력 순서 유지).
+        // 매치가 없으면 안내 줄(버퍼에 없는 합성 줄)만 Owned로 추가한다.
         if matches.is_empty() {
             lines.push(LineRef::Owned(vec![TextSegment::new(format!(
                 "No lines match \"{query}\""
             ))]));
-            highlights.push(LineHighlight::None);
+            highlights.push(LineSearch::default());
+            return (lines, highlights);
         }
-        for &output_idx in matches {
-            if let Some((_, segments)) = session.output_lines.get(output_idx) {
+        let mut seen = HashSet::new();
+        for m in matches {
+            if seen.insert(m.line_idx)
+                && let Some((_, segments)) = session.output_lines.get(m.line_idx)
+            {
                 lines.push(LineRef::Ref(segments));
-                highlights.push(highlight_for(output_idx));
+                highlights.push(by_line.remove(&m.line_idx).unwrap_or_default());
             }
         }
         return (lines, highlights);
     }
 
-    // 일반 모드: 보관된 모든 줄을 빌려서 그대로 표시(zero-copy). 출력 인덱스로 하이라이트 판정.
+    // 일반 모드: 보관된 모든 줄을 빌려서 그대로 표시(zero-copy). 출력 인덱스로 매치 범위 판정.
     for (output_idx, (_, segments)) in session.output_lines.iter().enumerate() {
         lines.push(LineRef::Ref(segments));
-        highlights.push(highlight_for(output_idx));
+        highlights.push(by_line.remove(&output_idx).unwrap_or_default());
     }
 
     (lines, highlights)
@@ -1920,6 +2018,34 @@ mod tests {
     use iced::Size;
     use iced::widget::canvas::Program as _;
 
+    #[test]
+    fn match_rect_in_chunk_clips_and_uses_display_width() {
+        let chars: Vec<char> = "abcdef".chars().collect();
+        let cw = 10.0;
+        // chunk 0..6, 매치 2..4 → 앞 "ab"(폭 2)=20px 오프셋, "cd"(폭 2)=20px 너비
+        let (x, w) = TerminalCanvas::<'_>::match_rect_in_chunk(&chars, 0, 6, 2, 4, cw).unwrap();
+        assert_eq!(x, HORIZONTAL_PADDING + 20.0);
+        assert_eq!(w, 20.0);
+
+        // 매치가 chunk 밖이면 None
+        assert!(TerminalCanvas::<'_>::match_rect_in_chunk(&chars, 0, 2, 3, 5, cw).is_none());
+
+        // 매치가 chunk 경계를 넘으면 chunk 안으로 클리핑 (1..10 ∩ 0..3 = 1..3)
+        let (x2, w2) = TerminalCanvas::<'_>::match_rect_in_chunk(&chars, 0, 3, 1, 10, cw).unwrap();
+        assert_eq!(x2, HORIZONTAL_PADDING + 10.0); // 앞 "a"
+        assert_eq!(w2, 20.0); // "bc"
+    }
+
+    #[test]
+    fn match_rect_in_chunk_accounts_for_wide_chars() {
+        let chars: Vec<char> = "가나ab".chars().collect(); // 가/나 폭 2, a/b 폭 1
+        let cw = 10.0;
+        // 매치 2..4("ab"): 앞 "가나" 디스플레이 폭 4 → 40px, "ab" 폭 2 → 20px
+        let (x, w) = TerminalCanvas::<'_>::match_rect_in_chunk(&chars, 0, 4, 2, 4, cw).unwrap();
+        assert_eq!(x, HORIZONTAL_PADDING + 40.0);
+        assert_eq!(w, 20.0);
+    }
+
     /// 테스트용 캔버스: `n`개의 짧은 라인으로 구성 (래핑 없음 → total_wrapped == n).
     /// 합성(Owned) 줄로 만들어 세션 borrow 없이 'static 수명을 갖는다.
     fn canvas_with_lines(n: usize, auto_scroll: bool) -> (TerminalCanvas<'static>, Uuid) {
@@ -1927,7 +2053,7 @@ mod tests {
         let lines: Vec<LineRef<'static>> = (0..n)
             .map(|i| LineRef::Owned(vec![TextSegment::new(format!("line {i}"))]))
             .collect();
-        let highlights = vec![LineHighlight::None; n];
+        let highlights = vec![LineSearch::default(); n];
         (
             TerminalCanvas {
                 lines,
@@ -2101,7 +2227,7 @@ mod tests {
         let lines: Vec<LineRef<'static>> = (0..30)
             .map(|_| LineRef::Owned(vec![TextSegment::new(long.clone())]))
             .collect();
-        let highlights = vec![LineHighlight::None; 30];
+        let highlights = vec![LineSearch::default(); 30];
         let canvas = TerminalCanvas {
             lines,
             highlights,
@@ -2170,7 +2296,7 @@ mod tests {
                 .into_iter()
                 .map(|t| LineRef::Owned(vec![TextSegment::new(t)]))
                 .collect(),
-            highlights: vec![LineHighlight::None; n],
+            highlights: vec![LineSearch::default(); n],
             session_id: Uuid::new_v4(),
             initial_scroll_progress: 1.0,
             auto_scroll: false,
