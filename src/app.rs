@@ -3153,7 +3153,12 @@ impl RunConfigManager {
     fn view_window_resize_grips(&self) -> Element<'static, Message> {
         const GRIP: f32 = 5.0;
 
-        if self.is_window_maximized {
+        // macOS는 grip을 깔지 않는다. winit의 `drag_resize_window`이 macOS에서
+        // `NotSupported`라 grip을 잡아도 리사이즈가 시작되지 않고, resizable NSWindow의
+        // 네이티브 가장자리 리사이즈가 이미 동작한다. grip을 두면 커서만 바뀌고
+        // 동작하지 않는 5px 죽은 영역 + 네이티브 리사이즈 방해만 된다.
+        // Windows/Linux는 `drag_resize_window`이 동작하므로 grip을 유지한다.
+        if cfg!(target_os = "macos") || self.is_window_maximized {
             return container(Space::new())
                 .width(Length::Fill)
                 .height(Length::Fill)
