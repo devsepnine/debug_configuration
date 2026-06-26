@@ -213,15 +213,20 @@ where
         }
 
         if show_title {
-            self.content.as_widget().draw(
-                &tree.children[0],
-                renderer,
-                theme,
-                &inherited_style,
-                title_layout,
-                cursor,
-                viewport,
-            );
+            // Clip the title to its own (controls-excluded) bounds so a long
+            // session name/badge is truncated rather than spilling over the
+            // right-hand controls.
+            renderer.with_layer(title_layout.bounds(), |renderer| {
+                self.content.as_widget().draw(
+                    &tree.children[0],
+                    renderer,
+                    theme,
+                    &inherited_style,
+                    title_layout,
+                    cursor,
+                    viewport,
+                );
+            });
         }
     }
 
@@ -275,68 +280,77 @@ where
         let limits = limits.shrink(self.padding);
         let max_size = limits.max();
 
-        let title_layout = self.content.as_widget_mut().layout(
-            &mut tree.children[0],
-            renderer,
-            &layout::Limits::new(Size::ZERO, max_size),
-        );
-
-        let title_size = title_layout.size();
-
         let node = if let Some(controls) = &mut self.controls {
+            // Controls (the button row) must keep their natural size. Bounding
+            // them by `max_size` makes flex layout squish the fixed-size buttons;
+            // INFINITY keeps them at natural size (compact takes over when the
+            // full row doesn't fit).
             let controls_layout = controls.full.as_widget_mut().layout(
                 &mut tree.children[1],
                 renderer,
-                &layout::Limits::new(Size::ZERO, max_size),
+                &layout::Limits::new(Size::ZERO, Size::new(f32::INFINITY, max_size.height)),
             );
+            let controls_width = controls_layout.bounds().width;
 
-            if title_layout.bounds().width + controls_layout.bounds().width > max_size.width {
-                if let Some(compact) = controls.compact.as_mut() {
-                    let compact_layout = compact.as_widget_mut().layout(
-                        &mut tree.children[2],
-                        renderer,
-                        &layout::Limits::new(Size::ZERO, max_size),
-                    );
+            // Measure the title's natural width to decide full vs compact. The
+            // probe node is discarded; the title is re-laid-out below within the
+            // space left over by the controls so a long name/badge can never
+            // overlap the right-hand controls (⋯·close or the full button row).
+            let title_natural_width = self
+                .content
+                .as_widget_mut()
+                .layout(
+                    &mut tree.children[0],
+                    renderer,
+                    &layout::Limits::new(Size::ZERO, Size::new(f32::INFINITY, max_size.height)),
+                )
+                .bounds()
+                .width;
 
-                    let compact_size = compact_layout.size();
-                    let space_before_controls = max_size.width - compact_size.width;
-
-                    let height = title_size.height.max(compact_size.height);
-
-                    layout::Node::with_children(
-                        Size::new(max_size.width, height),
-                        vec![
-                            title_layout
-                                .move_to(Point::new(0.0, (height - title_size.height) / 2.0)),
-                            controls_layout,
-                            compact_layout.move_to(Point::new(
-                                space_before_controls,
-                                (height - compact_size.height) / 2.0,
-                            )),
-                        ],
-                    )
+            let (reserved, compact_layout) =
+                if title_natural_width + controls_width > max_size.width {
+                    if let Some(compact) = controls.compact.as_mut() {
+                        let compact_layout = compact.as_widget_mut().layout(
+                            &mut tree.children[2],
+                            renderer,
+                            &layout::Limits::new(Size::ZERO, max_size),
+                        );
+                        (compact_layout.bounds().width, Some(compact_layout))
+                    } else {
+                        // No compact: draw() hides the title and shows the full row.
+                        (controls_width, None)
+                    }
                 } else {
-                    let controls_size = controls_layout.size();
-                    let space_before_controls = max_size.width - controls_size.width;
+                    (controls_width, None)
+                };
 
-                    let height = title_size.height.max(controls_size.height);
+            // Re-lay-out the title constrained to the space left of the controls.
+            let title_avail = (max_size.width - reserved).max(0.0);
+            let title_layout = self.content.as_widget_mut().layout(
+                &mut tree.children[0],
+                renderer,
+                &layout::Limits::new(Size::ZERO, Size::new(title_avail, max_size.height)),
+            );
+            let title_size = title_layout.size();
 
-                    layout::Node::with_children(
-                        Size::new(max_size.width, height),
-                        vec![
-                            title_layout
-                                .move_to(Point::new(0.0, (height - title_size.height) / 2.0)),
-                            controls_layout.move_to(Point::new(
-                                space_before_controls,
-                                (height - controls_size.height) / 2.0,
-                            )),
-                        ],
-                    )
-                }
+            if let Some(compact_layout) = compact_layout {
+                let compact_size = compact_layout.size();
+                let height = title_size.height.max(compact_size.height);
+
+                layout::Node::with_children(
+                    Size::new(max_size.width, height),
+                    vec![
+                        title_layout.move_to(Point::new(0.0, (height - title_size.height) / 2.0)),
+                        controls_layout,
+                        compact_layout.move_to(Point::new(
+                            max_size.width - compact_size.width,
+                            (height - compact_size.height) / 2.0,
+                        )),
+                    ],
+                )
             } else {
                 let controls_size = controls_layout.size();
                 let space_before_controls = max_size.width - controls_size.width;
-
                 let height = title_size.height.max(controls_size.height);
 
                 layout::Node::with_children(
@@ -351,6 +365,13 @@ where
                 )
             }
         } else {
+            let title_layout = self.content.as_widget_mut().layout(
+                &mut tree.children[0],
+                renderer,
+                &layout::Limits::new(Size::ZERO, max_size),
+            );
+            let title_size = title_layout.size();
+
             layout::Node::with_children(
                 Size::new(max_size.width, title_size.height),
                 vec![title_layout],

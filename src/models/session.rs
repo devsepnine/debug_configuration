@@ -101,6 +101,9 @@ pub struct RunSession {
     /// 변환해 스크롤한 뒤, `SessionScrollChanged` 핸들러에서 `None`으로 클리어한다.
     /// (app→terminal 역방향 스크롤 명령 경로 — 비율 기반으론 매치로 점프가 안 됐다)
     pub scroll_target: Option<usize>,
+    /// 컨트롤 오버플로 메뉴(⋯) 열림 여부. pane이 좁아 전체 컨트롤 버튼이 들어가지
+    /// 않을 때 `⋯` 버튼으로 펼치는 세로 액션 메뉴의 토글 상태(터미널 위에 표시).
+    pub controls_menu_open: bool,
 }
 
 impl std::fmt::Debug for RunSession {
@@ -145,6 +148,7 @@ impl RunSession {
             process_pid: None,
             search: None,
             scroll_target: None,
+            controls_menu_open: false,
         }
     }
 

@@ -253,6 +253,10 @@ pub enum Message {
     /// 출력 내보내기 완료 (저장 경로 또는 에러/취소)
     SessionOutputExported(Result<PathBuf, String>),
 
+    // 컨트롤 오버플로 메뉴 (pane이 좁아 전체 버튼이 안 들어갈 때 ⋯로 펼치는 세션 액션 메뉴)
+    /// 컨트롤 오버플로 메뉴(⋯) 토글 (`session_id`)
+    ToggleSessionControlsMenu(Uuid),
+
     // URL 처리
     /// URL을 기본 브라우저로 열기
     OpenUrl(String),

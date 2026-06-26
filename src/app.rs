@@ -483,6 +483,9 @@ impl RunConfigManager {
     }
 
     fn dispatch_message(&mut self, message: Message) -> Task<Message> {
+        // 오버플로 메뉴 항목이 세션 액션을 실행하면 해당 세션의 메뉴를 닫는다.
+        self.close_controls_menu_on_action(&message);
+
         match message {
             Message::SwitchView(view_mode) => {
                 self.current_view = view_mode;
@@ -574,6 +577,7 @@ impl RunConfigManager {
             | Message::SearchPrevInActivePane
             | Message::ExportSessionOutput(_)
             | Message::SessionOutputExported(_)
+            | Message::ToggleSessionControlsMenu(_)
             | Message::CheckForUpdates
             | Message::UpdateCheckCompleted(_)
             | Message::UpdateSpinnerTick => self.handle_session_messages(message),
@@ -766,6 +770,9 @@ impl RunConfigManager {
                 self.handle_export_session_output(session_id)
             }
             Message::SessionOutputExported(result) => self.handle_session_output_exported(result),
+            Message::ToggleSessionControlsMenu(session_id) => {
+                self.handle_toggle_session_controls_menu(session_id)
+            }
             _ => unreachable!("non-session message routed to handle_session_messages"),
         }
     }
@@ -2153,6 +2160,63 @@ impl RunConfigManager {
             session.search = None;
         }
         Task::none()
+    }
+
+    /// 오버플로 메뉴(⋯) 토글. pane이 좁을 때 compact의 `⋯` 버튼이 보낸다.
+    /// 한 번에 하나의 메뉴만 열리도록, 대상 세션을 토글하고 나머지는 모두 닫는다.
+    fn handle_toggle_session_controls_menu(&mut self, session_id: Uuid) -> Task<Message> {
+        let opening = !self
+            .session_by_id_mut(session_id)
+            .map(|session| session.controls_menu_open)
+            .unwrap_or(false);
+        for session in &mut self.sessions {
+            session.controls_menu_open = opening && session.id == session_id;
+        }
+        Task::none()
+    }
+
+    /// 오버플로 메뉴를 닫아야 하는 상황을 한곳에서 처리한다.
+    /// - 메뉴 항목이 세션 액션을 실행하면 해당 세션의 메뉴를 닫는다(인라인 full
+    ///   컨트롤에서 온 동일 메시지엔 이미 닫혀 있어 무해). `TogglePaneMaximize`는
+    ///   메뉴에 maximize 항목이 있으므로 pane→세션을 거쳐 닫는다.
+    /// - 리사이즈로 레이아웃이 바뀌면 모든 메뉴를 닫는다. pane이 넓어져 full 컨트롤로
+    ///   돌아가면 `⋯`가 사라져 토글로 닫을 수 없게 되는 상태를 막기 위함이다.
+    fn close_controls_menu_on_action(&mut self, message: &Message) {
+        if matches!(
+            message,
+            Message::PaneGridResized(_)
+                | Message::WindowResized(_, _)
+                | Message::ClosePane(_)
+                | Message::PaneGridDragged(_)
+        ) {
+            for session in &mut self.sessions {
+                session.controls_menu_open = false;
+            }
+            return;
+        }
+
+        let session_id = match message {
+            Message::RerunSession(id)
+            | Message::StopSession(id)
+            | Message::ToggleAutoScroll(id)
+            | Message::OpenSessionSearch(id)
+            | Message::ExportSessionOutput(id) => *id,
+            Message::TogglePaneMaximize(pane_id) => {
+                let Some(session_id) = self
+                    .workspace_tabs
+                    .get(self.selected_tab_index)
+                    .and_then(|tab| tab.pane_layout.get(*pane_id))
+                    .and_then(|pane| pane.session_id)
+                else {
+                    return;
+                };
+                session_id
+            }
+            _ => return,
+        };
+        if let Some(session) = self.session_by_id_mut(session_id) {
+            session.controls_menu_open = false;
+        }
     }
 
     fn handle_session_search_changed(&mut self, session_id: Uuid, query: String) -> Task<Message> {

@@ -1,8 +1,8 @@
 use crate::messages::Message;
 use crate::models::{Pane, RunSession, SessionStatusKind};
 use crate::utils::{
-    ICON_ARROW_DOWN_FILL, ICON_ARROW_DOWN_LINE, ICON_CLOSE, ICON_PANE_MAXIMIZE, ICON_PANE_RESTORE,
-    ICON_REFRESH, ICON_SAVE, ICON_SEARCH, ICON_STOP,
+    ICON_ARROW_DOWN_FILL, ICON_ARROW_DOWN_LINE, ICON_CLOSE, ICON_MORE, ICON_PANE_MAXIMIZE,
+    ICON_PANE_RESTORE, ICON_REFRESH, ICON_SAVE, ICON_SEARCH, ICON_STOP,
 };
 use crate::views::shared::{
     IconButtonState, icon_button_foreground, icon_button_style, icon_tooltip,
@@ -167,7 +167,7 @@ fn view_pane_content<'a>(
         .filter(|session| !session.is_running)
         .map(RunSession::status_badge_label);
 
-    let mut title_controls: Option<Element<'a, Message>> = None;
+    let mut title_controls: Option<(Element<'a, Message>, Element<'a, Message>)> = None;
     let content: Element<'a, Message> = if let Some(session_id) = pane.session_id {
         // 세션이 있는 경우
         if let Some(session) = sessions.iter().find(|s| s.id == session_id) {
@@ -175,20 +175,27 @@ fn view_pane_content<'a>(
             let is_dragging = dragging_pane_id == Some(pane_id);
 
             let terminal_output = view_terminal_for_session(session, is_dragging);
-            title_controls = Some(view_session_controls(
-                session,
-                pane_id,
-                pane_count,
-                is_maximized,
-                is_dragging,
+            // 넓으면 전체 버튼(full), 좁아 안 들어가면 ⋯+닫기(compact).
+            // title_bar가 너비를 보고 자동 전환한다(Controls::dynamic).
+            title_controls = Some((
+                view_session_controls(session, pane_id, pane_count, is_maximized, is_dragging),
+                view_session_controls_compact(session, pane_id, is_dragging),
             ));
 
-            // 검색바가 열려 있으면 터미널 위에 표시.
-            let body: Element<'a, Message> = if session.search.is_some() {
-                column![view_session_search_bar(session), terminal_output].into()
-            } else {
-                terminal_output
-            };
+            // 터미널 위에 오버플로 메뉴(열려 있으면) → 검색바(열려 있으면) 순으로 쌓는다.
+            let mut stacked = column![].spacing(0);
+            if session.controls_menu_open {
+                stacked = stacked.push(view_session_controls_menu(
+                    session,
+                    pane_id,
+                    pane_count,
+                    is_maximized,
+                ));
+            }
+            if session.search.is_some() {
+                stacked = stacked.push(view_session_search_bar(session));
+            }
+            let body: Element<'a, Message> = stacked.push(terminal_output).into();
 
             container(body)
                 .width(Length::Fill)
@@ -237,9 +244,9 @@ fn view_pane_content<'a>(
                     border::Radius::default().top(4.0),
                 )
             });
-    if let Some(controls) = title_controls {
+    if let Some((full, compact)) = title_controls {
         title_bar = title_bar
-            .controls(pane_grid::Controls::new(controls))
+            .controls(pane_grid::Controls::dynamic(full, compact))
             .always_show_controls();
     }
 
@@ -407,6 +414,175 @@ fn view_session_controls(
         .into()
 }
 
+/// 좁은 pane용 축약 컨트롤: `⋯`(오버플로 메뉴 토글) + 닫기.
+///
+/// 닫기는 가장 자주 쓰므로 좁아도 항상 노출하고, 나머지 액션은 `⋯` 메뉴로 모은다.
+/// `title_bar`가 full이 안 들어간다고 판단하면 이 compact으로 자동 전환한다.
+fn view_session_controls_compact(
+    session: &RunSession,
+    pane_id: pane_grid::Pane,
+    is_dragging: bool,
+) -> Element<'_, Message> {
+    let session_id = session.id;
+
+    let menu_state = if session.controls_menu_open {
+        IconButtonState::Active
+    } else {
+        IconButtonState::Inactive
+    };
+    let menu_button = control_button(
+        control_icon(svg::Handle::from_memory(ICON_MORE), menu_state),
+        Some(Message::ToggleSessionControlsMenu(session_id)),
+        menu_state,
+        is_dragging,
+    );
+
+    let close_button = control_button(
+        control_icon(
+            svg::Handle::from_memory(ICON_CLOSE),
+            IconButtonState::Active,
+        ),
+        Some(Message::ClosePane(pane_id)),
+        IconButtonState::Active,
+        is_dragging,
+    );
+
+    let controls_row = row![menu_button, Space::new().width(6), close_button]
+        .align_y(Alignment::Center)
+        .spacing(1.0);
+
+    container(controls_row)
+        .padding(0)
+        .style(move |_theme: &Theme| container::Style {
+            background: None,
+            border: Border {
+                width: 0.0,
+                color: Color::TRANSPARENT,
+                radius: 0.0.into(),
+            },
+            ..container::Style::default()
+        })
+        .into()
+}
+
+/// 오버플로 메뉴: `⋯`로 펼치는 세션 액션 아이콘 행 (터미널 위에 표시).
+///
+/// full 컨트롤과 동일한 아이콘 버튼들을 라벨 없이 가로로 나열한다. body 전체 너비를
+/// 쓰므로 세션명이 자리를 차지하는 title_bar보다 여유가 있어 아이콘이 모두 들어간다.
+/// 닫기는 compact에 항상 있으므로 제외하고, 항목 선택 시 각 액션 핸들러가 메뉴를 닫는다.
+fn view_session_controls_menu(
+    session: &RunSession,
+    pane_id: pane_grid::Pane,
+    pane_count: usize,
+    is_maximized: bool,
+) -> Element<'_, Message> {
+    let session_id = session.id;
+
+    let rerun = control_button(
+        control_icon(
+            svg::Handle::from_memory(ICON_REFRESH),
+            IconButtonState::Active,
+        ),
+        Some(Message::RerunSession(session_id)),
+        IconButtonState::Active,
+        false,
+    );
+
+    let stop_state = if session.is_running {
+        IconButtonState::Active
+    } else {
+        IconButtonState::Inactive
+    };
+    let stop = control_button(
+        control_icon(svg::Handle::from_memory(ICON_STOP), stop_state),
+        session
+            .is_running
+            .then_some(Message::StopSession(session_id)),
+        stop_state,
+        false,
+    );
+
+    let auto_scroll_svg = if session.auto_scroll {
+        ICON_ARROW_DOWN_FILL
+    } else {
+        ICON_ARROW_DOWN_LINE
+    };
+    let auto_scroll = control_button(
+        control_icon(
+            svg::Handle::from_memory(auto_scroll_svg),
+            IconButtonState::Active,
+        ),
+        Some(Message::ToggleAutoScroll(session_id)),
+        IconButtonState::Active,
+        false,
+    );
+
+    let search = control_button(
+        control_icon(
+            svg::Handle::from_memory(ICON_SEARCH),
+            IconButtonState::Active,
+        ),
+        Some(Message::OpenSessionSearch(session_id)),
+        IconButtonState::Active,
+        false,
+    );
+
+    let has_output = !session.output_lines.is_empty();
+    let export_state = if has_output {
+        IconButtonState::Active
+    } else {
+        IconButtonState::Inactive
+    };
+    let export = control_button(
+        control_icon(svg::Handle::from_memory(ICON_SAVE), export_state),
+        has_output.then_some(Message::ExportSessionOutput(session_id)),
+        export_state,
+        false,
+    );
+
+    let mut controls_row = row![
+        rerun,
+        Space::new().width(4),
+        stop,
+        Space::new().width(4),
+        auto_scroll,
+        Space::new().width(4),
+        search,
+        Space::new().width(4),
+        export,
+    ]
+    .align_y(Alignment::Center)
+    .spacing(1.0);
+
+    if pane_count > 1 {
+        let maximize = control_button(
+            control_icon(
+                svg::Handle::from_memory(if is_maximized {
+                    ICON_PANE_RESTORE
+                } else {
+                    ICON_PANE_MAXIMIZE
+                }),
+                IconButtonState::Active,
+            ),
+            Some(Message::TogglePaneMaximize(pane_id)),
+            IconButtonState::Active,
+            false,
+        );
+        controls_row = controls_row.push(Space::new().width(4)).push(maximize);
+    }
+
+    container(controls_row)
+        .padding([4, 8])
+        .width(Length::Fill)
+        .style(|theme: &Theme| container::Style {
+            background: Some(Background::Color(
+                theme.extended_palette().background.weak.color,
+            )),
+            ..container::Style::default()
+        })
+        .into()
+}
+
 /// 출력 검색바 (터미널 위에 표시). 매치 개수, 이전/다음, 필터 토글, 닫기.
 fn view_session_search_bar(session: &RunSession) -> Element<'_, Message> {
     let search = session
@@ -543,7 +719,7 @@ fn session_title(
             .width(7)
             .height(7)
             .style(move |theme: &Theme| session_status_dot_style(theme, status)),
-        text(session_name).size(12),
+        text(session_name).size(12).wrapping(text::Wrapping::None),
     ]
     .spacing(8)
     .align_y(Alignment::Center);
