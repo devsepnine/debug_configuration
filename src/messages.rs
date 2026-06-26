@@ -225,6 +225,9 @@ pub enum Message {
     CancelEditingTabName,
     /// 편집 중인 탭 바깥 클릭으로 이름 편집 취소
     CancelEditingTabNameOnOutsideClick,
+    /// 워크스페이스로 점프 (`index`, 0-based) — Sessions 화면으로 전환 후 해당 탭 선택.
+    /// 키보드 단축키(Cmd+1~9) 전용. 범위 밖 인덱스는 핸들러에서 무시한다.
+    JumpToWorkspace(usize),
 
     // Pane 관리 메시지 (현재 탭 내)
     /// `pane_grid` 드래그 이벤트 처리

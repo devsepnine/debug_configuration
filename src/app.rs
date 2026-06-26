@@ -606,6 +606,7 @@ impl RunConfigManager {
             | Message::UpdateCheckCompleted(_)
             | Message::UpdateSpinnerTick => self.handle_session_messages(message),
             Message::AddWorkspaceTab
+            | Message::JumpToWorkspace(_)
             | Message::CloseTab(_)
             | Message::TabNameClicked(_)
             | Message::TabNameInputChanged(_)
@@ -820,6 +821,7 @@ impl RunConfigManager {
     fn handle_workspace_messages(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::AddWorkspaceTab => self.handle_add_workspace_tab(),
+            Message::JumpToWorkspace(index) => self.handle_jump_to_workspace(index),
             Message::CloseTab(tab_index) => self.handle_close_tab(tab_index),
             Message::TabNameClicked(tab_index) => self.handle_tab_name_clicked(tab_index),
             Message::TabNameInputChanged(new_value) => {
@@ -930,6 +932,19 @@ impl RunConfigManager {
             last_file_path: self.last_file_path.clone(),
             configuration_split_ratio: Some(configuration_split_ratio(&self.configuration_layout)),
         });
+    }
+
+    /// 키보드 단축키(Cmd+1~9)로 워크스페이스 탭으로 점프한다.
+    ///
+    /// 워크스페이스 탭은 Sessions 화면에만 존재하므로 화면 전환을 함께 수행한다.
+    /// 존재하지 않는 인덱스(탭 개수보다 큰 번호)는 무시한다. 마우스 클릭 경로
+    /// (`handle_tab_name_clicked`)와 달리 더블클릭 타이머·이름 편집 상태를 건드리지 않는다.
+    fn handle_jump_to_workspace(&mut self, index: usize) -> Task<Message> {
+        if index < self.workspace_tabs.len() {
+            self.current_view = ViewMode::Sessions;
+            self.selected_tab_index = index;
+        }
+        Task::none()
     }
 
     fn handle_tab_name_clicked(&mut self, tab_index: usize) -> Task<Message> {
@@ -2566,6 +2581,38 @@ impl RunConfigManager {
         }
     }
 
+    /// 네비게이션 단축키 키 이벤트를 메시지로 매핑한다.
+    ///
+    /// F1 = Configurations, F2 = Sessions, 순수 Cmd+1~9 = 워크스페이스 점프.
+    /// `event::listen_with`(fn 포인터라 self 캡처 불가) 클로저와 단위 테스트가 공유한다.
+    /// 매핑되지 않는 키는 `None`을 반환해 다른 단축키와 충돌하지 않는다.
+    fn nav_shortcut_message(
+        key: &keyboard::Key,
+        modifiers: keyboard::Modifiers,
+    ) -> Option<Message> {
+        match key {
+            // F1/F2는 단독 입력만 받는다(Cmd+F1=디스플레이 미러링 등 시스템 조합 제외).
+            keyboard::Key::Named(keyboard::key::Named::F1) if modifiers.is_empty() => {
+                Some(Message::SwitchView(ViewMode::Configuration))
+            }
+            keyboard::Key::Named(keyboard::key::Named::F2) if modifiers.is_empty() => {
+                Some(Message::SwitchView(ViewMode::Sessions))
+            }
+            // 순수 Cmd+숫자만 받는다(Shift/Alt 조합은 macOS 스크린샷 Cmd+Shift+3~5 등과
+            // 겹칠 수 있어 제외). 문자 범위 '1'..='9'는 Cmd+F(search_open)와 겹치지 않는다.
+            keyboard::Key::Character(c)
+                if modifiers.command() && !modifiers.shift() && !modifiers.alt() =>
+            {
+                c.as_str()
+                    .chars()
+                    .next()
+                    .filter(|ch| ('1'..='9').contains(ch))
+                    .map(|ch| Message::JumpToWorkspace((ch as u8 - b'1') as usize))
+            }
+            _ => None,
+        }
+    }
+
     /// Ctrl+F/ESC가 대상으로 삼을 세션. 활성 탭의 leaf pane 중 이미 검색바가 열린
     /// 세션을 우선, 없으면 첫 세션 pane (다중 pane에서 정확한 대상은 pane의 검색 버튼 사용).
     fn focused_search_session_id(&self) -> Option<Uuid> {
@@ -4011,6 +4058,21 @@ impl RunConfigManager {
             Subscription::none()
         };
 
+        // F1/F2 = 화면 전환(Configurations/Sessions), Cmd+1~9 = 해당 워크스페이스로 점프.
+        // 모달이 열려 있거나 탭 이름 편집 중이면 비활성화해 입력/모달 작업을 보호한다.
+        // 키→메시지 매핑은 nav_shortcut_message로 추출해 단위 테스트와 공유한다.
+        let nav_shortcut_subscription =
+            if self.env_modal.is_none() && self.tab_ui.editing_tab_name.is_none() {
+                event::listen_with(|event, _status, _id| match event {
+                    Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) => {
+                        Self::nav_shortcut_message(&key, modifiers)
+                    }
+                    _ => None,
+                })
+            } else {
+                Subscription::none()
+            };
+
         // 업데이트 확인 중에만 스피너 애니메이션 tick을 발행한다.
         let update_spinner_subscription = if self.is_checking_update {
             iced::time::every(Duration::from_millis(120)).map(|_| Message::UpdateSpinnerTick)
@@ -4028,6 +4090,7 @@ impl RunConfigManager {
             search_open_subscription,
             search_close_subscription,
             search_nav_subscription,
+            nav_shortcut_subscription,
             update_spinner_subscription,
             window::open_events().map(Message::WindowOpened),
             window::resize_events().map(|(id, size)| Message::WindowResized(id, size)),
@@ -4211,6 +4274,127 @@ mod tests {
         assert_eq!(names(&app), vec!["B", "A", "C", "D"]);
         assert_eq!(final_index, 1);
         assert_eq!(app.selected_config_index, Some(1));
+    }
+
+    fn manager_with_workspaces(count: usize) -> RunConfigManager {
+        let (mut app, _task) = RunConfigManager::new();
+        app.workspace_tabs = (1..=count)
+            .map(|n| WorkspaceTab::empty(format!("Workspace {n}")))
+            .collect();
+        app.selected_tab_index = 0;
+        app
+    }
+
+    #[test]
+    fn jump_to_workspace_switches_view_and_selects_tab() {
+        // Cmd+3 상당: Configs 화면에 있어도 Sessions로 전환하며 3번째 탭(index 2)을 선택
+        let mut app = manager_with_workspaces(3);
+        app.current_view = ViewMode::Configuration;
+
+        let _ = app.handle_jump_to_workspace(2);
+
+        assert_eq!(app.current_view, ViewMode::Sessions);
+        assert_eq!(app.selected_tab_index, 2);
+    }
+
+    #[test]
+    fn jump_to_workspace_out_of_range_is_noop() {
+        // 존재하지 않는 번호(탭 2개인데 index 5)는 화면·선택을 바꾸지 않는다
+        let mut app = manager_with_workspaces(2);
+        app.current_view = ViewMode::Configuration;
+        app.selected_tab_index = 1;
+
+        let _ = app.handle_jump_to_workspace(5);
+
+        assert_eq!(app.current_view, ViewMode::Configuration);
+        assert_eq!(app.selected_tab_index, 1);
+    }
+
+    #[test]
+    fn jump_to_workspace_from_sessions_only_changes_tab() {
+        // 이미 Sessions 화면이면 화면은 유지하고 탭만 바뀐다
+        let mut app = manager_with_workspaces(3);
+        app.current_view = ViewMode::Sessions;
+        app.selected_tab_index = 0;
+
+        let _ = app.handle_jump_to_workspace(2);
+
+        assert_eq!(app.current_view, ViewMode::Sessions);
+        assert_eq!(app.selected_tab_index, 2);
+    }
+
+    #[test]
+    fn nav_shortcut_f1_f2_switch_views() {
+        use keyboard::key::Named;
+        assert!(matches!(
+            RunConfigManager::nav_shortcut_message(
+                &keyboard::Key::Named(Named::F1),
+                keyboard::Modifiers::empty()
+            ),
+            Some(Message::SwitchView(ViewMode::Configuration))
+        ));
+        assert!(matches!(
+            RunConfigManager::nav_shortcut_message(
+                &keyboard::Key::Named(Named::F2),
+                keyboard::Modifiers::empty()
+            ),
+            Some(Message::SwitchView(ViewMode::Sessions))
+        ));
+    }
+
+    #[test]
+    fn nav_shortcut_cmd_digits_jump_to_workspace() {
+        // Cmd+1 → index 0, Cmd+9 → index 8
+        assert!(matches!(
+            RunConfigManager::nav_shortcut_message(
+                &keyboard::Key::Character("1".into()),
+                keyboard::Modifiers::COMMAND
+            ),
+            Some(Message::JumpToWorkspace(0))
+        ));
+        assert!(matches!(
+            RunConfigManager::nav_shortcut_message(
+                &keyboard::Key::Character("9".into()),
+                keyboard::Modifiers::COMMAND
+            ),
+            Some(Message::JumpToWorkspace(8))
+        ));
+    }
+
+    #[test]
+    fn nav_shortcut_rejects_cmd_zero_and_modifier_combos() {
+        // Cmd+0: 대응 워크스페이스 없음
+        assert!(
+            RunConfigManager::nav_shortcut_message(
+                &keyboard::Key::Character("0".into()),
+                keyboard::Modifiers::COMMAND
+            )
+            .is_none()
+        );
+        // Cmd 없이 "1": 텍스트 입력과 충돌하지 않도록 무시
+        assert!(
+            RunConfigManager::nav_shortcut_message(
+                &keyboard::Key::Character("1".into()),
+                keyboard::Modifiers::empty()
+            )
+            .is_none()
+        );
+        // Cmd+Shift+1: macOS 스크린샷 등 시스템 단축키와 충돌 방지로 무시
+        assert!(
+            RunConfigManager::nav_shortcut_message(
+                &keyboard::Key::Character("1".into()),
+                keyboard::Modifiers::COMMAND | keyboard::Modifiers::SHIFT
+            )
+            .is_none()
+        );
+        // Cmd+Alt+1: 마찬가지로 순수 Cmd+숫자가 아니므로 무시
+        assert!(
+            RunConfigManager::nav_shortcut_message(
+                &keyboard::Key::Character("1".into()),
+                keyboard::Modifiers::COMMAND | keyboard::Modifiers::ALT
+            )
+            .is_none()
+        );
     }
 
     #[test]
