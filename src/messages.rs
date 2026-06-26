@@ -167,6 +167,23 @@ pub enum Message {
     EnvModalFocusNext,
     /// 모달 내부 이전 cell로 focus (Shift+Tab) — modal trap cycle
     EnvModalFocusPrev,
+
+    // 앱 설정 모달 lifecycle
+    /// 설정 모달 열기 (현재 설정값을 staging으로 복사)
+    OpenSettingsModal,
+    /// 설정 모달 OK — staging 검증 후 설정에 반영하고 저장
+    ConfirmSettingsModal,
+    /// 설정 모달 Cancel — staging 폐기
+    CancelSettingsModal,
+    /// 설정: 실행 시 Environment 라인 표시 토글
+    SettingsToggleEnvironment(bool),
+    /// 설정: 세션 출력 최대 라인 수 입력 변경 (raw 문자열; Confirm 시 파싱·클램프)
+    SettingsMaxLinesChanged(String),
+    /// 설정: 새 세션 자동 스크롤 기본값 토글
+    SettingsToggleAutoScroll(bool),
+    /// 설정: 시작 시 업데이트 자동 확인 토글
+    SettingsToggleAutoCheckUpdates(bool),
+
     /// Editor focus 이동 (`true`면 역방향)
     MoveEditorFocus(bool),
     /// Editor pane이 키보드 focus 이동 대상인지 갱신

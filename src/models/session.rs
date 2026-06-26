@@ -19,7 +19,7 @@ pub enum SessionStatusKind {
 
 /// 터미널 출력 버퍼의 최대 라인 수 (보관 상한). 이 제한을 초과하면 오래된 라인이 FIFO로
 /// 영구 제거된다. 터미널 뷰는 가상화로 이 버퍼 전체를 스크롤해서 볼 수 있다(가시 영역만 렌더).
-const MAX_OUTPUT_LINES: usize = 50_000;
+pub const DEFAULT_MAX_OUTPUT_LINES: usize = 50_000;
 
 /// 세션당 출력 버퍼의 최대 누적 바이트 (보관 상한). 줄 수 상한만으로는 메모리가 묶이지
 /// 않으므로(병적으로 긴 줄들), 이 바이트 예산을 함께 적용해 폭주하는 로그 생산자가 앱을
@@ -104,6 +104,9 @@ pub struct RunSession {
     /// 컨트롤 오버플로 메뉴(⋯) 열림 여부. pane이 좁아 전체 컨트롤 버튼이 들어가지
     /// 않을 때 `⋯` 버튼으로 펼치는 세로 액션 메뉴의 토글 상태(터미널 위에 표시).
     pub controls_menu_open: bool,
+    /// 이 세션의 출력 버퍼 최대 라인 수. 생성 시 앱 설정값으로 고정된다. 초과 시
+    /// 오래된 라인이 FIFO로 제거된다(전역 기본은 `DEFAULT_MAX_OUTPUT_LINES`).
+    pub max_output_lines: usize,
 }
 
 impl std::fmt::Debug for RunSession {
@@ -149,6 +152,7 @@ impl RunSession {
             search: None,
             scroll_target: None,
             controls_menu_open: false,
+            max_output_lines: DEFAULT_MAX_OUTPUT_LINES,
         }
     }
 
@@ -245,7 +249,7 @@ impl RunSession {
             // worst-case: 단일 줄이 예산을 넘으면 total_bytes가 MAX_OUTPUT_BYTES + 마지막 줄
             // 크기(≤ MAX_LINE_BYTES + 마커)까지 일시 초과한다 — 버퍼를 완전히 비우는 것보다
             // 1줄 유지가 낫다는 의도적 트레이드오프이며, 메모리는 여전히 상수로 묶인다.
-            while self.output_lines.len() > MAX_OUTPUT_LINES
+            while self.output_lines.len() > self.max_output_lines
                 || (self.total_bytes > MAX_OUTPUT_BYTES && self.output_lines.len() > 1)
             {
                 if let Some((_, evicted)) = self.output_lines.pop_front() {
@@ -351,16 +355,27 @@ mod tests {
     }
 
     #[test]
+    fn custom_max_output_lines_caps_buffer() {
+        // 세션별 max_output_lines를 작게 설정하면 그 한도로 evict된다(설정 주입 검증).
+        let mut session = RunSession::new("test".to_string());
+        session.max_output_lines = 3;
+        for i in 0..10 {
+            session.add_output_line(&format!("line {i}"));
+        }
+        assert_eq!(session.output_lines.len(), 3);
+    }
+
+    #[test]
     fn test_max_lines_limit() {
         let mut session = RunSession::new("test".to_string());
 
-        // MAX_OUTPUT_LINES를 초과하는 라인 추가
-        for i in 0..MAX_OUTPUT_LINES + 100 {
+        // DEFAULT_MAX_OUTPUT_LINES를 초과하는 라인 추가
+        for i in 0..DEFAULT_MAX_OUTPUT_LINES + 100 {
             session.add_output_line(&format!("Line {i}"));
         }
 
-        // 라인 수가 MAX_OUTPUT_LINES로 제한되었는지 확인
-        assert_eq!(session.output_lines.len(), MAX_OUTPUT_LINES);
+        // 라인 수가 DEFAULT_MAX_OUTPUT_LINES로 제한되었는지 확인
+        assert_eq!(session.output_lines.len(), DEFAULT_MAX_OUTPUT_LINES);
 
         // 첫 100개 라인이 제거되었는지 확인 (ID 0~99)
         let has_line_0 = session.output_lines.iter().any(|(_, segs)| {
@@ -389,7 +404,7 @@ mod tests {
         assert!(has_line_100);
 
         // 마지막 라인도 남아있어야 함
-        let last_line = format!("Line {}", MAX_OUTPUT_LINES + 99);
+        let last_line = format!("Line {}", DEFAULT_MAX_OUTPUT_LINES + 99);
         let has_last_line = session.output_lines.iter().any(|(_, segs)| {
             let text: String = segs.iter().map(|s| s.text.as_str()).collect();
             text == last_line
@@ -405,10 +420,10 @@ mod tests {
             .collect();
         assert_eq!(first_line_text, "Line 100");
         assert_eq!(
-            session.output_lines[MAX_OUTPUT_LINES - 1].0,
-            MAX_OUTPUT_LINES + 99
+            session.output_lines[DEFAULT_MAX_OUTPUT_LINES - 1].0,
+            DEFAULT_MAX_OUTPUT_LINES + 99
         ); // ID는 2099
-        let last_line_text: String = session.output_lines[MAX_OUTPUT_LINES - 1]
+        let last_line_text: String = session.output_lines[DEFAULT_MAX_OUTPUT_LINES - 1]
             .1
             .iter()
             .map(|s| s.text.as_str())

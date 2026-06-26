@@ -9,7 +9,8 @@ mod workspace_tabs;
 
 pub use configuration_editor::{
     EditorLoadingState, EditorSelectState, EnvModalView, FileDialogLoadingState, NodeLoadingState,
-    env_modal_key_id, env_modal_value_id, view_configuration_editor, view_env_modal,
+    SettingsModalView, env_modal_key_id, env_modal_value_id, view_configuration_editor,
+    view_env_modal, view_settings_modal,
 };
 pub use configuration_list::view_configuration_list;
 pub use main_tabs::view_main_tabs;

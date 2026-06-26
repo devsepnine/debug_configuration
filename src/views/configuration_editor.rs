@@ -11,8 +11,8 @@ use iced::{
     Alignment, Background, Border, Color, Element, Length, Padding, Theme,
     alignment::{Horizontal, Vertical},
     widget::{
-        Column, Space, button, center, column, combo_box, container, opaque, row, svg, text,
-        text_input,
+        Column, Space, button, center, checkbox, column, combo_box, container, opaque, row, svg,
+        text, text_input,
     },
 };
 use std::fmt::Display;
@@ -717,6 +717,98 @@ pub fn view_env_modal<'a>(props: EnvModalView<'a>) -> Element<'a, Message> {
         .padding(18)
         .max_width(640)
         .max_height(520)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .style(modal_dialog_style);
+
+    opaque(
+        center(opaque(dialog))
+            .padding(40)
+            .style(modal_backdrop_style),
+    )
+}
+
+/// 앱 설정 모달 뷰 모델 (app의 staging 상태를 참조로 전달).
+pub struct SettingsModalView<'a> {
+    pub show_environment: bool,
+    pub max_output_lines_text: &'a str,
+    pub default_auto_scroll: bool,
+    pub auto_check_updates: bool,
+}
+
+/// 앱 설정 모달 (반투명 배경 + 중앙 다이얼로그). env 모달과 동일한 오버레이/스타일을
+/// 재사용한다. 외부 클릭은 무시되며 OK / Cancel / X 로만 닫힌다.
+pub fn view_settings_modal(props: SettingsModalView<'_>) -> Element<'_, Message> {
+    let header = row![
+        text("Settings").size(15),
+        Space::new().width(Length::Fill),
+        icon_button(ICON_CLOSE, Some(Message::CancelSettingsModal)),
+    ]
+    .align_y(Alignment::Center)
+    .width(Length::Fill);
+
+    let max_lines_row = row![
+        text("Max output lines per session").size(13),
+        Space::new().width(Length::Fill),
+        // placeholder는 기본값(DEFAULT_MAX_OUTPUT_LINES=50_000) 힌트 — 상수 변경 시 함께 갱신.
+        // 입력을 비웠을 때만 노출되며, 모달을 열면 현재값으로 채워진다.
+        text_input("50000", props.max_output_lines_text)
+            .on_input(Message::SettingsMaxLinesChanged)
+            .padding([6, 10])
+            .size(13)
+            .width(Length::Fixed(140.0)),
+    ]
+    .align_y(Alignment::Center)
+    .spacing(10);
+
+    let body = column![
+        checkbox(props.show_environment)
+            .label("Show environment line on run")
+            .on_toggle(Message::SettingsToggleEnvironment)
+            .size(18)
+            .text_size(13),
+        max_lines_row,
+        checkbox(props.default_auto_scroll)
+            .label("Auto-scroll new sessions")
+            .on_toggle(Message::SettingsToggleAutoScroll)
+            .size(18)
+            .text_size(13),
+        checkbox(props.auto_check_updates)
+            .label("Check for updates on startup")
+            .on_toggle(Message::SettingsToggleAutoCheckUpdates)
+            .size(18)
+            .text_size(13),
+    ]
+    .spacing(14);
+
+    let footer = row![
+        Space::new().width(Length::Fill),
+        button(text("Cancel").size(13))
+            .on_press(Message::CancelSettingsModal)
+            .padding([6, 16])
+            .style(modal_secondary_button_style),
+        button(text("OK").size(13))
+            .on_press(Message::ConfirmSettingsModal)
+            .padding([6, 18])
+            .style(modal_primary_button_style),
+    ]
+    .spacing(8)
+    .align_y(Alignment::Center);
+
+    let dialog_content = column![
+        header,
+        Space::new().height(18),
+        body,
+        Space::new().height(22),
+        footer,
+    ]
+    .width(Length::Fill)
+    .height(Length::Fill);
+
+    let dialog = container(dialog_content)
+        .padding(18)
+        .max_width(460)
+        .max_height(330)
         .width(Length::Fill)
         .height(Length::Fill)
         .style(modal_dialog_style);

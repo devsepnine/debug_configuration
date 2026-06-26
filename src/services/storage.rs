@@ -4,13 +4,52 @@ use rfd::AsyncFileDialog;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-/// 앱 설정 (마지막 파일 경로 등)
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+/// 앱 설정 (마지막 파일 경로, 사용자 환경설정 등).
+///
+/// 신규 필드는 모두 `#[serde(default = ...)]`을 지정해, 이 필드가 없는 구버전 설정
+/// 파일도 파싱 실패 없이 로드되며 누락분은 기본값으로 채워진다(하위호환).
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSettings {
     /// 마지막으로 사용한 구성 파일 경로
     pub last_file_path: Option<PathBuf>,
     /// Configuration 화면 좌우 분할 비율
     pub configuration_split_ratio: Option<f32>,
+    /// 구성 실행 시 출력 헤더에 `Environment: ...` 라인을 표시할지 여부
+    #[serde(default = "default_true")]
+    pub show_environment_on_run: bool,
+    /// 세션 터미널 출력 버퍼의 최대 보관 라인 수 (새 세션부터 적용)
+    #[serde(default = "default_max_output_lines")]
+    pub max_output_lines: usize,
+    /// 새 세션의 자동 스크롤 초기 상태
+    #[serde(default = "default_true")]
+    pub default_auto_scroll: bool,
+    /// 앱 시작 시 업데이트를 자동으로 확인할지 여부
+    #[serde(default = "default_true")]
+    pub auto_check_updates: bool,
+}
+
+/// serde 기본값 헬퍼: bool 필드의 기본은 `true` (켜짐). `#[derive(Default)]`의
+/// bool 기본은 `false`라 직접 지정해야 한다.
+fn default_true() -> bool {
+    true
+}
+
+/// serde 기본값 헬퍼: 출력 라인 한도 기본값 (세션 버퍼 상한과 단일 출처 공유).
+fn default_max_output_lines() -> usize {
+    crate::models::DEFAULT_MAX_OUTPUT_LINES
+}
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        Self {
+            last_file_path: None,
+            configuration_split_ratio: None,
+            show_environment_on_run: true,
+            max_output_lines: default_max_output_lines(),
+            default_auto_scroll: true,
+            auto_check_updates: true,
+        }
+    }
 }
 
 /// 앱 설정 파일 경로. 홈 디렉터리를 찾을 수 없으면 `None`을 반환해 fail-closed한다.
@@ -279,5 +318,36 @@ mod tests {
             parse_config_file(&format!("{bom}{{\"version\":1,\"configurations\":[]}}")).is_ok()
         );
         assert!(parse_config_file(&format!("{bom}[]")).is_ok());
+    }
+
+    #[test]
+    fn app_settings_legacy_json_defaults_new_fields() {
+        // 신규 필드가 없는 구버전 설정 파일도 파싱되며 누락분은 기본값으로 채워진다(하위호환).
+        let legacy = r#"{"last_file_path":null,"configuration_split_ratio":0.3}"#;
+        let settings: AppSettings = serde_json::from_str(legacy).unwrap();
+        assert!(settings.show_environment_on_run);
+        assert_eq!(
+            settings.max_output_lines,
+            crate::models::DEFAULT_MAX_OUTPUT_LINES
+        );
+        assert!(settings.default_auto_scroll);
+        assert!(settings.auto_check_updates);
+    }
+
+    #[test]
+    fn app_settings_round_trip_preserves_fields() {
+        let settings = AppSettings {
+            show_environment_on_run: false,
+            max_output_lines: 12_345,
+            default_auto_scroll: false,
+            auto_check_updates: false,
+            ..AppSettings::default()
+        };
+        let json = serde_json::to_string(&settings).unwrap();
+        let back: AppSettings = serde_json::from_str(&json).unwrap();
+        assert!(!back.show_environment_on_run);
+        assert_eq!(back.max_output_lines, 12_345);
+        assert!(!back.default_auto_scroll);
+        assert!(!back.auto_check_updates);
     }
 }

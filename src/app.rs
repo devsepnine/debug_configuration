@@ -13,8 +13,8 @@ use crate::utils::{DIALOG_CANCELLED, ICON_DELETE, ICON_PLAY, ICON_REFRESH, ICON_
 use crate::views::shared::icon_tooltip;
 use crate::views::{
     EditorLoadingState, EditorSelectState, EnvModalView, FileDialogLoadingState, NodeLoadingState,
-    view_configuration_editor, view_configuration_list, view_env_modal, view_main_tabs,
-    view_pane_layout, view_toolbar, view_workspace_tab_bar,
+    SettingsModalView, view_configuration_editor, view_configuration_list, view_env_modal,
+    view_main_tabs, view_pane_layout, view_settings_modal, view_toolbar, view_workspace_tab_bar,
 };
 use crate::widgets::pane_grid;
 use iced::{
@@ -34,8 +34,10 @@ use uuid::Uuid;
 
 mod chrome;
 mod env_modal;
+mod settings_modal;
 
 use env_modal::EnvModalState;
+use settings_modal::SettingsModalState;
 
 use chrome::{
     SessionActionKind, empty_workspace_content_style, session_action_button_style,
@@ -342,6 +344,16 @@ pub struct RunConfigManager {
     env_bulk_inputs: HashMap<Uuid, String>,
     /// 환경변수 편집 모달 상태 (`Some`이면 모달 열림)
     env_modal: Option<EnvModalState>,
+    /// 앱 설정 모달 상태 (`Some`이면 모달 열림)
+    settings_modal: Option<SettingsModalState>,
+    /// 설정: 구성 실행 시 Environment 라인 표시 여부
+    show_environment_on_run: bool,
+    /// 설정: 새 세션의 출력 버퍼 최대 라인 수
+    max_output_lines: usize,
+    /// 설정: 새 세션의 자동 스크롤 초기값
+    default_auto_scroll: bool,
+    /// 설정: 앱 시작 시 업데이트 자동 확인
+    auto_check_updates: bool,
     file_dialog: FileDialogState,
 
     /// Node package script 캐시 (`config_id` 기준)
@@ -401,6 +413,7 @@ impl RunConfigManager {
         let settings = load_settings();
         let last_file_path = settings.last_file_path.clone();
         let configuration_split_ratio = settings.configuration_split_ratio.unwrap_or(0.30);
+        let auto_check_updates = settings.auto_check_updates;
 
         let app = Self {
             current_view: ViewMode::Configuration,
@@ -409,6 +422,11 @@ impl RunConfigManager {
             status_message: String::from("Ready"),
             env_bulk_inputs: HashMap::new(),
             env_modal: None,
+            settings_modal: None,
+            show_environment_on_run: settings.show_environment_on_run,
+            max_output_lines: settings.max_output_lines,
+            default_auto_scroll: settings.default_auto_scroll,
+            auto_check_updates,
             file_dialog: FileDialogState::default(),
             node_available_scripts: HashMap::new(),
             node_ui: NodeUiState::default(),
@@ -441,8 +459,8 @@ impl RunConfigManager {
             is_window_focused: true,
             last_file_path: last_file_path.clone(),
             update_available: None,
-            // 아래에서 시작 시 자동 체크 Task를 큐잉하므로 스피너를 켠 상태로 시작.
-            is_checking_update: true,
+            // 설정이 켜진 경우에만 아래에서 자동 체크 Task를 큐잉하므로 그에 맞춰 스피너 시작.
+            is_checking_update: auto_check_updates,
             update_spinner_frame: 0,
         };
 
@@ -471,11 +489,13 @@ impl RunConfigManager {
             ));
         }
 
-        // 3. 최신 버전 확인 (백그라운드, 실패는 비치명적)
-        tasks.push(Task::perform(
-            check_latest_release(),
-            Message::UpdateCheckCompleted,
-        ));
+        // 3. 최신 버전 확인 (설정이 켜진 경우만; 백그라운드, 실패는 비치명적)
+        if auto_check_updates {
+            tasks.push(Task::perform(
+                check_latest_release(),
+                Message::UpdateCheckCompleted,
+            ));
+        }
 
         (app, Task::batch(tasks))
     }
@@ -502,6 +522,19 @@ impl RunConfigManager {
             Message::SwitchView(view_mode) => {
                 self.current_view = view_mode;
                 Task::none()
+            }
+            Message::OpenSettingsModal => self.handle_open_settings_modal(),
+            Message::ConfirmSettingsModal => self.handle_confirm_settings_modal(),
+            Message::CancelSettingsModal => self.handle_cancel_settings_modal(),
+            Message::SettingsToggleEnvironment(value) => {
+                self.handle_settings_toggle_environment(value)
+            }
+            Message::SettingsMaxLinesChanged(text) => self.handle_settings_max_lines_changed(text),
+            Message::SettingsToggleAutoScroll(value) => {
+                self.handle_settings_toggle_auto_scroll(value)
+            }
+            Message::SettingsToggleAutoCheckUpdates(value) => {
+                self.handle_settings_toggle_auto_check_updates(value)
             }
             Message::AddConfiguration
             | Message::DeleteConfiguration(_)
@@ -931,6 +964,10 @@ impl RunConfigManager {
         save_settings(&AppSettings {
             last_file_path: self.last_file_path.clone(),
             configuration_split_ratio: Some(configuration_split_ratio(&self.configuration_layout)),
+            show_environment_on_run: self.show_environment_on_run,
+            max_output_lines: self.max_output_lines,
+            default_auto_scroll: self.default_auto_scroll,
+            auto_check_updates: self.auto_check_updates,
         });
     }
 
@@ -1138,6 +1175,15 @@ impl RunConfigManager {
         Task::none()
     }
 
+    /// 새 세션을 생성하며 현재 설정값(출력 라인 한도·자동 스크롤 기본)을 주입한다.
+    /// 설정은 생성 시점에 고정되므로 이미 실행 중인 세션에는 소급되지 않는다.
+    fn new_session(&self, config_name: String) -> RunSession {
+        let mut session = RunSession::new(config_name);
+        session.max_output_lines = self.max_output_lines;
+        session.auto_scroll = self.default_auto_scroll;
+        session
+    }
+
     fn handle_run_configuration(&mut self, index_opt: Option<usize>) -> Task<Message> {
         let index = index_opt.or(self.selected_config_index);
 
@@ -1156,7 +1202,7 @@ impl RunConfigManager {
 
             let config = config.clone();
 
-            let session = RunSession::new(config.name.clone());
+            let session = self.new_session(config.name.clone());
             let session_id = session.id;
             let cancel_flag = session.cancel_flag.clone();
 
@@ -1172,7 +1218,12 @@ impl RunConfigManager {
             self.current_view = ViewMode::Sessions;
 
             return Task::run(
-                run_configuration_stream(config, session_id, cancel_flag),
+                run_configuration_stream(
+                    config,
+                    session_id,
+                    cancel_flag,
+                    self.show_environment_on_run,
+                ),
                 |msg| msg,
             );
         }
@@ -1225,7 +1276,7 @@ impl RunConfigManager {
         let aspect = self.workspace_content_aspect();
         let mut tasks = Vec::new();
         for config in runnable {
-            let session = RunSession::new(config.name.clone());
+            let session = self.new_session(config.name.clone());
             let session_id = session.id;
             let cancel_flag = session.cancel_flag.clone();
 
@@ -1235,7 +1286,12 @@ impl RunConfigManager {
             }
 
             tasks.push(Task::run(
-                run_configuration_stream(config, session_id, cancel_flag),
+                run_configuration_stream(
+                    config,
+                    session_id,
+                    cancel_flag,
+                    self.show_environment_on_run,
+                ),
                 |msg| msg,
             ));
         }
@@ -2733,6 +2789,8 @@ impl RunConfigManager {
     }
 
     fn handle_rerun_session(&mut self, session_id: Uuid) -> Task<Message> {
+        // 재실행은 기존 세션 객체를 재사용하므로 max_output_lines/auto_scroll은 생성 시점 값을
+        // 유지한다(설정 변경 후 재실행해도 소급 적용 안 됨 — "새 세션부터" 정책과 일치).
         // 동시성 설계: 실행 중 재실행 시 이전 스트림과 새 스트림이 잠시 공존하지만 격리된다.
         // (1) 이전 cancel_flag.store(true)는 이전 스트림이 보유한 같은 Arc를 가리켜 이전
         //     실행을 중단시키고, 이후 cancel_flag를 새 Arc로 교체해 새 스트림과 분리한다.
@@ -2796,7 +2854,12 @@ impl RunConfigManager {
                 let config = config.clone();
 
                 return Task::run(
-                    run_configuration_stream(config, new_id, cancel_flag),
+                    run_configuration_stream(
+                        config,
+                        new_id,
+                        cancel_flag,
+                        self.show_environment_on_run,
+                    ),
                     |msg| msg,
                 );
             }
@@ -3986,6 +4049,19 @@ impl RunConfigManager {
             Subscription::none()
         };
 
+        // 설정 모달: Esc로 닫기 (필드가 적어 Tab 트랩은 불필요).
+        let settings_modal_keyboard_subscription = if self.settings_modal.is_some() {
+            event::listen_with(|event, _status, _id| match event {
+                Event::Keyboard(keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Named(keyboard::key::Named::Escape),
+                    ..
+                }) => Some(Message::CancelSettingsModal),
+                _ => None,
+            })
+        } else {
+            Subscription::none()
+        };
+
         let tab_name_edit_subscription = if self.tab_ui.editing_tab_name.is_some() {
             event::listen_with(|event, _status, _id| match event {
                 Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
@@ -4061,17 +4137,19 @@ impl RunConfigManager {
         // F1/F2 = 화면 전환(Configurations/Sessions), Cmd+1~9 = 해당 워크스페이스로 점프.
         // 모달이 열려 있거나 탭 이름 편집 중이면 비활성화해 입력/모달 작업을 보호한다.
         // 키→메시지 매핑은 nav_shortcut_message로 추출해 단위 테스트와 공유한다.
-        let nav_shortcut_subscription =
-            if self.env_modal.is_none() && self.tab_ui.editing_tab_name.is_none() {
-                event::listen_with(|event, _status, _id| match event {
-                    Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) => {
-                        Self::nav_shortcut_message(&key, modifiers)
-                    }
-                    _ => None,
-                })
-            } else {
-                Subscription::none()
-            };
+        let nav_shortcut_subscription = if self.env_modal.is_none()
+            && self.settings_modal.is_none()
+            && self.tab_ui.editing_tab_name.is_none()
+        {
+            event::listen_with(|event, _status, _id| match event {
+                Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) => {
+                    Self::nav_shortcut_message(&key, modifiers)
+                }
+                _ => None,
+            })
+        } else {
+            Subscription::none()
+        };
 
         // 업데이트 확인 중에만 스피너 애니메이션 tick을 발행한다.
         let update_spinner_subscription = if self.is_checking_update {
@@ -4085,6 +4163,7 @@ impl RunConfigManager {
             configuration_release_subscription,
             editor_focus_subscription,
             env_modal_keyboard_subscription,
+            settings_modal_keyboard_subscription,
             tab_name_edit_subscription,
             window_focus_subscription,
             search_open_subscription,
@@ -4140,6 +4219,16 @@ impl RunConfigManager {
                 entries: &modal.entries,
             };
             layers = layers.push(view_env_modal(props));
+        }
+
+        if let Some(modal) = self.settings_modal.as_ref() {
+            let props = SettingsModalView {
+                show_environment: modal.show_environment,
+                max_output_lines_text: &modal.max_output_lines_text,
+                default_auto_scroll: modal.default_auto_scroll,
+                auto_check_updates: modal.auto_check_updates,
+            };
+            layers = layers.push(view_settings_modal(props));
         }
 
         layers.width(Length::Fill).height(Length::Fill).into()

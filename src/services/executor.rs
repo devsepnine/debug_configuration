@@ -130,6 +130,7 @@ pub fn run_configuration_stream(
     config: RunConfiguration,
     session_id: Uuid,
     cancel_flag: Arc<AtomicBool>,
+    show_env: bool,
 ) -> impl iced::futures::Stream<Item = Message> {
     stream::channel(
         100,
@@ -139,7 +140,15 @@ pub fn run_configuration_stream(
 
             let (command_str, extra_env) = build_command(&config);
             let mut cmd = create_process_command(&config, &command_str, &extra_env);
-            send_command_info(&mut output, session_id, &config, &command_str, &extra_env).await;
+            send_command_info(
+                &mut output,
+                session_id,
+                &config,
+                &command_str,
+                &extra_env,
+                show_env,
+            )
+            .await;
 
             match cmd.spawn() {
                 Ok(child) => {
@@ -314,6 +323,7 @@ async fn send_command_info(
     config: &RunConfiguration,
     command_str: &str,
     extra_env: &[(String, String)],
+    show_env: bool,
 ) {
     use iced::futures::SinkExt;
 
@@ -327,7 +337,8 @@ async fn send_command_info(
         config.working_directory
     );
     // 환경변수는 더 이상 Command 문자열에 보이지 않으므로 별도 라인으로 표시해 가시성 유지.
-    if !config.environment_variables.is_empty() || !extra_env.is_empty() {
+    // 단, 설정에서 끄면(show_env=false) 출력하지 않는다.
+    if show_env && (!config.environment_variables.is_empty() || !extra_env.is_empty()) {
         let mut pairs: Vec<(String, String)> = config
             .environment_variables
             .iter()
@@ -1275,6 +1286,37 @@ mod tests {
 
         // 그 다음은 EOF.
         assert!(read_next_line(&mut reader).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn send_command_info_env_line_gated_by_show_env() {
+        use iced::futures::StreamExt;
+        use iced::futures::channel::mpsc;
+
+        let mut config = RunConfiguration {
+            name: "T".to_string(),
+            ..RunConfiguration::default()
+        };
+        config
+            .environment_variables
+            .insert("FOO".to_string(), "bar".to_string());
+
+        async fn header(config: &RunConfiguration, show_env: bool) -> String {
+            let (mut tx, mut rx) = mpsc::channel(16);
+            send_command_info(&mut tx, Uuid::new_v4(), config, "echo hi", &[], show_env).await;
+            drop(tx);
+            let mut out = String::new();
+            while let Some(msg) = rx.next().await {
+                if let Message::OutputReceived(_, s) = msg {
+                    out.push_str(&s);
+                }
+            }
+            out
+        }
+
+        // show_env=true면 Environment 라인 포함, false면 제외
+        assert!(header(&config, true).await.contains("Environment:"));
+        assert!(!header(&config, false).await.contains("Environment:"));
     }
 
     #[test]

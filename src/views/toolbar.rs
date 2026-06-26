@@ -1,5 +1,5 @@
 use crate::messages::Message;
-use crate::utils::{ICON_ADD, ICON_FOLDER_OPEN, ICON_SAVE};
+use crate::utils::{ICON_ADD, ICON_FOLDER_OPEN, ICON_SAVE, ICON_SETTINGS};
 use crate::views::shared::{IconButtonState, icon_button_foreground, icon_tooltip};
 use iced::{
     Element, Length, Theme,
@@ -13,8 +13,11 @@ pub fn view_toolbar() -> Element<'static, Message> {
     let add_btn = toolbar_button("Add", ICON_ADD, Message::AddConfiguration);
     let open_btn = toolbar_button("Open", ICON_FOLDER_OPEN, Message::OpenConfigurations);
     let save_btn = toolbar_button("Save", ICON_SAVE, Message::SaveConfigurations);
+    let settings_btn = toolbar_button("Settings", ICON_SETTINGS, Message::OpenSettingsModal);
 
-    row![add_btn, open_btn, save_btn].spacing(4).into()
+    row![add_btn, open_btn, save_btn, settings_btn]
+        .spacing(4)
+        .into()
 }
 
 fn toolbar_button(
