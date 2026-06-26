@@ -1,7 +1,7 @@
 use crate::messages::Message;
 use crate::models::{
-    ConfigTypeData, ConfigurationType, ExecuteMode, ExecuteModeType, NodeCommand, PackageManager,
-    RunConfiguration,
+    ConfigTypeData, ConfigurationType, ExecuteMode, ExecuteModeType, KotlinLaunchMode,
+    KotlinLaunchModeType, NodeCommand, PackageManager, RunConfiguration,
 };
 use crate::utils::{
     ICON_CLOSE, ICON_COPY, ICON_DELETE, ICON_EDIT, ICON_FOLDER_OPEN, ICON_REFRESH, to_relative_path,
@@ -29,6 +29,8 @@ pub struct FileDialogLoadingState {
     pub folder: bool,
     pub script_file: bool,
     pub interpreter: bool,
+    pub kotlin_jar: bool,
+    pub kotlin_jdk: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -51,6 +53,8 @@ pub struct EditorSelectState {
     pub node_runtime: combo_box::State<String>,
     pub package_json: combo_box::State<String>,
     pub node_script: combo_box::State<String>,
+    pub kotlin_launch_mode: combo_box::State<KotlinLaunchModeType>,
+    pub jdk: combo_box::State<String>,
 }
 
 impl EditorSelectState {
@@ -63,12 +67,18 @@ impl EditorSelectState {
             node_runtime: combo_box::State::new(vec![String::from("Default (system)")]),
             package_json: combo_box::State::new(Vec::new()),
             node_script: combo_box::State::new(Vec::new()),
+            kotlin_launch_mode: combo_box::State::new(KotlinLaunchModeType::ALL.to_vec()),
+            jdk: combo_box::State::new(vec![String::from("Default (system)")]),
         }
     }
 
     pub fn set_node_runtimes(&mut self, runtimes: &[(String, String)]) {
         self.node_runtime =
             combo_box::State::new(runtimes.iter().map(|(label, _)| label.clone()).collect());
+    }
+
+    pub fn set_jdks(&mut self, jdks: &[(String, String)]) {
+        self.jdk = combo_box::State::new(jdks.iter().map(|(label, _)| label.clone()).collect());
     }
 
     pub fn set_package_jsons(&mut self, package_jsons: Vec<String>) {
@@ -98,6 +108,7 @@ impl Default for EditorSelectState {
 /// * `loading` - 파일 다이얼로그 / 노드 로딩 상태
 /// * `select_state` - 콤보박스 상태
 /// * `available_node_runtimes` - 시스템에서 감지된 Node.js 런타임 목록
+/// * `available_jdks` - 시스템에서 감지된 JDK 목록
 ///
 /// # Note
 /// iced 프레임워크의 view 함수는 많은 파라미터를 받는 것이 일반적인 패턴입니다.
@@ -109,6 +120,7 @@ pub fn view_configuration_editor<'a>(
     loading: EditorLoadingState,
     select_state: &'a EditorSelectState,
     available_node_runtimes: &'a [(String, String)],
+    available_jdks: &'a [(String, String)],
 ) -> Element<'a, Message> {
     let Some(index) = selected_config_index else {
         return view_empty_configuration_editor();
@@ -154,6 +166,21 @@ pub fn view_configuration_editor<'a>(
                 is_loading_scripts: loading.node.scripts,
                 is_loading_project_directory: loading.node.project_directory,
             },
+        ),
+        ConfigTypeData::Kotlin {
+            jdk_path,
+            launch_mode,
+            vm_options,
+            program_arguments,
+        } => view_kotlin_fields(
+            launch_mode,
+            vm_options,
+            program_arguments,
+            jdk_path.as_ref(),
+            available_jdks,
+            select_state,
+            loading.file_dialog.kotlin_jar,
+            loading.file_dialog.kotlin_jdk,
         ),
         ConfigTypeData::Compound { members, workspace } => {
             view_compound_fields(members, workspace.as_deref(), configurations, index)
@@ -1367,4 +1394,177 @@ fn view_node_options_row(node_options: &str) -> iced::widget::Row<'_, Message> {
             .on_input(Message::NodeOptionsChanged)
             .into(),
     )
+}
+
+/// Kotlin 타입 필드 렌더링
+///
+/// 실행 모드(Main class / JAR), 모드별 필드, VM options, program arguments, JDK 선택
+#[allow(clippy::too_many_arguments)]
+fn view_kotlin_fields<'a>(
+    launch_mode: &'a KotlinLaunchMode,
+    vm_options: &'a str,
+    program_arguments: &'a str,
+    jdk_path: Option<&'a String>,
+    available_jdks: &'a [(String, String)],
+    select_state: &'a EditorSelectState,
+    is_loading_kotlin_jar: bool,
+    is_loading_kotlin_jdk: bool,
+) -> Element<'a, Message> {
+    let mut col =
+        column![view_kotlin_launch_mode_row(launch_mode, select_state)].width(Length::Fill);
+
+    match launch_mode {
+        KotlinLaunchMode::MainClass {
+            main_class,
+            classpath,
+        } => {
+            col = col
+                .push(Space::new().height(10))
+                .push(view_kotlin_main_class_row(main_class))
+                .push(Space::new().height(10))
+                .push(view_kotlin_classpath_row(classpath));
+        }
+        KotlinLaunchMode::Jar { jar_path } => {
+            col = col
+                .push(Space::new().height(10))
+                .push(view_kotlin_jar_path_row(jar_path, is_loading_kotlin_jar));
+        }
+    }
+
+    col = col
+        .push(Space::new().height(10))
+        .push(view_kotlin_vm_options_row(vm_options))
+        .push(Space::new().height(10))
+        .push(view_kotlin_program_arguments_row(program_arguments))
+        .push(Space::new().height(10))
+        .push(view_kotlin_jdk_row(
+            jdk_path,
+            available_jdks,
+            select_state,
+            is_loading_kotlin_jdk,
+        ));
+
+    col.into()
+}
+
+fn view_kotlin_launch_mode_row<'a>(
+    launch_mode: &'a KotlinLaunchMode,
+    select_state: &'a EditorSelectState,
+) -> iced::widget::Row<'a, Message> {
+    // 단위 variant라 rvalue static promotion으로 &'static 참조를 얻는다 (ExecuteModeType 동일 패턴).
+    let current_mode_type = match launch_mode {
+        KotlinLaunchMode::MainClass { .. } => &KotlinLaunchModeType::MainClass,
+        KotlinLaunchMode::Jar { .. } => &KotlinLaunchModeType::Jar,
+    };
+
+    view_editor_row(
+        "Launch Mode:",
+        editor_combo_box(
+            &select_state.kotlin_launch_mode,
+            "Select launch mode",
+            Some(current_mode_type),
+            Message::KotlinLaunchModeChanged,
+        )
+        .into(),
+    )
+}
+
+fn view_kotlin_main_class_row(main_class: &str) -> iced::widget::Row<'_, Message> {
+    view_editor_row(
+        "Main Class:",
+        editor_input("com.example.MainKt", main_class)
+            .on_input(Message::KotlinMainClassChanged)
+            .into(),
+    )
+}
+
+fn view_kotlin_classpath_row(classpath: &str) -> iced::widget::Row<'_, Message> {
+    view_editor_row(
+        "Classpath:",
+        editor_input("build/libs/*:libs/*", classpath)
+            .on_input(Message::KotlinClasspathChanged)
+            .into(),
+    )
+}
+
+fn view_kotlin_jar_path_row(
+    jar_path: &str,
+    is_loading_kotlin_jar: bool,
+) -> iced::widget::Row<'_, Message> {
+    let path_input = editor_input("Path to .jar", jar_path).on_input(Message::KotlinJarPathChanged);
+
+    let mut browse_btn = icon_button(ICON_FOLDER_OPEN, None)
+        .padding(0)
+        .width(34)
+        .height(34);
+
+    if !is_loading_kotlin_jar {
+        browse_btn = browse_btn.on_press(Message::BrowseKotlinJarPath);
+    }
+
+    row![
+        container(text("JAR Path:").size(12).style(editor_label_style)).width(Length::Fixed(136.0)),
+        path_input,
+        browse_btn,
+    ]
+    .spacing(10)
+    .align_y(Alignment::Center)
+    .width(Length::Fill)
+}
+
+fn view_kotlin_vm_options_row(vm_options: &str) -> iced::widget::Row<'_, Message> {
+    view_editor_row(
+        "VM Options:",
+        editor_input("-Xmx2g -Dkey=value", vm_options)
+            .on_input(Message::KotlinVmOptionsChanged)
+            .into(),
+    )
+}
+
+fn view_kotlin_program_arguments_row(program_arguments: &str) -> iced::widget::Row<'_, Message> {
+    view_editor_row(
+        "Program Args:",
+        editor_input("arg1 arg2", program_arguments)
+            .on_input(Message::KotlinProgramArgumentsChanged)
+            .into(),
+    )
+}
+
+fn view_kotlin_jdk_row<'a>(
+    jdk_path: Option<&'a String>,
+    available_jdks: &'a [(String, String)],
+    select_state: &'a EditorSelectState,
+    is_loading_kotlin_jdk: bool,
+) -> iced::widget::Row<'a, Message> {
+    let current_jdk = jdk_path.map_or("java", String::as_str);
+    // 감지 목록에서 레이블을 찾고, 없으면(수동 선택 경로) 원시 경로를 그대로 표시.
+    let current_label = available_jdks
+        .iter()
+        .find(|(_, path)| path == current_jdk)
+        .map(|(label, _)| label)
+        .or(jdk_path);
+
+    let mut browse_btn = icon_button(ICON_FOLDER_OPEN, None)
+        .padding(0)
+        .width(34)
+        .height(34);
+
+    if !is_loading_kotlin_jdk {
+        browse_btn = browse_btn.on_press(Message::BrowseKotlinJdk);
+    }
+
+    row![
+        container(text("JDK:").size(12).style(editor_label_style)).width(Length::Fixed(136.0)),
+        container(editor_combo_box(
+            &select_state.jdk,
+            "Search JDK",
+            current_label,
+            Message::KotlinJdkChanged,
+        ))
+        .width(Length::Fill),
+        browse_btn,
+    ]
+    .spacing(10)
+    .align_y(Alignment::Center)
+    .width(Length::Fill)
 }

@@ -94,6 +94,7 @@ pub const ICON_PLAY: &[u8] = include_bytes!("../assets/mingcute--play-fill.svg")
 pub const ICON_TYPE_APPLICATION: &[u8] = include_bytes!("../assets/app--type-application.svg");
 pub const ICON_TYPE_SHELL: &[u8] = include_bytes!("../assets/app--type-shell.svg");
 pub const ICON_TYPE_NODE: &[u8] = include_bytes!("../assets/app--type-node.svg");
+pub const ICON_TYPE_KOTLIN: &[u8] = include_bytes!("../assets/app--type-kotlin.svg");
 pub const ICON_TYPE_COMPOUND: &[u8] = include_bytes!("../assets/app--type-compound.svg");
 
 // Pane View
@@ -423,6 +424,208 @@ fn collect_nvm_dir(
     }
 }
 
+/// JDK(`java` 런타임) 경로 감지 (시스템 전체)
+///
+/// # Returns
+/// * `Vec<(label, path)>` - 표시용 레이블과 `java` 실행 파일(또는 "java") 경로 튜플 목록
+///   예: [("Default (system)", "java"), ("21.0.1 (sdkman) - /Users/.../bin/java", "/Users/.../bin/java")]
+pub fn detect_jdks() -> Vec<(String, String)> {
+    let mut jdks = Vec::new();
+
+    add_runtime(
+        &mut jdks,
+        String::from("Default (system)"),
+        String::from("java"),
+    );
+
+    #[cfg(target_os = "windows")]
+    {
+        collect_windows_jdks(&mut jdks);
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        collect_macos_jdks(&mut jdks);
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        collect_linux_jdks(&mut jdks);
+    }
+
+    // 공통: JAVA_HOME + SDKMAN (해당 경로가 없으면 no-op)
+    collect_env_and_sdkman_jdks(&mut jdks);
+
+    jdks
+}
+
+/// 플랫폼별 `java` 실행 파일 이름. executor의 JDK 경로 해석에서도 재사용.
+pub fn java_executable_name() -> &'static str {
+    #[cfg(target_os = "windows")]
+    {
+        "java.exe"
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        "java"
+    }
+}
+
+/// `java -version`의 버전 문자열 추출. java는 버전을 **stderr**로 출력하므로
+/// stdout만 읽는 `command_version`을 쓸 수 없다.
+fn java_version(path: &Path) -> Option<String> {
+    let mut command = std::process::Command::new(path);
+    command.arg("-version");
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    let output = command.output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let text = String::from_utf8_lossy(&output.stderr);
+    let first_line = text.lines().next()?.trim();
+    // 따옴표 안 버전 토큰 추출 (예: openjdk version "21.0.1" → 21.0.1), 없으면 첫 줄 전체
+    let version = first_line
+        .split('"')
+        .nth(1)
+        .map_or_else(|| first_line.to_string(), str::to_string);
+    Some(version)
+}
+
+/// JDK home(`<home>/bin/java`)에서 `java`를 찾아 버전과 함께 목록에 추가.
+fn add_jdk_from_home(jdks: &mut Vec<(String, String)>, home: &Path, source: &str) {
+    let java_bin = home.join("bin").join(java_executable_name());
+    if !java_bin.exists() {
+        return;
+    }
+    if let Some(version) = java_version(&java_bin) {
+        let path_str = java_bin.to_string_lossy().to_string();
+        add_runtime(jdks, format!("{version} ({source}) - {path_str}"), path_str);
+    }
+}
+
+/// `parent` 하위 각 디렉터리를 JDK home으로 간주하고 수집.
+/// `home_suffix`는 자식에서 home까지의 상대 경로 (macOS는 "Contents/Home", 그 외는 "").
+fn collect_jdks_in(
+    jdks: &mut Vec<(String, String)>,
+    parent: &Path,
+    home_suffix: &str,
+    source: &str,
+) {
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let mut home = entry.path();
+        if !home.is_dir() {
+            continue;
+        }
+        if !home_suffix.is_empty() {
+            home = home.join(home_suffix);
+        }
+        add_jdk_from_home(jdks, &home, source);
+    }
+}
+
+/// `which -a java` (Unix PATH)로 JDK 수집.
+#[cfg(unix)]
+fn collect_path_jdks(jdks: &mut Vec<(String, String)>) {
+    if let Ok(output) = std::process::Command::new("sh")
+        .args(["-c", "which -a java 2>/dev/null"])
+        .output()
+        && output.status.success()
+    {
+        let paths = String::from_utf8_lossy(&output.stdout);
+        for path in paths
+            .lines()
+            .map(str::trim)
+            .filter(|path| !path.is_empty() && *path != "java")
+        {
+            if let Some(version) = java_version(Path::new(path)) {
+                add_runtime(jdks, format!("{version} - {path}"), path.to_string());
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn collect_macos_jdks(jdks: &mut Vec<(String, String)>) {
+    collect_path_jdks(jdks);
+    collect_jdks_in(
+        jdks,
+        Path::new("/Library/Java/JavaVirtualMachines"),
+        "Contents/Home",
+        "system",
+    );
+    if let Ok(home) = std::env::var("HOME") {
+        collect_jdks_in(
+            jdks,
+            &PathBuf::from(home).join("Library/Java/JavaVirtualMachines"),
+            "Contents/Home",
+            "user",
+        );
+    }
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn collect_linux_jdks(jdks: &mut Vec<(String, String)>) {
+    collect_path_jdks(jdks);
+    collect_jdks_in(jdks, Path::new("/usr/lib/jvm"), "", "system");
+}
+
+#[cfg(target_os = "windows")]
+fn collect_windows_jdks(jdks: &mut Vec<(String, String)>) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    if let Ok(output) = std::process::Command::new("cmd")
+        .args(["/C", "where", "java"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        && output.status.success()
+    {
+        let paths = String::from_utf8_lossy(&output.stdout);
+        for path in paths
+            .lines()
+            .map(str::trim)
+            .filter(|path| !path.is_empty() && *path != "java")
+        {
+            if let Some(version) = java_version(Path::new(path)) {
+                add_runtime(jdks, format!("{version} - {path}"), path.to_string());
+            }
+        }
+    }
+
+    for base in [
+        "C:\\Program Files\\Java",
+        "C:\\Program Files\\Eclipse Adoptium",
+    ] {
+        collect_jdks_in(jdks, Path::new(base), "", "system");
+    }
+}
+
+/// `JAVA_HOME`과 SDKMAN(`~/.sdkman/candidates/java`)에서 JDK 수집 (전 플랫폼 공통).
+fn collect_env_and_sdkman_jdks(jdks: &mut Vec<(String, String)>) {
+    if let Ok(java_home) = std::env::var("JAVA_HOME")
+        && !java_home.trim().is_empty()
+    {
+        add_jdk_from_home(jdks, &PathBuf::from(java_home), "JAVA_HOME");
+    }
+
+    if let Ok(home) = std::env::var("HOME") {
+        let sdkman = PathBuf::from(home).join(".sdkman/candidates/java");
+        collect_jdks_in(jdks, &sdkman, "", "sdkman");
+    }
+}
+
 /// 절대 경로를 `project_directory` 기준 상대 경로로 변환
 ///
 /// # Arguments
@@ -452,6 +655,16 @@ pub fn to_relative_path(absolute_path: &Path, project_dir: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detect_jdks_always_includes_system_default() {
+        let jdks = detect_jdks();
+        assert!(
+            jdks.iter()
+                .any(|(label, path)| label == "Default (system)" && path == "java"),
+            "detect_jdks must always include the system default entry"
+        );
+    }
 
     #[test]
     fn truncate_text_keeps_short_strings() {

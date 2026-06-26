@@ -1,7 +1,8 @@
 use crate::messages::{ConfigurationDropPosition, Message, ViewMode};
 use crate::models::{
-    ConfigTypeData, ConfigurationType, ExecuteMode, ExecuteModeType, LayoutId, PackageManager,
-    RunConfiguration, RunSession, SearchState, SessionStatusKind, WorkspaceTab,
+    ConfigTypeData, ConfigurationType, ExecuteMode, ExecuteModeType, KotlinLaunchMode,
+    KotlinLaunchModeType, LayoutId, PackageManager, RunConfiguration, RunSession, SearchState,
+    SessionStatusKind, WorkspaceTab,
 };
 use crate::services::{
     AppSettings, UpdateOutcome, check_latest_release, export_text, load_from_path, load_settings,
@@ -53,6 +54,8 @@ struct FileDialogState {
     is_loading_folder: bool,
     is_loading_script_file: bool,
     is_loading_interpreter: bool,
+    is_loading_kotlin_jar: bool,
+    is_loading_kotlin_jdk: bool,
 }
 
 #[derive(Default)]
@@ -349,6 +352,8 @@ pub struct RunConfigManager {
     node_available_package_jsons: HashMap<Uuid, Vec<String>>,
     /// 시스템에서 감지된 Node.js Runtime 목록 (label, path)
     available_node_runtimes: Vec<(String, String)>,
+    /// 시스템에서 감지된 JDK 목록 (label, path)
+    available_jdks: Vec<(String, String)>,
 
     /// 실행 중인 세션 목록
     sessions: Vec<RunSession>,
@@ -410,6 +415,7 @@ impl RunConfigManager {
             editor_select_state: EditorSelectState::new(),
             node_available_package_jsons: HashMap::new(),
             available_node_runtimes: vec![("Default (system)".to_string(), "node".to_string())],
+            available_jdks: vec![("Default (system)".to_string(), "java".to_string())],
             sessions: vec![],
             hovered_session_index: None,
             workspace_tabs: vec![WorkspaceTab::empty(String::from("Workspace 1"))],
@@ -447,6 +453,12 @@ impl RunConfigManager {
         tasks.push(Task::perform(
             async { crate::utils::detect_node_runtimes() },
             Message::NodeRuntimesDetected,
+        ));
+
+        // 1-1. JDK 감지 (백그라운드)
+        tasks.push(Task::perform(
+            async { crate::utils::detect_jdks() },
+            Message::JdksDetected,
         ));
 
         // 2. 마지막 파일이 있으면 자동 로드
@@ -528,6 +540,18 @@ impl RunConfigManager {
             | Message::NodeArgumentsChanged(_)
             | Message::NodeOptionsChanged(_)
             | Message::NodeRefreshScripts
+            | Message::KotlinLaunchModeChanged(_)
+            | Message::KotlinMainClassChanged(_)
+            | Message::KotlinClasspathChanged(_)
+            | Message::KotlinJarPathChanged(_)
+            | Message::BrowseKotlinJarPath
+            | Message::KotlinJarPathSelected(_)
+            | Message::KotlinVmOptionsChanged(_)
+            | Message::KotlinProgramArgumentsChanged(_)
+            | Message::KotlinJdkChanged(_)
+            | Message::BrowseKotlinJdk
+            | Message::KotlinJdkPathSelected(_)
+            | Message::JdksDetected(_)
             | Message::WorkingDirectoryChanged(_)
             | Message::BrowseWorkingDirectory
             | Message::WorkingDirectorySelected(_)
@@ -667,6 +691,22 @@ impl RunConfigManager {
             Message::NodeArgumentsChanged(value) => self.handle_node_arguments_changed(value),
             Message::NodeOptionsChanged(value) => self.handle_node_options_changed(value),
             Message::NodeRefreshScripts => self.handle_node_refresh_scripts(),
+            Message::KotlinLaunchModeChanged(mode_type) => {
+                self.handle_kotlin_launch_mode_changed(mode_type)
+            }
+            Message::KotlinMainClassChanged(value) => self.handle_kotlin_main_class_changed(value),
+            Message::KotlinClasspathChanged(value) => self.handle_kotlin_classpath_changed(value),
+            Message::KotlinJarPathChanged(value) => self.handle_kotlin_jar_path_changed(value),
+            Message::BrowseKotlinJarPath => self.handle_browse_kotlin_jar_path(),
+            Message::KotlinJarPathSelected(result) => self.handle_kotlin_jar_path_selected(result),
+            Message::KotlinVmOptionsChanged(value) => self.handle_kotlin_vm_options_changed(value),
+            Message::KotlinProgramArgumentsChanged(value) => {
+                self.handle_kotlin_program_arguments_changed(value)
+            }
+            Message::KotlinJdkChanged(label) => self.handle_kotlin_jdk_changed(label),
+            Message::BrowseKotlinJdk => self.handle_browse_kotlin_jdk(),
+            Message::KotlinJdkPathSelected(result) => self.handle_kotlin_jdk_path_selected(result),
+            Message::JdksDetected(jdks) => self.handle_jdks_detected(jdks),
             Message::WorkingDirectoryChanged(dir) => self.handle_working_directory_changed(&dir),
             Message::BrowseWorkingDirectory => self.handle_browse_working_directory(),
             Message::WorkingDirectorySelected(result) => {
@@ -1347,6 +1387,12 @@ impl RunConfigManager {
                         arguments: String::new(),
                         node_options: String::new(),
                     },
+                    ConfigurationType::Kotlin => ConfigTypeData::Kotlin {
+                        jdk_path: None,
+                        launch_mode: KotlinLaunchMode::default(),
+                        vm_options: String::new(),
+                        program_arguments: String::new(),
+                    },
                     ConfigurationType::Compound => ConfigTypeData::Compound {
                         members: Vec::new(),
                         workspace: None,
@@ -1789,6 +1835,176 @@ impl RunConfigManager {
             *node.node_options = value;
         }
 
+        Task::none()
+    }
+
+    fn handle_kotlin_launch_mode_changed(
+        &mut self,
+        mode_type: KotlinLaunchModeType,
+    ) -> Task<Message> {
+        // 동일 모드 재선택 시 입력값이 사라지지 않도록 변경이 있을 때만 교체.
+        if let Some(kotlin) = self
+            .selected_type_data_mut()
+            .and_then(ConfigTypeData::kotlin_mut)
+            && kotlin.launch_mode.mode_type() != mode_type
+        {
+            *kotlin.launch_mode = match mode_type {
+                KotlinLaunchModeType::MainClass => KotlinLaunchMode::MainClass {
+                    main_class: String::new(),
+                    classpath: String::new(),
+                },
+                KotlinLaunchModeType::Jar => KotlinLaunchMode::Jar {
+                    jar_path: String::new(),
+                },
+            };
+        }
+
+        Task::none()
+    }
+
+    fn handle_kotlin_main_class_changed(&mut self, value: String) -> Task<Message> {
+        if let Some(main_class) = self
+            .selected_type_data_mut()
+            .and_then(ConfigTypeData::kotlin_main_class_mut)
+        {
+            *main_class.main_class = value;
+        }
+
+        Task::none()
+    }
+
+    fn handle_kotlin_classpath_changed(&mut self, value: String) -> Task<Message> {
+        if let Some(main_class) = self
+            .selected_type_data_mut()
+            .and_then(ConfigTypeData::kotlin_main_class_mut)
+        {
+            *main_class.classpath = value;
+        }
+
+        Task::none()
+    }
+
+    fn handle_kotlin_jar_path_changed(&mut self, value: String) -> Task<Message> {
+        if let Some(jar_path) = self
+            .selected_type_data_mut()
+            .and_then(ConfigTypeData::kotlin_jar_path_mut)
+        {
+            *jar_path = value;
+        }
+
+        Task::none()
+    }
+
+    fn handle_browse_kotlin_jar_path(&mut self) -> Task<Message> {
+        self.file_dialog.is_loading_kotlin_jar = true;
+        pick_path_task(
+            "Select JAR File",
+            Some(("JAR Files", &["jar"])),
+            false,
+            Message::KotlinJarPathSelected,
+        )
+    }
+
+    fn handle_kotlin_jar_path_selected(&mut self, result: Result<String, String>) -> Task<Message> {
+        self.file_dialog.is_loading_kotlin_jar = false;
+
+        match result {
+            Ok(path) => {
+                if let Some(jar_path) = self
+                    .selected_type_data_mut()
+                    .and_then(ConfigTypeData::kotlin_jar_path_mut)
+                {
+                    jar_path.clone_from(&path);
+                }
+                self.status_message = format!("JAR file selected: {path}");
+            }
+            Err(error) => {
+                self.status_message = cancellable_status(&error, "JAR file selection");
+            }
+        }
+
+        Task::none()
+    }
+
+    fn handle_kotlin_vm_options_changed(&mut self, value: String) -> Task<Message> {
+        if let Some(kotlin) = self
+            .selected_type_data_mut()
+            .and_then(ConfigTypeData::kotlin_mut)
+        {
+            *kotlin.vm_options = value;
+        }
+
+        Task::none()
+    }
+
+    fn handle_kotlin_program_arguments_changed(&mut self, value: String) -> Task<Message> {
+        if let Some(kotlin) = self
+            .selected_type_data_mut()
+            .and_then(ConfigTypeData::kotlin_mut)
+        {
+            *kotlin.program_arguments = value;
+        }
+
+        Task::none()
+    }
+
+    fn handle_kotlin_jdk_changed(&mut self, label: String) -> Task<Message> {
+        let actual_path = self
+            .available_jdks
+            .iter()
+            .find(|(jdk_label, _)| jdk_label == &label)
+            .map(|(_, path)| path.clone())
+            .unwrap_or(label);
+
+        if let Some(kotlin) = self
+            .selected_type_data_mut()
+            .and_then(ConfigTypeData::kotlin_mut)
+        {
+            *kotlin.jdk_path = if actual_path == "java" {
+                None
+            } else {
+                Some(actual_path)
+            };
+        }
+
+        Task::none()
+    }
+
+    fn handle_browse_kotlin_jdk(&mut self) -> Task<Message> {
+        self.file_dialog.is_loading_kotlin_jdk = true;
+        // JDK는 home 디렉터리를 고른다 (executor가 bin/java를 해석).
+        pick_path_task(
+            "Select JDK Home",
+            None,
+            true,
+            Message::KotlinJdkPathSelected,
+        )
+    }
+
+    fn handle_kotlin_jdk_path_selected(&mut self, result: Result<String, String>) -> Task<Message> {
+        self.file_dialog.is_loading_kotlin_jdk = false;
+
+        match result {
+            Ok(path) => {
+                if let Some(kotlin) = self
+                    .selected_type_data_mut()
+                    .and_then(ConfigTypeData::kotlin_mut)
+                {
+                    *kotlin.jdk_path = Some(path.clone());
+                }
+                self.status_message = format!("JDK selected: {path}");
+            }
+            Err(error) => {
+                self.status_message = cancellable_status(&error, "JDK selection");
+            }
+        }
+
+        Task::none()
+    }
+
+    fn handle_jdks_detected(&mut self, jdks: Vec<(String, String)>) -> Task<Message> {
+        self.available_jdks = jdks;
+        self.editor_select_state.set_jdks(&self.available_jdks);
         Task::none()
     }
 
@@ -3534,6 +3750,8 @@ impl RunConfigManager {
                                             folder: self.file_dialog.is_loading_folder,
                                             script_file: self.file_dialog.is_loading_script_file,
                                             interpreter: self.file_dialog.is_loading_interpreter,
+                                            kotlin_jar: self.file_dialog.is_loading_kotlin_jar,
+                                            kotlin_jdk: self.file_dialog.is_loading_kotlin_jdk,
                                         },
                                         node: NodeLoadingState {
                                             scripts: self.node_ui.is_loading_node_scripts,
@@ -3544,6 +3762,7 @@ impl RunConfigManager {
                                     },
                                     &self.editor_select_state,
                                     &self.available_node_runtimes,
+                                    &self.available_jdks,
                                 ))
                                 .width(Length::Fill)
                                 .height(Length::Shrink),

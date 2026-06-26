@@ -1,5 +1,7 @@
 use crate::messages::Message;
-use crate::models::{ConfigTypeData, ExecuteMode, NodeCommand, PackageManager, RunConfiguration};
+use crate::models::{
+    ConfigTypeData, ExecuteMode, KotlinLaunchMode, NodeCommand, PackageManager, RunConfiguration,
+};
 use iced::stream;
 use std::collections::HashSet;
 use std::fmt::Write as _;
@@ -204,6 +206,21 @@ fn build_command(config: &RunConfiguration) -> (String, Vec<(String, String)>) {
                 vec![(String::from("NODE_OPTIONS"), node_options.clone())]
             };
             (command_str, extra_env)
+        }
+        ConfigTypeData::Kotlin {
+            jdk_path,
+            launch_mode,
+            vm_options,
+            program_arguments,
+        } => {
+            let command_str = build_kotlin_command(KotlinCommandParts {
+                jdk_path: jdk_path.as_ref(),
+                launch_mode,
+                vm_options,
+                program_arguments,
+            });
+            // VM options는 명령줄에 직접 노출하므로 별도 환경변수 불필요.
+            (command_str, Vec::new())
         }
         // Compound 구성은 셸 명령이 없다 — app.rs가 멤버별로 펼쳐 실행하므로
         // 이 스트림 경로에는 도달하지 않는다 (방어적으로 빈 명령 반환).
@@ -912,6 +929,104 @@ fn package_manager_command_args(
     vec![command.as_str().to_string()]
 }
 
+/// Kotlin 타입의 명령어 생성에 필요한 필드 묶음.
+struct KotlinCommandParts<'a> {
+    jdk_path: Option<&'a String>,
+    launch_mode: &'a KotlinLaunchMode,
+    vm_options: &'a str,
+    program_arguments: &'a str,
+}
+
+/// Kotlin 구성의 셸 명령 문자열 생성 (`java` 경유).
+///
+/// MainClass: `java [vm_options] -cp "<classpath>" <main_class> [program_arguments]`
+/// Jar:       `java [vm_options] -jar <jar_path> [program_arguments]`
+fn build_kotlin_command(parts: KotlinCommandParts<'_>) -> String {
+    let java = resolve_java_executable(parts.jdk_path);
+
+    // Windows PowerShell에서는 공백이 포함된 경로를 & "경로" 형태로 실행해야 함
+    #[cfg(target_os = "windows")]
+    let java_cmd = if java.starts_with('"') {
+        format!("& {java}")
+    } else {
+        java
+    };
+
+    #[cfg(not(target_os = "windows"))]
+    let java_cmd = java;
+
+    let mut cmd_parts = vec![java_cmd];
+
+    // VM options(-Xmx 등)는 main class / -jar 앞에 위치
+    if !parts.vm_options.trim().is_empty() {
+        cmd_parts.push(parts.vm_options.trim().to_string());
+    }
+
+    match parts.launch_mode {
+        KotlinLaunchMode::MainClass {
+            main_class,
+            classpath,
+        } => {
+            // classpath는 항상 따옴표로 감싼다 — `build/libs/*` 같은 와일드카드를
+            // 셸이 glob 확장하지 않고 java로 그대로 전달해야 하기 때문. 내부 `"`는
+            // 이스케이프해 따옴표 breakout(파싱 오류/주입)을 막는다.
+            if !classpath.trim().is_empty() {
+                cmd_parts.push(String::from("-cp"));
+                let escaped = classpath.trim().replace('"', "\\\"");
+                cmd_parts.push(format!("\"{escaped}\""));
+            }
+            if !main_class.trim().is_empty() {
+                cmd_parts.push(main_class.trim().to_string());
+            }
+        }
+        KotlinLaunchMode::Jar { jar_path } => {
+            cmd_parts.push(String::from("-jar"));
+            cmd_parts.push(quote_if_needed(jar_path.trim()));
+        }
+    }
+
+    if !parts.program_arguments.trim().is_empty() {
+        cmd_parts.push(parts.program_arguments.trim().to_string());
+    }
+
+    cmd_parts.join(" ")
+}
+
+/// `jdk_path`(JDK home 디렉터리 또는 `java` 실행 파일 경로)로부터 실행할 `java` 명령을 해석.
+///
+/// - None/빈 문자열 → 시스템 PATH의 `java`
+/// - 디렉터리 → `<dir>/bin/java`(JDK home) 또는 `<dir>/java`(bin 디렉터리) 탐색,
+///   못 찾으면 시스템 `java`로 폴백 (디렉터리 경로를 명령으로 넘기지 않음)
+/// - 그 외(파일 경로) → 입력값을 그대로 사용
+fn resolve_java_executable(jdk_path: Option<&String>) -> String {
+    let Some(path) = jdk_path else {
+        return String::from("java");
+    };
+
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return String::from("java");
+    }
+
+    let candidate = std::path::Path::new(trimmed);
+    if candidate.is_dir() {
+        let name = crate::utils::java_executable_name();
+        let home_bin = candidate.join("bin").join(name);
+        if home_bin.exists() {
+            return quote_if_needed(&home_bin.to_string_lossy());
+        }
+        let direct = candidate.join(name);
+        if direct.exists() {
+            return quote_if_needed(&direct.to_string_lossy());
+        }
+        // 디렉터리지만 java 바이너리를 못 찾으면 디렉터리 경로를 명령으로 넘기는 대신
+        // 시스템 java로 폴백한다 ("is a directory" 실행 오류 방지).
+        return String::from("java");
+    }
+
+    quote_if_needed(trimmed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -926,6 +1041,115 @@ mod tests {
             package_manager_command_args("bun", NodeCommand::Build, None),
             vec![String::from("run"), String::from("build")]
         );
+    }
+
+    fn kotlin_main_class(main_class: &str, classpath: &str) -> KotlinLaunchMode {
+        KotlinLaunchMode::MainClass {
+            main_class: String::from(main_class),
+            classpath: String::from(classpath),
+        }
+    }
+
+    #[test]
+    fn kotlin_main_class_command_quotes_classpath_and_omits_empty_fields() {
+        let cmd = build_kotlin_command(KotlinCommandParts {
+            jdk_path: None,
+            launch_mode: &kotlin_main_class("com.example.MainKt", "build/libs/*:libs/*"),
+            vm_options: "",
+            program_arguments: "",
+        });
+        // classpath는 glob 보존을 위해 항상 따옴표로 감싼다.
+        assert_eq!(cmd, "java -cp \"build/libs/*:libs/*\" com.example.MainKt");
+    }
+
+    #[test]
+    fn kotlin_main_class_command_includes_vm_options_and_args() {
+        let cmd = build_kotlin_command(KotlinCommandParts {
+            jdk_path: None,
+            launch_mode: &kotlin_main_class("MainKt", "out"),
+            vm_options: "-Xmx2g",
+            program_arguments: "--debug input.txt",
+        });
+        assert_eq!(cmd, "java -Xmx2g -cp \"out\" MainKt --debug input.txt");
+    }
+
+    #[test]
+    fn kotlin_main_class_command_without_classpath_omits_cp() {
+        let cmd = build_kotlin_command(KotlinCommandParts {
+            jdk_path: None,
+            launch_mode: &kotlin_main_class("MainKt", ""),
+            vm_options: "",
+            program_arguments: "",
+        });
+        assert_eq!(cmd, "java MainKt");
+    }
+
+    #[test]
+    fn kotlin_jar_command_quotes_path_with_space() {
+        let jar = KotlinLaunchMode::Jar {
+            jar_path: String::from("my apps/app.jar"),
+        };
+        let cmd = build_kotlin_command(KotlinCommandParts {
+            jdk_path: None,
+            launch_mode: &jar,
+            vm_options: "-Xmx1g",
+            program_arguments: "run",
+        });
+        assert_eq!(cmd, "java -Xmx1g -jar \"my apps/app.jar\" run");
+    }
+
+    #[test]
+    fn kotlin_custom_jdk_path_used_as_is_when_not_a_dir() {
+        // 존재하지 않는 경로는 is_dir=false → 입력값 그대로 사용 (결정적).
+        let jdk = String::from("/opt/nonexistent-jdk/bin/java");
+        let jar = KotlinLaunchMode::Jar {
+            jar_path: String::from("app.jar"),
+        };
+        let cmd = build_kotlin_command(KotlinCommandParts {
+            jdk_path: Some(&jdk),
+            launch_mode: &jar,
+            vm_options: "",
+            program_arguments: "",
+        });
+        assert_eq!(cmd, "/opt/nonexistent-jdk/bin/java -jar app.jar");
+    }
+
+    #[test]
+    fn kotlin_classpath_escapes_inner_quotes() {
+        let cmd = build_kotlin_command(KotlinCommandParts {
+            jdk_path: None,
+            launch_mode: &kotlin_main_class("MainKt", "a\"b:c"),
+            vm_options: "",
+            program_arguments: "",
+        });
+        // 내부 따옴표는 이스케이프되어 따옴표 breakout이 발생하지 않아야 한다.
+        assert_eq!(cmd, "java -cp \"a\\\"b:c\" MainKt");
+    }
+
+    #[test]
+    fn resolve_java_falls_back_when_dir_has_no_java_binary() {
+        // 존재하는 디렉터리지만 bin/java가 없으면 시스템 java로 폴백 (디렉터리 경로 미사용).
+        let dir = std::env::temp_dir().to_string_lossy().to_string();
+        assert_eq!(resolve_java_executable(Some(&dir)), "java");
+    }
+
+    #[test]
+    fn build_command_routes_kotlin_and_returns_no_extra_env() {
+        let config = RunConfiguration {
+            id: Uuid::new_v4(),
+            name: String::from("k"),
+            working_directory: String::from("."),
+            environment_variables: std::collections::HashMap::new(),
+            type_data: ConfigTypeData::Kotlin {
+                jdk_path: None,
+                launch_mode: kotlin_main_class("MainKt", "out"),
+                vm_options: String::new(),
+                program_arguments: String::new(),
+            },
+        };
+        let (cmd, env) = build_command(&config);
+        assert_eq!(cmd, "java -cp \"out\" MainKt");
+        assert!(env.is_empty());
     }
 
     /// 회귀 방지: 한쪽 reader가 먼저 EOF(None)가 돼도 출력 루프가 정상 종료해야 한다.

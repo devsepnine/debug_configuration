@@ -11,6 +11,8 @@ pub enum ConfigurationType {
     ShellScript,
     /// Node.js package manager 실행
     Node,
+    /// Kotlin 앱 실행 (JVM `java` 경유)
+    Kotlin,
     /// 여러 구성을 묶어 한 번에 실행 (복합 구성)
     Compound,
 }
@@ -329,6 +331,68 @@ impl Default for ExecuteMode {
     }
 }
 
+/// Kotlin 실행 모드 타입 (UI 선택용)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KotlinLaunchModeType {
+    MainClass,
+    Jar,
+}
+
+impl KotlinLaunchModeType {
+    pub const ALL: [KotlinLaunchModeType; 2] =
+        [KotlinLaunchModeType::MainClass, KotlinLaunchModeType::Jar];
+}
+
+impl std::fmt::Display for KotlinLaunchModeType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}",
+            match self {
+                KotlinLaunchModeType::MainClass => "Main class",
+                KotlinLaunchModeType::Jar => "JAR",
+            }
+        )
+    }
+}
+
+/// Kotlin 실행 모드
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "mode")]
+pub enum KotlinLaunchMode {
+    /// main class 실행 (`java -cp <classpath> <main_class>`)
+    MainClass {
+        /// 실행할 main class (예: `com.example.MainKt`)
+        main_class: String,
+        /// classpath (`-cp` 값). 플랫폼 구분자(`:`/`;`)는 사용자 책임
+        classpath: String,
+    },
+    /// JAR 실행 (`java -jar <jar_path>`)
+    Jar {
+        /// 실행할 JAR 파일 경로
+        jar_path: String,
+    },
+}
+
+impl Default for KotlinLaunchMode {
+    fn default() -> Self {
+        KotlinLaunchMode::MainClass {
+            main_class: String::new(),
+            classpath: String::new(),
+        }
+    }
+}
+
+impl KotlinLaunchMode {
+    /// 현재 모드의 타입(판별자)을 반환 (UI 셀렉터의 선택값용).
+    pub fn mode_type(&self) -> KotlinLaunchModeType {
+        match self {
+            KotlinLaunchMode::MainClass { .. } => KotlinLaunchModeType::MainClass,
+            KotlinLaunchMode::Jar { .. } => KotlinLaunchModeType::Jar,
+        }
+    }
+}
+
 /// 구성 타입별 데이터
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type")]
@@ -362,6 +426,18 @@ pub enum ConfigTypeData {
         arguments: String,
         /// Node 옵션 (`NODE_OPTIONS` 환경 변수)
         node_options: String,
+    },
+    /// Kotlin 타입 데이터 — JVM(`java`)으로 Kotlin 앱 실행
+    Kotlin {
+        /// JDK 경로 (None이면 시스템 `java`). 디렉터리(JDK home) 또는 `java` 실행 파일 경로
+        jdk_path: Option<String>,
+        /// 실행 모드 (Main class / JAR)
+        #[serde(default)]
+        launch_mode: KotlinLaunchMode,
+        /// VM options (`-Xmx2g` 등 JVM 인자)
+        vm_options: String,
+        /// 프로그램 인자
+        program_arguments: String,
     },
     /// 복합 구성 데이터 — 함께 실행할 다른 구성들의 id 목록.
     /// 실행 시 각 멤버가 자신의 세션/페인으로 동시에 펼쳐진다.
@@ -400,6 +476,20 @@ pub struct NodeFieldsMut<'a> {
     pub node_options: &'a mut String,
 }
 
+/// `ConfigTypeData::Kotlin` 변형의 공통 가변 필드 묶음 (모드 무관).
+pub struct KotlinFieldsMut<'a> {
+    pub jdk_path: &'a mut Option<String>,
+    pub launch_mode: &'a mut KotlinLaunchMode,
+    pub vm_options: &'a mut String,
+    pub program_arguments: &'a mut String,
+}
+
+/// `KotlinLaunchMode::MainClass` 변형의 가변 필드 묶음.
+pub struct KotlinMainClassFieldsMut<'a> {
+    pub main_class: &'a mut String,
+    pub classpath: &'a mut String,
+}
+
 impl ConfigTypeData {
     /// 이 데이터에 대응하는 구성 타입(판별자)을 반환.
     pub fn config_type(&self) -> ConfigurationType {
@@ -407,6 +497,7 @@ impl ConfigTypeData {
             ConfigTypeData::Application { .. } => ConfigurationType::Application,
             ConfigTypeData::ShellScript { .. } => ConfigurationType::ShellScript,
             ConfigTypeData::Node { .. } => ConfigurationType::Node,
+            ConfigTypeData::Kotlin { .. } => ConfigurationType::Kotlin,
             ConfigTypeData::Compound { .. } => ConfigurationType::Compound,
         }
     }
@@ -480,6 +571,59 @@ impl ConfigTypeData {
         }
     }
 
+    /// Kotlin 변형이면 공통 가변 필드 묶음 반환.
+    pub fn kotlin_mut(&mut self) -> Option<KotlinFieldsMut<'_>> {
+        if let ConfigTypeData::Kotlin {
+            jdk_path,
+            launch_mode,
+            vm_options,
+            program_arguments,
+        } = self
+        {
+            Some(KotlinFieldsMut {
+                jdk_path,
+                launch_mode,
+                vm_options,
+                program_arguments,
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Kotlin + `MainClass` 변형이면 가변 필드 묶음 반환.
+    pub fn kotlin_main_class_mut(&mut self) -> Option<KotlinMainClassFieldsMut<'_>> {
+        if let ConfigTypeData::Kotlin {
+            launch_mode:
+                KotlinLaunchMode::MainClass {
+                    main_class,
+                    classpath,
+                },
+            ..
+        } = self
+        {
+            Some(KotlinMainClassFieldsMut {
+                main_class,
+                classpath,
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Kotlin + `Jar` 변형이면 `jar_path`의 가변 참조 반환.
+    pub fn kotlin_jar_path_mut(&mut self) -> Option<&mut String> {
+        if let ConfigTypeData::Kotlin {
+            launch_mode: KotlinLaunchMode::Jar { jar_path },
+            ..
+        } = self
+        {
+            Some(jar_path)
+        } else {
+            None
+        }
+    }
+
     /// Compound 변형이면 멤버 id 목록의 가변 참조 반환.
     pub fn compound_members_mut(&mut self) -> Option<&mut Vec<Uuid>> {
         if let ConfigTypeData::Compound { members, .. } = self {
@@ -500,10 +644,11 @@ impl ConfigTypeData {
 }
 
 impl ConfigurationType {
-    pub const ALL: [ConfigurationType; 4] = [
+    pub const ALL: [ConfigurationType; 5] = [
         ConfigurationType::Application,
         ConfigurationType::ShellScript,
         ConfigurationType::Node,
+        ConfigurationType::Kotlin,
         ConfigurationType::Compound,
     ];
 }
@@ -517,6 +662,7 @@ impl std::fmt::Display for ConfigurationType {
                 ConfigurationType::Application => "Application",
                 ConfigurationType::ShellScript => "Shell Script",
                 ConfigurationType::Node => "Node",
+                ConfigurationType::Kotlin => "Kotlin",
                 ConfigurationType::Compound => "Compound",
             }
         )
@@ -559,5 +705,54 @@ impl RunConfiguration {
     /// 두 표현이 어긋나는 불법 상태가 발생할 수 없다.
     pub fn config_type(&self) -> ConfigurationType {
         self.type_data.config_type()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kotlin_config_type_data_round_trips() {
+        let original = ConfigTypeData::Kotlin {
+            jdk_path: Some(String::from("/opt/jdk")),
+            launch_mode: KotlinLaunchMode::MainClass {
+                main_class: String::from("com.example.MainKt"),
+                classpath: String::from("build/libs/*"),
+            },
+            vm_options: String::from("-Xmx2g"),
+            program_arguments: String::from("--debug"),
+        };
+
+        let json = serde_json::to_string(&original).expect("serialize");
+        let restored: ConfigTypeData = serde_json::from_str(&json).expect("deserialize");
+
+        assert_eq!(original, restored);
+        assert_eq!(restored.config_type(), ConfigurationType::Kotlin);
+    }
+
+    #[test]
+    fn kotlin_jar_launch_mode_round_trips() {
+        let original = KotlinLaunchMode::Jar {
+            jar_path: String::from("build/libs/app.jar"),
+        };
+
+        let json = serde_json::to_string(&original).expect("serialize");
+        let restored: KotlinLaunchMode = serde_json::from_str(&json).expect("deserialize");
+
+        assert_eq!(original, restored);
+    }
+
+    #[test]
+    fn kotlin_launch_mode_defaults_to_main_class() {
+        assert_eq!(
+            KotlinLaunchMode::default().mode_type(),
+            KotlinLaunchModeType::MainClass
+        );
+    }
+
+    #[test]
+    fn configuration_type_all_includes_kotlin() {
+        assert!(ConfigurationType::ALL.contains(&ConfigurationType::Kotlin));
     }
 }

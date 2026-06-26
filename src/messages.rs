@@ -1,5 +1,6 @@
 use crate::models::{
-    ConfigurationType, ExecuteModeType, NodeCommand, PackageManager, RunConfiguration,
+    ConfigurationType, ExecuteModeType, KotlinLaunchModeType, NodeCommand, PackageManager,
+    RunConfiguration,
 };
 use crate::widgets::pane_grid;
 use iced::window;
@@ -105,6 +106,32 @@ pub enum Message {
     NodeOptionsChanged(String),
     /// Node package script 목록 새로고침
     NodeRefreshScripts,
+
+    // Kotlin 구성 편집 메시지
+    /// 실행 모드 선택 (Main class / JAR)
+    KotlinLaunchModeChanged(KotlinLaunchModeType),
+    /// main class 변경
+    KotlinMainClassChanged(String),
+    /// classpath 변경
+    KotlinClasspathChanged(String),
+    /// JAR 파일 경로 변경
+    KotlinJarPathChanged(String),
+    /// JAR 파일 선택 다이얼로그 열기
+    BrowseKotlinJarPath,
+    /// JAR 파일 선택 완료
+    KotlinJarPathSelected(Result<String, String>),
+    /// VM options 변경
+    KotlinVmOptionsChanged(String),
+    /// 프로그램 인자 변경
+    KotlinProgramArgumentsChanged(String),
+    /// JDK 선택 변경 (레이블 → 경로 해석)
+    KotlinJdkChanged(String),
+    /// JDK 수동 선택 다이얼로그 열기
+    BrowseKotlinJdk,
+    /// JDK 수동 선택 완료
+    KotlinJdkPathSelected(Result<String, String>),
+    /// JDK 감지 완료
+    JdksDetected(Vec<(String, String)>),
 
     /// 작업 디렉토리 변경
     WorkingDirectoryChanged(String),
