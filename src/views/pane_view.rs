@@ -129,6 +129,7 @@ pub fn view_pane_layout<'a>(
     })
     .width(Length::Fill)
     .height(Length::Fill)
+    .on_click(Message::PaneClicked)
     .on_drag(Message::PaneGridDragged)
     .on_resize(10, Message::PaneGridResized)
     .spacing(4)

@@ -255,6 +255,8 @@ pub enum Message {
     ClosePane(pane_grid::Pane),
     /// Pane 최대화/복원 토글 (`pane_id`)
     TogglePaneMaximize(pane_grid::Pane),
+    /// Pane 클릭 — 그 pane의 세션을 활성 탭의 포커스로 기록 (검색 등 단축키 대상)
+    PaneClicked(pane_grid::Pane),
 
     // 탭 간 드래그 앤 드롭
     /// 탭 바 위에 마우스 진입 (드래그 중 hover)

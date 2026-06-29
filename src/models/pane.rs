@@ -331,6 +331,11 @@ pub struct WorkspaceTab {
     pub layout_tree: LayoutTree,
     /// `LayoutId` <-> `pane_grid::Pane` 매핑
     pub id_mapping: HashMap<LayoutId, pane_grid::Pane>,
+    /// 마지막으로 클릭/열린 세션 — 검색 등 pane 대상 단축키의 포커스 대상.
+    /// 탭별로 독립 유지되어, 같은 탭 안에서 단축키가 노릴 pane을 추적한다.
+    /// 쓰기는 `focus_session`/`open_session`/`remove_session`으로만 (불변식 단일화);
+    /// 읽기는 라이브 세션 검증을 거치는 `focused_session()`을 쓴다.
+    focused_session_id: Option<Uuid>,
 }
 
 impl WorkspaceTab {
@@ -344,6 +349,7 @@ impl WorkspaceTab {
             pane_layout,
             layout_tree,
             id_mapping: mapping.into_iter().collect(),
+            focused_session_id: None,
         }
     }
 
@@ -369,7 +375,9 @@ impl WorkspaceTab {
     /// 빈 패인이 있으면 거기에 채우고, 없으면 가장 큰 패인을 긴 변 방향으로 분할해
     /// 균형 잡힌 격자를 유지한다 (`aspect` = 표시 영역의 가로/세로 비율).
     pub fn open_session(&mut self, session_id: Uuid, aspect: f32) -> bool {
+        // 이미 열려 있어도 포커스는 이 세션으로 옮긴다 (목록에서 다시 클릭한 경우 등).
         if self.contains_session(session_id) {
+            self.focused_session_id = Some(session_id);
             return false;
         }
 
@@ -388,6 +396,8 @@ impl WorkspaceTab {
                     .split_leaf(layout_id, axis, Pane::with_session(session_id), false);
         }
 
+        // 방금 연 세션을 포커스 — 단축키(검색 등)가 바로 이 세션을 대상으로 삼는다.
+        self.focused_session_id = Some(session_id);
         self.rebuild_from_layout_tree();
         true
     }
@@ -413,6 +423,9 @@ impl WorkspaceTab {
         }
 
         if removed {
+            if self.focused_session_id == Some(session_id) {
+                self.focused_session_id = None;
+            }
             self.layout_tree.remove_empty_leaves();
             self.rebuild_from_layout_tree();
         }
@@ -420,7 +433,25 @@ impl WorkspaceTab {
         removed
     }
 
-    /// 워크스페이스 내용을 비우고 탭은 유지
+    /// 주어진 `pane_grid::Pane`이 담고 있는 세션 ID (빈 pane이면 `None`).
+    pub fn session_at(&self, pane: pane_grid::Pane) -> Option<Uuid> {
+        self.pane_layout.get(pane).and_then(|p| p.session_id)
+    }
+
+    /// pane 클릭 등으로 포커스를 이 세션으로 옮긴다.
+    /// 호출부는 세션이 이 탭에 있음을 `session_at`으로 이미 확인한 상태여야 한다.
+    pub fn focus_session(&mut self, session_id: Uuid) {
+        self.focused_session_id = Some(session_id);
+    }
+
+    /// pane 대상 단축키의 포커스 세션 — 이 탭에 아직 열려 있을 때만 반환.
+    /// 포커스 세션이 닫혔으면 `None`을 돌려 호출부가 폴백하도록 한다.
+    pub fn focused_session(&self) -> Option<Uuid> {
+        self.focused_session_id
+            .filter(|id| self.contains_session(*id))
+    }
+
+    /// 워크스페이스 내용을 비우고 탭은 유지. 전체 교체이므로 `focused_session_id`도 초기화된다.
     pub fn clear(&mut self) {
         *self = Self::empty(String::from("Workspace"));
     }

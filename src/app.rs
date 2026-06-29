@@ -652,6 +652,7 @@ impl RunConfigManager {
             | Message::PaneGridResized(_)
             | Message::ClosePane(_)
             | Message::TogglePaneMaximize(_)
+            | Message::PaneClicked(_)
             | Message::TabBarHovered(_)
             | Message::MouseReleased
             | Message::WindowOpened(_)
@@ -824,19 +825,19 @@ impl RunConfigManager {
             Message::ToggleSessionSearchRegex(session_id) => {
                 self.handle_toggle_session_search_regex(session_id)
             }
-            Message::OpenSearchInActivePane => match self.focused_search_session_id() {
+            Message::OpenSearchInActivePane => match self.search_open_target() {
                 Some(session_id) => self.handle_open_session_search(session_id),
                 None => Task::none(),
             },
-            Message::CloseActiveSearch => match self.focused_search_session_id() {
+            Message::CloseActiveSearch => match self.search_nav_target() {
                 Some(session_id) => self.handle_close_session_search(session_id),
                 None => Task::none(),
             },
-            Message::SearchNextInActivePane => match self.focused_search_session_id() {
+            Message::SearchNextInActivePane => match self.search_nav_target() {
                 Some(session_id) => self.handle_session_search_step(session_id, 1),
                 None => Task::none(),
             },
-            Message::SearchPrevInActivePane => match self.focused_search_session_id() {
+            Message::SearchPrevInActivePane => match self.search_nav_target() {
                 Some(session_id) => self.handle_session_search_step(session_id, -1),
                 None => Task::none(),
             },
@@ -873,6 +874,7 @@ impl RunConfigManager {
             Message::PaneGridResized(event) => self.handle_pane_grid_resized(event),
             Message::ClosePane(pane_id) => self.handle_close_pane(pane_id),
             Message::TogglePaneMaximize(pane_id) => self.handle_toggle_pane_maximize(pane_id),
+            Message::PaneClicked(pane_id) => self.handle_pane_clicked(pane_id),
             Message::TabBarHovered(tab_index) => self.handle_tab_bar_hovered(tab_index),
             Message::MouseReleased => self.handle_mouse_released(),
             Message::WindowOpened(id) => self.handle_window_opened(id),
@@ -2669,20 +2671,64 @@ impl RunConfigManager {
         }
     }
 
-    /// Ctrl+F/ESC가 대상으로 삼을 세션. 활성 탭의 leaf pane 중 이미 검색바가 열린
-    /// 세션을 우선, 없으면 첫 세션 pane (다중 pane에서 정확한 대상은 pane의 검색 버튼 사용).
-    fn focused_search_session_id(&self) -> Option<Uuid> {
+    /// Cmd+F가 검색을 "열" 세션. 포커스한(마지막으로 클릭/연) pane을 최우선으로 —
+    /// 이미 검색이 열려 있으면 `handle_open_session_search`가 입력에 re-focus만 한다.
+    /// 포커스가 없으면 이미 검색바가 열린 세션, 그래도 없으면 탭의 첫 세션 pane.
+    /// "열기"는 보고 있는 pane을 대상으로 해야 하므로 포커스가 검색 열림 여부보다 우선한다.
+    fn search_open_target(&self) -> Option<Uuid> {
         let tab = self.workspace_tabs.get(self.selected_tab_index)?;
-        let leaves = tab.layout_tree.collect_leaves();
-        leaves
-            .iter()
+        if let Some(focused) = tab.focused_session() {
+            return Some(focused);
+        }
+        self.first_session_with_search(tab).or_else(|| {
+            tab.layout_tree
+                .collect_leaves()
+                .into_iter()
+                .find_map(|(_, pane)| pane.session_id)
+        })
+    }
+
+    /// ESC/다음/이전이 대상으로 삼을 세션. 이 단축키들은 검색이 열린 pane에서만 의미가
+    /// 있다(구독 자체가 "검색 열림"을 조건으로 활성화). 따라서 포커스 pane이 검색 중이면
+    /// 그것을, 아니면 검색이 열린 다른 pane을 고른다 — 포커스를 다른 pane으로 옮겨도
+    /// 이미 열린 검색을 계속 조작/닫을 수 있게 하기 위함(포커스만 우선하면 회귀).
+    fn search_nav_target(&self) -> Option<Uuid> {
+        let tab = self.workspace_tabs.get(self.selected_tab_index)?;
+        if let Some(focused) = tab.focused_session()
+            && self.session_is_searching(focused)
+        {
+            return Some(focused);
+        }
+        self.first_session_with_search(tab)
+    }
+
+    /// 활성 탭의 leaf 순서로 검색바가 열린 첫 세션.
+    fn first_session_with_search(&self, tab: &WorkspaceTab) -> Option<Uuid> {
+        tab.layout_tree
+            .collect_leaves()
+            .into_iter()
             .filter_map(|(_, pane)| pane.session_id)
-            .find(|id| {
-                self.sessions
-                    .iter()
-                    .any(|s| s.id == *id && s.search.is_some())
-            })
-            .or_else(|| leaves.iter().find_map(|(_, pane)| pane.session_id))
+            .find(|&id| self.session_is_searching(id))
+    }
+
+    /// 해당 세션에 검색바가 열려 있는지.
+    fn session_is_searching(&self, session_id: Uuid) -> bool {
+        self.sessions
+            .iter()
+            .any(|s| s.id == session_id && s.search.is_some())
+    }
+
+    /// Pane 클릭 → 그 pane의 세션을 활성 탭의 포커스로 기록.
+    /// 빈 pane 클릭은 무시(기존 포커스 유지)해, 빈 영역을 눌렀다고 검색 대상을 잃지 않게 한다.
+    /// 같은 프레임에서 ClosePane이 먼저 처리됐다면 `session_at`이 무효화된 핸들에 대해
+    /// `None`을 돌려주므로(레이아웃 rebuild → 새 State → HashMap miss) 자연히 no-op이 된다.
+    fn handle_pane_clicked(&mut self, pane: pane_grid::Pane) -> Task<Message> {
+        if let Some(tab) = self.workspace_tabs.get_mut(self.selected_tab_index)
+            && let Some(session_id) = tab.session_at(pane)
+        {
+            tab.focus_session(session_id);
+        }
+        Task::none()
     }
 
     fn handle_pane_grid_resized(&mut self, event: pane_grid::ResizeEvent) -> Task<Message> {
@@ -4889,5 +4935,88 @@ mod tests {
         let _ = app.handle_rerun_failed_sessions();
         assert!(app.sessions[0].is_running);
         assert!(app.status_message.contains("No failed"));
+    }
+
+    /// 주어진 세션을 담은 `pane_grid::Pane` 핸들을 찾는다 (클릭 시뮬레이션용).
+    fn pane_for_session(tab: &WorkspaceTab, session_id: Uuid) -> pane_grid::Pane {
+        tab.pane_layout
+            .panes
+            .iter()
+            .find(|(_, pane)| pane.session_id == Some(session_id))
+            .map(|(pane, _)| *pane)
+            .expect("session must occupy a pane")
+    }
+
+    /// `names`의 모든 세션을 현재 탭의 pane으로 연 앱을 만든다.
+    fn manager_with_open_panes(names: &[&str]) -> (RunConfigManager, Vec<Uuid>) {
+        let (mut app, ids) = manager_with_sessions(names);
+        for id in &ids {
+            app.workspace_tabs[0].open_session(*id, 1.0);
+        }
+        (app, ids)
+    }
+
+    #[test]
+    fn search_open_targets_clicked_session_not_first() {
+        let (mut app, ids) = manager_with_open_panes(&["a", "b", "c"]);
+
+        // 마지막으로 연 세션(c)이 포커스 — Cmd+F는 "첫 세션"이 아닌 이걸 대상으로.
+        assert_eq!(app.search_open_target(), Some(ids[2]));
+
+        // 두 번째 세션 pane을 클릭하면 그 세션이 Cmd+F 대상이 된다.
+        let pane_b = pane_for_session(&app.workspace_tabs[0], ids[1]);
+        let _ = app.handle_pane_clicked(pane_b);
+        assert_eq!(app.search_open_target(), Some(ids[1]));
+    }
+
+    /// 회귀 가드: A에서 검색을 연 뒤 다른 pane으로 포커스를 옮겨도 Enter/ESC는
+    /// "열린 검색"(A)을, Cmd+F는 "포커스 pane"(B)을 대상으로 해야 한다.
+    #[test]
+    fn search_nav_follows_open_search_even_after_focus_moves() {
+        let (mut app, ids) = manager_with_open_panes(&["a", "b", "c"]);
+
+        let _ = app.handle_open_session_search(ids[0]); // a에서 검색 열기
+        let pane_b = pane_for_session(&app.workspace_tabs[0], ids[1]);
+        let _ = app.handle_pane_clicked(pane_b); // 포커스를 b로 이동
+
+        assert_eq!(app.search_open_target(), Some(ids[1]), "Cmd+F는 포커스 pane을 연다");
+        assert_eq!(
+            app.search_nav_target(),
+            Some(ids[0]),
+            "Enter/ESC는 이미 열린 검색을 계속 조작한다"
+        );
+    }
+
+    #[test]
+    fn search_nav_prefers_focused_pane_when_it_is_searching() {
+        let (mut app, ids) = manager_with_open_panes(&["a", "b"]);
+
+        // 두 pane 모두 검색이 열린 상태에서 a를 포커스하면 네비게이션 대상은 a.
+        let _ = app.handle_open_session_search(ids[0]);
+        let _ = app.handle_open_session_search(ids[1]);
+        let pane_a = pane_for_session(&app.workspace_tabs[0], ids[0]);
+        let _ = app.handle_pane_clicked(pane_a);
+
+        assert_eq!(app.search_nav_target(), Some(ids[0]));
+    }
+
+    #[test]
+    fn search_open_falls_back_when_focused_session_closed() {
+        let (mut app, ids) = manager_with_open_panes(&["a", "b", "c"]);
+
+        // b를 포커스한 뒤 그 세션을 워크스페이스에서 닫으면 포커스가 사라지고,
+        // 대상은 살아 있는 세션으로 폴백된다 (stale 포커스를 가리키지 않는다).
+        let pane_b = pane_for_session(&app.workspace_tabs[0], ids[1]);
+        let _ = app.handle_pane_clicked(pane_b);
+        app.workspace_tabs[0].remove_session(ids[1]);
+
+        // 포커스가 사라지고 검색도 열려 있지 않으니 search_open_target의 마지막 폴백
+        // (탭의 첫 세션 pane)을 탄다. 어느 leaf가 첫째인지는 레이아웃 내부 구현이므로,
+        // 닫힌 세션이 아닌 살아 있는 세션이라는 것만 단언한다.
+        let target = app.search_open_target().expect("a live session remains");
+        assert!(
+            target == ids[0] || target == ids[2],
+            "닫힌 세션이 아닌 살아 있는 세션을 반환해야 한다"
+        );
     }
 }
