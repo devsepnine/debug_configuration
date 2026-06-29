@@ -3980,6 +3980,7 @@ impl RunConfigManager {
                 &current_tab.pane_layout,
                 &self.sessions,
                 current_tab.pane_layout.maximized(),
+                current_tab.focused_session(),
                 self.drag.is_dragging_pane,
                 self.drag.dragging_pane_id,
             )
@@ -4979,7 +4980,11 @@ mod tests {
         let pane_b = pane_for_session(&app.workspace_tabs[0], ids[1]);
         let _ = app.handle_pane_clicked(pane_b); // 포커스를 b로 이동
 
-        assert_eq!(app.search_open_target(), Some(ids[1]), "Cmd+F는 포커스 pane을 연다");
+        assert_eq!(
+            app.search_open_target(),
+            Some(ids[1]),
+            "Cmd+F는 포커스 pane을 연다"
+        );
         assert_eq!(
             app.search_nav_target(),
             Some(ids[0]),

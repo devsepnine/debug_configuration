@@ -15,6 +15,7 @@ use iced::{
     Alignment, Background, Border, Color, Element, Length, Theme, border,
     widget::{button, column, container, row, svg, text, text_input, tooltip},
 };
+use uuid::Uuid;
 
 const CONTROL_ICON_SIZE: f32 = 14.0;
 const CONTROL_BUTTON_SIZE: f32 = 24.0;
@@ -101,27 +102,56 @@ fn control_button(
     }
 }
 
+/// pane 타이틀바 포커스 강조 상태.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PaneFocus {
+    /// 강조 없음 — pane이 하나뿐이거나 포커스가 설정되지 않음.
+    Inactive,
+    /// 현재 포커스된 pane (accent 틴트 + 밝은 타이틀).
+    Focused,
+    /// 다른 pane이 포커스됨 — 타이틀을 살짝 흐리게.
+    Unfocused,
+}
+
+/// pane 개수·세션·포커스 대상으로 타이틀바 강조 상태를 정한다.
+/// pane이 2개 이상이고 포커스가 설정됐을 때만 Focused/Unfocused로 갈린다(단일 pane은 강조 불필요).
+fn pane_focus(pane_count: usize, session_id: Option<Uuid>, focused: Option<Uuid>) -> PaneFocus {
+    match focused {
+        Some(focused) if pane_count > 1 && session_id.is_some() => {
+            if session_id == Some(focused) {
+                PaneFocus::Focused
+            } else {
+                PaneFocus::Unfocused
+            }
+        }
+        _ => PaneFocus::Inactive,
+    }
+}
+
 /// `pane_grid`를 사용한 Pane 레이아웃 렌더링
 ///
 /// # Arguments
 /// * `state` - `pane_grid::State<Pane>`
 /// * `sessions` - 모든 세션 데이터
+/// * `focused_session_id` - 활성 탭에서 포커스된 세션 (타이틀바 강조 대상)
 /// * `is_dragging_pane` - Pane 드래그 중 여부 (드롭 존 표시를 위해 content 투명화)
 /// * `dragging_pane_id` - 드래그 중인 Pane ID (`pane_grid` 네이티브 드래그)
 pub fn view_pane_layout<'a>(
     state: &'a pane_grid::State<Pane>,
     sessions: &'a [RunSession],
     maximized_pane: Option<pane_grid::Pane>,
+    focused_session_id: Option<Uuid>,
     is_dragging_pane: bool,
     dragging_pane_id: Option<pane_grid::Pane>,
 ) -> Element<'a, Message> {
     let pane_count = state.panes.len();
-    pane_grid::PaneGrid::new(state, |pane_id, pane, _is_focused| {
+    pane_grid::PaneGrid::new(state, move |pane_id, pane, _is_focused| {
         view_pane_content(
             pane_id,
             pane,
             sessions,
             pane_count,
+            pane_focus(pane_count, pane.session_id, focused_session_id),
             maximized_pane == Some(pane_id),
             is_dragging_pane,
             dragging_pane_id,
@@ -143,15 +173,17 @@ pub fn view_pane_layout<'a>(
 /// * `pane` - 렌더링할 Pane 데이터 (단일 세션)
 /// * `sessions` - 모든 세션 데이터
 /// * `pane_count` - 현재 워크스페이스의 Pane 개수
+/// * `focus` - 타이틀바 포커스 강조 상태
 /// * `is_maximized` - 현재 Pane 최대화 여부
 /// * `_is_dragging_pane` - Pane 드래그 중 여부 (현재 미사용)
 /// * `dragging_pane_id` - 드래그 중인 Pane ID (`pane_grid` 네이티브 드래그)
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn view_pane_content<'a>(
     pane_id: pane_grid::Pane,
     pane: &'a Pane,
     sessions: &'a [RunSession],
     pane_count: usize,
+    focus: PaneFocus,
     is_maximized: bool,
     _is_dragging_pane: bool,
     dragging_pane_id: Option<pane_grid::Pane>,
@@ -223,28 +255,37 @@ fn view_pane_content<'a>(
         .into()
     };
 
-    // TitleBar 복구 - session_name 표시
-    let mut title_bar =
-        pane_grid::TitleBar::new(session_title(session_name, session_status, session_badge))
-            .padding([6, 9])
-            .style(move |theme: &Theme| {
-                let palette = theme.extended_palette();
-                pane_container_style_with_radius(
-                    with_drag_opacity(
-                        Color {
-                            a: 0.58,
-                            ..palette.background.strong.color
-                        },
-                        dragging_pane_id == Some(pane_id),
-                    ),
-                    Color {
-                        a: 0.0,
-                        ..palette.background.base.text
-                    },
-                    0.0,
-                    border::Radius::default().top(4.0),
-                )
-            });
+    // TitleBar 복구 - session_name 표시. 포커스된 pane은 타이틀바를 accent로 틴트한다.
+    let mut title_bar = pane_grid::TitleBar::new(session_title(
+        session_name,
+        session_status,
+        session_badge,
+        focus,
+    ))
+    .padding([6, 9])
+    .style(move |theme: &Theme| {
+        let palette = theme.extended_palette();
+        let background = if focus == PaneFocus::Focused {
+            Color {
+                a: 0.42,
+                ..palette.primary.base.color
+            }
+        } else {
+            Color {
+                a: 0.58,
+                ..palette.background.strong.color
+            }
+        };
+        pane_container_style_with_radius(
+            with_drag_opacity(background, dragging_pane_id == Some(pane_id)),
+            Color {
+                a: 0.0,
+                ..palette.background.base.text
+            },
+            0.0,
+            border::Radius::default().top(4.0),
+        )
+    });
     if let Some((full, compact)) = title_controls {
         title_bar = title_bar
             .controls(pane_grid::Controls::dynamic(full, compact))
@@ -714,13 +755,31 @@ fn session_title(
     session_name: String,
     status: Option<SessionStatusKind>,
     badge: Option<String>,
+    focus: PaneFocus,
 ) -> Element<'static, Message> {
+    // 포커스된 pane은 타이틀을 또렷하게, 비포커스는 살짝 흐리게. 단일 pane(Inactive)은
+    // 색 override 없이 기본 텍스트색을 유지한다.
+    let name_alpha = match focus {
+        PaneFocus::Focused => Some(0.98),
+        PaneFocus::Unfocused => Some(0.72),
+        PaneFocus::Inactive => None,
+    };
+    let mut name = text(session_name).size(12).wrapping(text::Wrapping::None);
+    if let Some(alpha) = name_alpha {
+        name = name.style(move |theme: &Theme| text::Style {
+            color: Some(Color {
+                a: alpha,
+                ..theme.extended_palette().background.base.text
+            }),
+        });
+    }
+
     let mut title = row![
         container(Space::new())
             .width(7)
             .height(7)
             .style(move |theme: &Theme| session_status_dot_style(theme, status)),
-        text(session_name).size(12).wrapping(text::Wrapping::None),
+        name,
     ]
     .spacing(8)
     .align_y(Alignment::Center);
@@ -764,5 +823,34 @@ fn session_status_dot_style(theme: &Theme, status: Option<SessionStatusKind>) ->
             ..Border::default()
         },
         ..container::Style::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pane_focus_inactive_for_single_pane() {
+        // pane이 하나뿐이면 포커스 대상이어도 강조하지 않는다.
+        let id = Uuid::new_v4();
+        assert_eq!(pane_focus(1, Some(id), Some(id)), PaneFocus::Inactive);
+    }
+
+    #[test]
+    fn pane_focus_splits_focused_and_unfocused_with_multiple_panes() {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        assert_eq!(pane_focus(2, Some(a), Some(a)), PaneFocus::Focused);
+        assert_eq!(pane_focus(2, Some(b), Some(a)), PaneFocus::Unfocused);
+    }
+
+    #[test]
+    fn pane_focus_inactive_without_focus_or_for_empty_pane() {
+        let a = Uuid::new_v4();
+        // 포커스가 설정되지 않음
+        assert_eq!(pane_focus(2, Some(a), None), PaneFocus::Inactive);
+        // 빈 pane(세션 없음)은 강조 대상이 아니다
+        assert_eq!(pane_focus(2, None, Some(a)), PaneFocus::Inactive);
     }
 }
