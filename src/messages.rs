@@ -358,8 +358,16 @@ pub enum Message {
     WindowMaximized(bool),
     /// 윈도우 포커스 변경 (백그라운드 완료 알림 판단용)
     WindowFocusChanged(bool),
-    /// 커스텀 타이틀바에서 창 드래그 시작
+    /// 윈도우가 이동함 (창 좌상단 logical 좌표). 터치 드래그의 기준 위치 추적용.
+    WindowMoved(iced::Point),
+    /// 커스텀 타이틀바에서 창 드래그 시작 (마우스 — OS 드래그)
     StartWindowDrag,
+    /// 커스텀 타이틀바 터치 드래그 시작 (손가락 창 기준 logical 좌표)
+    TitleBarTouchDragStart(iced::Point),
+    /// 커스텀 타이틀바 터치 드래그 이동 (손가락 창 기준 logical 좌표)
+    TitleBarTouchDragMove(iced::Point),
+    /// 커스텀 타이틀바 터치 드래그 종료
+    TitleBarTouchDragEnd,
     /// 커스텀 프레임에서 창 리사이즈 시작
     ResizeWindow(window::Direction),
     /// 커스텀 타이틀바에서 창 최소화
