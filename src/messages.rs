@@ -189,17 +189,41 @@ pub enum Message {
     /// Editor pane이 키보드 focus 이동 대상인지 갱신
     EditorFocusAreaChanged(bool),
 
-    // Open/Save 메시지
+    // Load/Save 메시지
     /// 앱 시작 시 자동 로드 완료 (성공/실패)
     ConfigurationsLoaded(Result<Vec<RunConfiguration>, String>),
-    /// 현재 구성 파일 열기 (기존 구성 대체)
-    OpenConfigurations,
-    /// 구성 파일 열기 완료 (구성 목록, 파일 경로)
-    ConfigurationsOpened(Result<(Vec<RunConfiguration>, PathBuf), String>),
     /// 현재 구성 파일 저장
     SaveConfigurations,
     /// 구성 파일 저장 완료 (저장된 파일 경로)
     ConfigurationsSaved(Result<PathBuf, String>),
+
+    // 구성 가져오기(Import) 모달 lifecycle — 파일에서 선택 병합
+    /// 가져올 파일 선택 다이얼로그 열기
+    ImportConfigurations,
+    /// 가져올 파일 읽기/파싱 완료 (파일의 구성 목록, 파일 경로) — 성공 시 모달 열림
+    ImportFileLoaded(Result<(Vec<RunConfiguration>, PathBuf), String>),
+    /// 가져오기 모달 Import — 선택된 구성을 현재 목록에 병합
+    ConfirmImportModal,
+    /// 가져오기 모달 Cancel — staging 폐기
+    CancelImportModal,
+    /// 가져오기 대상 구성 선택 토글 (`config_id`, 선택 여부)
+    ImportModalToggleConfig(Uuid, bool),
+    /// 가져오기 대상 전체 선택/해제 토글
+    ImportModalToggleAll(bool),
+
+    // 구성 내보내기(Export) 모달 lifecycle
+    /// 내보내기 모달 열기 (전체 구성이 선택된 staging으로 시작)
+    OpenExportModal,
+    /// 내보내기 모달 Export — 선택된 구성만 파일로 저장
+    ConfirmExportModal,
+    /// 내보내기 모달 Cancel — staging 폐기
+    CancelExportModal,
+    /// 내보내기 대상 구성 선택 토글 (`config_id`, 선택 여부)
+    ExportModalToggleConfig(Uuid, bool),
+    /// 내보내기 대상 전체 선택/해제 토글
+    ExportModalToggleAll(bool),
+    /// 구성 내보내기 완료 (저장 경로 또는 에러/취소)
+    ConfigurationsExported(Result<PathBuf, String>),
 
     // 실행 세션 메시지
     /// 프로세스 시작됨 (세션 ID, PID) - Drop cleanup을 위한 PID 추적

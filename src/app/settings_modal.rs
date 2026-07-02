@@ -29,8 +29,8 @@ const MAX_OUTPUT_LINES_LIMIT: usize = 1_000_000;
 
 impl RunConfigManager {
     pub(super) fn handle_open_settings_modal(&mut self) -> Task<Message> {
-        // 한 번에 하나의 모달만 — env 모달이 떠 있으면 닫는다(보통 opaque가 막지만 방어적).
-        self.env_modal = None;
+        // 한 번에 하나의 모달만 (계약과 근거는 close_all_modals 참고).
+        self.close_all_modals();
         // 현재 적용 중인 설정값을 staging으로 복사 (Cancel 시 원상복구를 위해).
         self.settings_modal = Some(SettingsModalState {
             show_environment: self.show_environment_on_run,

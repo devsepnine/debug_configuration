@@ -820,6 +820,332 @@ pub fn view_settings_modal(props: SettingsModalView<'_>) -> Element<'_, Message>
     )
 }
 
+/// 구성 내보내기 모달 뷰 모델 (app의 staging 선택 상태를 참조로 전달).
+pub struct ExportModalView<'a> {
+    pub configurations: &'a [RunConfiguration],
+    pub selected: &'a std::collections::HashSet<Uuid>,
+}
+
+/// 구성 내보내기 모달 (반투명 배경 + 중앙 다이얼로그). env/settings 모달과 동일한
+/// 오버레이/스타일을 재사용한다. 외부 클릭은 무시되며 Export / Cancel / X 로만 닫힌다.
+///
+/// 체크박스로 내보낼 구성을 고르며, 선택된 Compound의 멤버가 선택에서 빠져 있으면
+/// 경고를 표시한다(내보낸 파일에서 해당 멤버 참조가 끊기므로).
+pub fn view_export_modal<'a>(props: ExportModalView<'a>) -> Element<'a, Message> {
+    let header = row![
+        text("Export Configurations").size(15),
+        Space::new().width(Length::Fill),
+        icon_button(ICON_CLOSE, Some(Message::CancelExportModal)),
+    ]
+    .align_y(Alignment::Center)
+    .width(Length::Fill);
+
+    let mut list = Column::new().spacing(8);
+    for config in props.configurations {
+        list = list.push(view_export_modal_row(
+            config,
+            props.selected.contains(&config.id),
+        ));
+    }
+
+    let mut body = column![
+        modal_select_all_row(
+            props.selected.len(),
+            props.configurations.len(),
+            Message::ExportModalToggleAll,
+        ),
+        Space::new().height(10),
+        modal_list_scrollable(list),
+    ]
+    .width(Length::Fill)
+    .height(Length::Fill);
+
+    let no_satisfied = std::collections::HashSet::new();
+    for warning in compound_member_warnings(props.configurations, props.selected, &no_satisfied) {
+        body = body.push(Space::new().height(8));
+        body = body.push(text(warning).size(12).style(warn_text_style));
+    }
+
+    let has_selection = !props.selected.is_empty();
+    let footer = modal_footer(
+        Message::CancelExportModal,
+        "Export",
+        has_selection.then_some(Message::ConfirmExportModal),
+    );
+
+    let dialog_content = column![
+        header,
+        Space::new().height(14),
+        body,
+        Space::new().height(14),
+        footer,
+    ]
+    .width(Length::Fill)
+    .height(Length::Fill);
+
+    modal_dialog(dialog_content.into(), 520.0, 520.0)
+}
+
+/// 단일 row: [checkbox(구성 이름)] ... [타입 라벨].
+fn view_export_modal_row(config: &RunConfiguration, is_selected: bool) -> Element<'_, Message> {
+    let id = config.id;
+    row![
+        checkbox(is_selected)
+            .label(config.name.as_str())
+            .on_toggle(move |checked| Message::ExportModalToggleConfig(id, checked))
+            .size(18)
+            .text_size(13),
+        Space::new().width(Length::Fill),
+        text(config.config_type().to_string())
+            .size(12)
+            .style(muted_text_style),
+    ]
+    .align_y(Alignment::Center)
+    .into()
+}
+
+/// 구성 가져오기 모달 뷰 모델 (app의 staging 상태를 참조로 전달).
+pub struct ImportModalView<'a> {
+    /// 가져올 파일 경로 (헤더 아래 출처 표시용)
+    pub source: &'a std::path::Path,
+    /// 파일에서 읽은 구성 목록
+    pub configs: &'a [RunConfiguration],
+    /// 가져오기로 선택된 id 집합
+    pub selected: &'a std::collections::HashSet<Uuid>,
+    /// 현재 앱의 구성 목록 (id 충돌 = 교체 표시와 Compound 멤버 충족 판정에 사용)
+    pub existing: &'a [RunConfiguration],
+}
+
+/// 구성 가져오기 모달. export 모달과 대칭 구조이며, 파일의 구성 중 선택한 것만
+/// 현재 목록에 병합한다. 이미 존재하는 id의 row에는 교체 경고 태그를 붙인다.
+pub fn view_import_modal<'a>(props: ImportModalView<'a>) -> Element<'a, Message> {
+    let header = row![
+        text("Import Configurations").size(15),
+        Space::new().width(Length::Fill),
+        icon_button(ICON_CLOSE, Some(Message::CancelImportModal)),
+    ]
+    .align_y(Alignment::Center)
+    .width(Length::Fill);
+
+    // 전체 경로는 길어 잘리기 쉬우므로 파일 이름만 표시한다.
+    let source_name = props.source.file_name().map_or_else(
+        || props.source.display().to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    );
+
+    let mut list = Column::new().spacing(8);
+    for config in props.configs {
+        let replaces = props
+            .existing
+            .iter()
+            .find(|e| e.id == config.id)
+            .map(|e| e.name.as_str());
+        list = list.push(view_import_modal_row(
+            config,
+            props.selected.contains(&config.id),
+            replaces,
+        ));
+    }
+
+    let mut body = column![
+        text(format!("From: {source_name}"))
+            .size(12)
+            .style(muted_text_style),
+        Space::new().height(10),
+        modal_select_all_row(
+            props.selected.len(),
+            props.configs.len(),
+            Message::ImportModalToggleAll,
+        ),
+        Space::new().height(10),
+        modal_list_scrollable(list),
+    ]
+    .width(Length::Fill)
+    .height(Length::Fill);
+
+    // 파일 리스트에 없어도 현재 목록에 이미 있는 멤버는 병합 후 참조가 살아 있다.
+    let existing_ids: std::collections::HashSet<Uuid> =
+        props.existing.iter().map(|e| e.id).collect();
+    for warning in compound_member_warnings(props.configs, props.selected, &existing_ids) {
+        body = body.push(Space::new().height(8));
+        body = body.push(text(warning).size(12).style(warn_text_style));
+    }
+
+    let has_selection = !props.selected.is_empty();
+    let footer = modal_footer(
+        Message::CancelImportModal,
+        "Import",
+        has_selection.then_some(Message::ConfirmImportModal),
+    );
+
+    let dialog_content = column![
+        header,
+        Space::new().height(14),
+        body,
+        Space::new().height(14),
+        footer,
+    ]
+    .width(Length::Fill)
+    .height(Length::Fill);
+
+    modal_dialog(dialog_content.into(), 560.0, 520.0)
+}
+
+/// 단일 row: [checkbox(구성 이름)] [교체 태그?] ... [타입 라벨].
+///
+/// `replaces`는 같은 id의 기존 구성 이름 — `Some`이면 가져오기 시 그 구성이 교체됨을
+/// 경고색 태그로 알린다 (이름이 같으면 "replaces existing", 다르면 기존 이름 표기).
+fn view_import_modal_row<'a>(
+    config: &'a RunConfiguration,
+    is_selected: bool,
+    replaces: Option<&'a str>,
+) -> Element<'a, Message> {
+    let id = config.id;
+    let mut item = row![
+        checkbox(is_selected)
+            .label(config.name.as_str())
+            .on_toggle(move |checked| Message::ImportModalToggleConfig(id, checked))
+            .size(18)
+            .text_size(13),
+    ];
+    if let Some(current_name) = replaces {
+        let tag = if current_name == config.name {
+            String::from("replaces existing")
+        } else {
+            format!("replaces '{current_name}'")
+        };
+        item = item.push(text(tag).size(11).style(warn_text_style));
+    }
+    item.push(Space::new().width(Length::Fill))
+        .push(
+            text(config.config_type().to_string())
+                .size(12)
+                .style(muted_text_style),
+        )
+        .spacing(8)
+        .align_y(Alignment::Center)
+        .into()
+}
+
+/// 모달 공용: "Select all" 체크박스 + `N / M selected` 카운터 row.
+fn modal_select_all_row<'a>(
+    selected_count: usize,
+    total: usize,
+    on_toggle: fn(bool) -> Message,
+) -> iced::widget::Row<'a, Message> {
+    row![
+        checkbox(selected_count == total)
+            .label("Select all")
+            .on_toggle(on_toggle)
+            .size(18)
+            .text_size(13),
+        Space::new().width(Length::Fill),
+        text(format!("{selected_count} / {total} selected"))
+            .size(12)
+            .style(muted_text_style),
+    ]
+    .align_y(Alignment::Center)
+}
+
+/// 모달 공용: 리스트 영역 scrollable 래퍼 (얇은 스크롤바 스타일 공유).
+fn modal_list_scrollable(list: Column<'_, Message>) -> iced::widget::Scrollable<'_, Message> {
+    scrollable(list.padding(Padding::new(0.0).right(8.0)))
+        .height(Length::Fill)
+        .direction(scrollable::Direction::Vertical(
+            scrollable::Scrollbar::default()
+                .width(4)
+                .scroller_width(4.0)
+                .spacing(2.0),
+        ))
+}
+
+/// 모달 공용: [Cancel] [primary] 푸터. `primary_msg`가 `None`이면 primary 비활성.
+fn modal_footer<'a>(
+    cancel_msg: Message,
+    primary_label: &'a str,
+    primary_msg: Option<Message>,
+) -> iced::widget::Row<'a, Message> {
+    row![
+        Space::new().width(Length::Fill),
+        button(text("Cancel").size(13))
+            .on_press(cancel_msg)
+            .padding([6, 16])
+            .style(modal_secondary_button_style),
+        button(text(primary_label).size(13))
+            .on_press_maybe(primary_msg)
+            .padding([6, 18])
+            .style(modal_primary_button_style),
+    ]
+    .spacing(8)
+    .align_y(Alignment::Center)
+}
+
+/// 모달 공용: 다이얼로그 컨테이너 + 반투명 backdrop 오버레이 래핑
+/// (`opaque(center(opaque(dialog)))` — iced 공식 modal 패턴, view_env_modal 참고).
+fn modal_dialog(
+    content: Element<'_, Message>,
+    max_width: f32,
+    max_height: f32,
+) -> Element<'_, Message> {
+    let dialog = container(content)
+        .padding(18)
+        .max_width(max_width)
+        .max_height(max_height)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .style(modal_dialog_style);
+
+    opaque(
+        center(opaque(dialog))
+            .padding(40)
+            .style(modal_backdrop_style),
+    )
+}
+
+/// 모달 리스트(`configurations`)에서 선택된 Compound 중, "리스트에 존재하지만
+/// 선택되지 않았고 `satisfied_elsewhere`로도 충족되지 않는" 멤버가 있으면 경고
+/// 문구를 만든다. export는 빈 집합을, import는 현재 구성 id들을 `satisfied_elsewhere`로
+/// 전달한다(이미 있는 멤버는 가져오지 않아도 참조가 살아 있으므로). 리스트에 아예
+/// 없는 멤버는 이 작업으로 해결할 수 없으므로(이미 dangling) 경고하지 않는다.
+fn compound_member_warnings(
+    configurations: &[RunConfiguration],
+    selected: &std::collections::HashSet<Uuid>,
+    satisfied_elsewhere: &std::collections::HashSet<Uuid>,
+) -> Vec<String> {
+    configurations
+        .iter()
+        .filter(|c| selected.contains(&c.id))
+        .filter_map(|c| {
+            let ConfigTypeData::Compound { members, .. } = &c.type_data else {
+                return None;
+            };
+            let missing: Vec<&str> = configurations
+                .iter()
+                .filter(|m| {
+                    members.contains(&m.id)
+                        && !selected.contains(&m.id)
+                        && !satisfied_elsewhere.contains(&m.id)
+                })
+                .map(|m| m.name.as_str())
+                .collect();
+            (!missing.is_empty()).then(|| {
+                format!(
+                    "Compound '{}' members not selected: {}",
+                    c.name,
+                    missing.join(", ")
+                )
+            })
+        })
+        .collect()
+}
+
+fn warn_text_style(_theme: &Theme) -> text::Style {
+    text::Style {
+        // text_input_warn_style의 경고 테두리와 동일 색 (일관성)
+        color: Some(Color::from_rgb(0.95, 0.65, 0.20)),
+    }
+}
+
 /// staging entries 중 동일 키가 둘 이상 있는 row index 집합.
 /// trim 후 빈 키는 중복 검사에서 제외 (placeholder/입력 중인 row 보호).
 fn duplicate_key_indices(entries: &[(String, String)]) -> std::collections::HashSet<usize> {
@@ -936,11 +1262,23 @@ fn modal_primary_button_style(theme: &Theme, status: button::Status) -> button::
     let bg = match status {
         button::Status::Hovered => palette.primary.strong.color,
         button::Status::Pressed => palette.primary.weak.color,
+        // 비활성(예: Export 모달에서 선택 0개): 흐리게 표시해 눌리지 않음을 드러낸다.
+        button::Status::Disabled => Color {
+            a: 0.35,
+            ..base.color
+        },
         _ => base.color,
+    };
+    let text_color = match status {
+        button::Status::Disabled => Color {
+            a: 0.5,
+            ..base.text
+        },
+        _ => base.text,
     };
     button::Style {
         background: Some(Background::Color(bg)),
-        text_color: base.text,
+        text_color,
         border: Border {
             radius: 4.0.into(),
             ..Default::default()
@@ -1659,4 +1997,67 @@ fn view_kotlin_jdk_row<'a>(
     .spacing(10)
     .align_y(Alignment::Center)
     .width(Length::Fill)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::compound_member_warnings;
+    use crate::models::{ConfigTypeData, RunConfiguration};
+    use std::collections::HashSet;
+    use uuid::Uuid;
+
+    fn named(name: &str) -> RunConfiguration {
+        RunConfiguration {
+            name: name.to_string(),
+            ..RunConfiguration::default()
+        }
+    }
+
+    /// [A, B, Bundle(A, B, dangling)] 구성 목록 생성.
+    fn configs_with_bundle() -> Vec<RunConfiguration> {
+        let a = named("A");
+        let b = named("B");
+        let mut bundle = named("Bundle");
+        bundle.type_data = ConfigTypeData::Compound {
+            members: vec![a.id, b.id, Uuid::new_v4()],
+            workspace: None,
+        };
+        vec![a, b, bundle]
+    }
+
+    #[test]
+    fn warns_when_selected_compound_has_unselected_existing_member() {
+        let configs = configs_with_bundle();
+        let none = HashSet::new();
+        // Bundle과 A만 선택 — B가 빠져 경고 대상. dangling 멤버는 경고에 포함되지 않는다.
+        let selected: HashSet<Uuid> = [configs[0].id, configs[2].id].into();
+        let warnings = compound_member_warnings(&configs, &selected, &none);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("Bundle"));
+        assert!(warnings[0].contains("B") && !warnings[0].contains("A,"));
+    }
+
+    #[test]
+    fn no_warning_when_all_existing_members_selected_or_compound_unselected() {
+        let configs = configs_with_bundle();
+        let none = HashSet::new();
+
+        // 전부 선택: dangling 멤버만 빠졌지만 목록에 없으므로 경고 없음
+        let all: HashSet<Uuid> = configs.iter().map(|c| c.id).collect();
+        assert!(compound_member_warnings(&configs, &all, &none).is_empty());
+
+        // Compound 자체가 미선택이면 멤버가 빠져도 경고 없음
+        let members_only: HashSet<Uuid> = [configs[0].id, configs[1].id].into();
+        assert!(compound_member_warnings(&configs, &members_only, &none).is_empty());
+    }
+
+    #[test]
+    fn no_warning_when_member_satisfied_elsewhere() {
+        // import 시나리오: 파일 리스트에서 B를 선택하지 않았지만, 현재 앱 목록에
+        // 같은 id가 이미 있으면(satisfied_elsewhere) 병합 후 참조가 살아 있어 경고 없음.
+        let configs = configs_with_bundle();
+        let selected: HashSet<Uuid> = [configs[0].id, configs[2].id].into();
+        let satisfied: HashSet<Uuid> = [configs[1].id].into();
+        assert!(compound_member_warnings(&configs, &selected, &satisfied).is_empty());
+    }
 }

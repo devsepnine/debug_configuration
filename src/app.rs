@@ -6,15 +6,16 @@ use crate::models::{
 };
 use crate::services::{
     AppSettings, UpdateOutcome, check_latest_release, export_text, load_from_path, load_settings,
-    open_configurations, register_running_pid, run_configuration_stream, save_configurations,
-    save_settings, unregister_running_pid,
+    register_running_pid, run_configuration_stream, save_configurations, save_settings,
+    unregister_running_pid,
 };
 use crate::utils::{DIALOG_CANCELLED, ICON_DELETE, ICON_PLAY, ICON_REFRESH, ICON_STOP};
 use crate::views::shared::icon_tooltip;
 use crate::views::{
-    EditorLoadingState, EditorSelectState, EnvModalView, FileDialogLoadingState, NodeLoadingState,
-    SettingsModalView, view_configuration_editor, view_configuration_list, view_env_modal,
-    view_main_tabs, view_pane_layout, view_settings_modal, view_toolbar, view_workspace_tab_bar,
+    EditorLoadingState, EditorSelectState, EnvModalView, ExportModalView, FileDialogLoadingState,
+    ImportModalView, NodeLoadingState, SettingsModalView, view_configuration_editor,
+    view_configuration_list, view_env_modal, view_export_modal, view_import_modal, view_main_tabs,
+    view_pane_layout, view_settings_modal, view_toolbar, view_workspace_tab_bar,
 };
 use crate::widgets::pane_grid;
 use iced::{
@@ -34,9 +35,13 @@ use uuid::Uuid;
 
 mod chrome;
 mod env_modal;
+mod export_modal;
+mod import_modal;
 mod settings_modal;
 
 use env_modal::EnvModalState;
+use export_modal::ExportModalState;
+use import_modal::ImportModalState;
 use settings_modal::SettingsModalState;
 
 use chrome::{
@@ -346,6 +351,10 @@ pub struct RunConfigManager {
     env_modal: Option<EnvModalState>,
     /// 앱 설정 모달 상태 (`Some`이면 모달 열림)
     settings_modal: Option<SettingsModalState>,
+    /// 구성 내보내기 모달 상태 (`Some`이면 모달 열림)
+    export_modal: Option<ExportModalState>,
+    /// 구성 가져오기 모달 상태 (`Some`이면 모달 열림)
+    import_modal: Option<ImportModalState>,
     /// 설정: 구성 실행 시 Environment 라인 표시 여부
     show_environment_on_run: bool,
     /// 설정: 새 세션의 출력 버퍼 최대 라인 수
@@ -423,6 +432,8 @@ impl RunConfigManager {
             env_bulk_inputs: HashMap::new(),
             env_modal: None,
             settings_modal: None,
+            export_modal: None,
+            import_modal: None,
             show_environment_on_run: settings.show_environment_on_run,
             max_output_lines: settings.max_output_lines,
             default_auto_scroll: settings.default_auto_scroll,
@@ -536,6 +547,22 @@ impl RunConfigManager {
             Message::SettingsToggleAutoCheckUpdates(value) => {
                 self.handle_settings_toggle_auto_check_updates(value)
             }
+            Message::OpenExportModal => self.handle_open_export_modal(),
+            Message::ConfirmExportModal => self.handle_confirm_export_modal(),
+            Message::CancelExportModal => self.handle_cancel_export_modal(),
+            Message::ExportModalToggleConfig(config_id, checked) => {
+                self.handle_export_modal_toggle_config(config_id, checked)
+            }
+            Message::ExportModalToggleAll(checked) => self.handle_export_modal_toggle_all(checked),
+            Message::ConfigurationsExported(result) => self.handle_configurations_exported(result),
+            Message::ImportConfigurations => self.handle_import_configurations(),
+            Message::ImportFileLoaded(result) => self.handle_import_file_loaded(result),
+            Message::ConfirmImportModal => self.handle_confirm_import_modal(),
+            Message::CancelImportModal => self.handle_cancel_import_modal(),
+            Message::ImportModalToggleConfig(config_id, checked) => {
+                self.handle_import_modal_toggle_config(config_id, checked)
+            }
+            Message::ImportModalToggleAll(checked) => self.handle_import_modal_toggle_all(checked),
             Message::AddConfiguration
             | Message::DeleteConfiguration(_)
             | Message::CloneConfiguration(_)
@@ -602,8 +629,6 @@ impl RunConfigManager {
             | Message::MoveEditorFocus(_)
             | Message::EditorFocusAreaChanged(_)
             | Message::ConfigurationsLoaded(_)
-            | Message::OpenConfigurations
-            | Message::ConfigurationsOpened(_)
             | Message::SaveConfigurations
             | Message::ConfigurationsSaved(_) => self.handle_configuration_messages(message),
             Message::ProcessStarted(_, _)
@@ -767,8 +792,6 @@ impl RunConfigManager {
                 self.handle_editor_focus_area_changed(is_active)
             }
             Message::ConfigurationsLoaded(result) => self.handle_configurations_loaded(result),
-            Message::OpenConfigurations => self.handle_open_configurations(),
-            Message::ConfigurationsOpened(result) => self.handle_configurations_opened(result),
             Message::SaveConfigurations => self.handle_save_configurations(),
             Message::ConfigurationsSaved(result) => self.handle_configurations_saved(result),
             _ => unreachable!("non-configuration message routed to handle_configuration_messages"),
@@ -2127,6 +2150,11 @@ impl RunConfigManager {
                 self.node_available_scripts.clear();
                 self.node_available_package_jsons.clear();
                 self.env_modal = None;
+                // 내보내기 모달의 선택 집합은 교체 전 구성의 id라 stale — 닫아서
+                // "선택했다고 믿은 것과 다른 것을 내보내는" 사고를 막는다.
+                self.export_modal = None;
+                // 가져오기 모달도 닫는다 — 병합 대상이 사용자가 봤던 목록과 달라지므로.
+                self.import_modal = None;
                 self.status_message = if let Some(path) = &self.last_file_path {
                     format!("Loaded: {}", path.display())
                 } else {
@@ -2170,37 +2198,6 @@ impl RunConfigManager {
         }
 
         Task::none()
-    }
-
-    fn handle_open_configurations(&mut self) -> Task<Message> {
-        self.status_message = String::from("Opening configurations...");
-        Task::perform(open_configurations(), Message::ConfigurationsOpened)
-    }
-
-    fn handle_configurations_opened(
-        &mut self,
-        result: Result<(Vec<RunConfiguration>, PathBuf), String>,
-    ) -> Task<Message> {
-        match result {
-            Ok((configs, path)) => {
-                self.configurations = configs;
-                self.env_bulk_inputs.clear();
-                self.node_available_scripts.clear();
-                self.node_available_package_jsons.clear();
-                self.env_modal = None;
-                self.selected_config_index = (!self.configurations.is_empty()).then_some(0);
-                let metadata_task = self.load_node_metadata_for_current_configurations();
-
-                self.last_file_path = Some(path.clone());
-                self.save_app_settings();
-                self.status_message = format!("Opened: {}", path.display());
-                metadata_task
-            }
-            Err(error) => {
-                self.status_message = cancellable_status(&error, "Open");
-                Task::none()
-            }
-        }
     }
 
     /// 현재 구성들의 Node 메타데이터(package.json 목록 + scripts)를 백그라운드에서 로드.
@@ -4018,6 +4015,25 @@ impl RunConfigManager {
         content.into()
     }
 
+    /// 오버레이 모달(env/settings/export/import)이 하나라도 열려 있는지.
+    /// 전역 키보드 단축키를 비활성화해 backdrop 뒤 UI로 입력이 새는 것을 막는 가드.
+    fn any_modal_open(&self) -> bool {
+        self.env_modal.is_some()
+            || self.settings_modal.is_some()
+            || self.export_modal.is_some()
+            || self.import_modal.is_some()
+    }
+
+    /// 모든 오버레이 모달을 닫는다. 각 모달의 open 핸들러가 "한 번에 하나의 모달만"
+    /// 계약을 지키기 위해 자신을 열기 직전에 호출한다(보통 opaque backdrop이 막지만
+    /// 방어적). 새 모달 추가 시 `any_modal_open`과 이 함수만 갱신하면 된다.
+    fn close_all_modals(&mut self) {
+        self.env_modal = None;
+        self.settings_modal = None;
+        self.export_modal = None;
+        self.import_modal = None;
+    }
+
     /// 마우스 이벤트 구독 (드래그 앤 드롭용)
     pub fn subscription(&self) -> Subscription<Message> {
         let cursor_subscription = if self.drag.is_dragging_pane
@@ -4050,9 +4066,11 @@ impl RunConfigManager {
         // There is no stable app-level API here to ask whether the focused
         // widget belongs to the editor pane. We use the editor pane hover area
         // as a practical guard so Tab does not affect the whole screen.
+        // 모달이 하나라도 열려 있으면 비활성 — Tab이 backdrop 뒤 에디터 input으로
+        // focus를 옮겨 이후 타이핑이 보이지 않는 input에 들어가는 것을 막는다.
         let editor_focus_subscription = if matches!(self.current_view, ViewMode::Configuration)
             && self.configuration_ui.editor_focus_area_active
-            && self.env_modal.is_none()
+            && !self.any_modal_open()
         {
             event::listen_with(|event, status, _id| match event {
                 Event::Keyboard(keyboard::Event::KeyPressed {
@@ -4109,6 +4127,32 @@ impl RunConfigManager {
             Subscription::none()
         };
 
+        // 내보내기 모달: Esc로 닫기 (settings 모달과 동일 — 체크박스뿐이라 Tab 트랩 불필요).
+        let export_modal_keyboard_subscription = if self.export_modal.is_some() {
+            event::listen_with(|event, _status, _id| match event {
+                Event::Keyboard(keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Named(keyboard::key::Named::Escape),
+                    ..
+                }) => Some(Message::CancelExportModal),
+                _ => None,
+            })
+        } else {
+            Subscription::none()
+        };
+
+        // 가져오기 모달: Esc로 닫기 (export 모달과 동일).
+        let import_modal_keyboard_subscription = if self.import_modal.is_some() {
+            event::listen_with(|event, _status, _id| match event {
+                Event::Keyboard(keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Named(keyboard::key::Named::Escape),
+                    ..
+                }) => Some(Message::CancelImportModal),
+                _ => None,
+            })
+        } else {
+            Subscription::none()
+        };
+
         let tab_name_edit_subscription = if self.tab_ui.editing_tab_name.is_some() {
             event::listen_with(|event, _status, _id| match event {
                 Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
@@ -4129,7 +4173,7 @@ impl RunConfigManager {
         // 세션 화면에서 Ctrl/Cmd+F = 검색 열기. 모달이 열려 있으면 비활성화. 대상
         // 세션은 핸들러가 해석한다(클로저는 fn 포인터라 self 접근 불가).
         let sessions_active =
-            matches!(self.current_view, ViewMode::Sessions) && self.env_modal.is_none();
+            matches!(self.current_view, ViewMode::Sessions) && !self.any_modal_open();
         let search_open_subscription = if sessions_active {
             event::listen_with(|event, _status, _id| match event {
                 Event::Keyboard(keyboard::Event::KeyPressed {
@@ -4184,19 +4228,17 @@ impl RunConfigManager {
         // F1/F2 = 화면 전환(Configurations/Sessions), Cmd+1~9 = 해당 워크스페이스로 점프.
         // 모달이 열려 있거나 탭 이름 편집 중이면 비활성화해 입력/모달 작업을 보호한다.
         // 키→메시지 매핑은 nav_shortcut_message로 추출해 단위 테스트와 공유한다.
-        let nav_shortcut_subscription = if self.env_modal.is_none()
-            && self.settings_modal.is_none()
-            && self.tab_ui.editing_tab_name.is_none()
-        {
-            event::listen_with(|event, _status, _id| match event {
-                Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) => {
-                    Self::nav_shortcut_message(&key, modifiers)
-                }
-                _ => None,
-            })
-        } else {
-            Subscription::none()
-        };
+        let nav_shortcut_subscription =
+            if !self.any_modal_open() && self.tab_ui.editing_tab_name.is_none() {
+                event::listen_with(|event, _status, _id| match event {
+                    Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) => {
+                        Self::nav_shortcut_message(&key, modifiers)
+                    }
+                    _ => None,
+                })
+            } else {
+                Subscription::none()
+            };
 
         // 업데이트 확인 중에만 스피너 애니메이션 tick을 발행한다.
         let update_spinner_subscription = if self.is_checking_update {
@@ -4211,6 +4253,8 @@ impl RunConfigManager {
             editor_focus_subscription,
             env_modal_keyboard_subscription,
             settings_modal_keyboard_subscription,
+            export_modal_keyboard_subscription,
+            import_modal_keyboard_subscription,
             tab_name_edit_subscription,
             window_focus_subscription,
             search_open_subscription,
@@ -4276,6 +4320,24 @@ impl RunConfigManager {
                 auto_check_updates: modal.auto_check_updates,
             };
             layers = layers.push(view_settings_modal(props));
+        }
+
+        if let Some(modal) = self.export_modal.as_ref() {
+            let props = ExportModalView {
+                configurations: &self.configurations,
+                selected: &modal.selected,
+            };
+            layers = layers.push(view_export_modal(props));
+        }
+
+        if let Some(modal) = self.import_modal.as_ref() {
+            let props = ImportModalView {
+                source: &modal.source_path,
+                configs: &modal.configs,
+                selected: &modal.selected,
+                existing: &self.configurations,
+            };
+            layers = layers.push(view_import_modal(props));
         }
 
         layers.width(Length::Fill).height(Length::Fill).into()

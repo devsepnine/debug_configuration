@@ -7,7 +7,7 @@ pub use executor::{
     run_configuration_stream, unregister_running_pid,
 };
 pub use storage::{
-    AppSettings, export_text, load_from_path, load_settings, open_configurations,
-    save_configurations, save_settings,
+    AppSettings, export_configurations, export_text, import_configurations, load_from_path,
+    load_settings, save_configurations, save_settings,
 };
 pub use update_check::{CURRENT_VERSION, UpdateOutcome, check_latest_release};

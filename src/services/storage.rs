@@ -174,22 +174,24 @@ pub async fn load_from_path(path: PathBuf) -> Result<Vec<RunConfiguration>, Stri
     parse_config_file(&content)
 }
 
-/// 구성 목록을 현재 파일 또는 사용자가 선택한 파일로 저장
+/// 구성 목록을 버전 envelope으로 직렬화해 `target_path`(없으면 저장 다이얼로그로
+/// 선택한 경로)에 쓴다. save/export의 공통 경로.
 ///
 /// # Returns
 /// * `Ok(PathBuf)` - 저장된 파일 경로
-/// * `Err(String)` - 저장 실패 시 에러 메시지
-pub async fn save_configurations(
+/// * `Err(String)` - 취소(`DIALOG_CANCELLED`) 또는 직렬화/쓰기 실패
+async fn save_configs_to(
     configs: Vec<RunConfiguration>,
-    current_path: Option<PathBuf>,
+    target_path: Option<PathBuf>,
+    suggested_name: &str,
 ) -> Result<PathBuf, String> {
-    let file_path = match current_path {
+    let file_path = match target_path {
         Some(path) => path,
         // AsyncFileDialog는 내부적으로 메인 스레드로 마샬링하므로, Task::perform가
         // 워커 스레드에서 폴링해도 안전하다 (macOS AppKit runModal()은 메인 스레드 전용).
         None => AsyncFileDialog::new()
             .add_filter("JSON", &["json"])
-            .set_file_name("configurations.json")
+            .set_file_name(suggested_name)
             .save_file()
             .await
             .map(|handle| handle.path().to_path_buf())
@@ -201,6 +203,30 @@ pub async fn save_configurations(
     std::fs::write(&file_path, json).map_err(|e| format!("File write error: {e}"))?;
 
     Ok(file_path)
+}
+
+/// 구성 목록을 현재 파일 또는 사용자가 선택한 파일로 저장
+///
+/// # Returns
+/// * `Ok(PathBuf)` - 저장된 파일 경로
+/// * `Err(String)` - 저장 실패 시 에러 메시지
+pub async fn save_configurations(
+    configs: Vec<RunConfiguration>,
+    current_path: Option<PathBuf>,
+) -> Result<PathBuf, String> {
+    save_configs_to(configs, current_path, "configurations.json").await
+}
+
+/// 선택된 구성들을 사용자가 지정한 파일로 내보내기.
+///
+/// 저장(save)과 달리 현재 파일 경로를 건드리지 않고 항상 저장 다이얼로그를 띄운다.
+/// 파일 포맷은 저장과 동일한 버전 envelope이므로 Open으로 그대로 다시 열 수 있다.
+///
+/// # Returns
+/// * `Ok(PathBuf)` - 내보낸 파일 경로
+/// * `Err(String)` - 취소(`DIALOG_CANCELLED`) 또는 직렬화/쓰기 실패
+pub async fn export_configurations(configs: Vec<RunConfiguration>) -> Result<PathBuf, String> {
+    save_configs_to(configs, None, "configurations-export.json").await
 }
 
 /// 임의 텍스트(세션 출력 등)를 사용자가 선택한 파일로 저장.
@@ -224,12 +250,14 @@ pub async fn export_text(content: String, suggested_name: String) -> Result<Path
     Ok(file_path)
 }
 
-/// 사용자가 선택한 파일에서 구성 목록 열기
+/// 가져오기(Import)용으로 사용자가 선택한 파일에서 구성 목록 읽기.
+/// 파일을 파싱만 하며 현재 구성/작업 파일 경로에는 영향을 주지 않는다
+/// (병합 대상 선택과 반영은 호출 측 import 모달이 담당).
 ///
 /// # Returns
-/// * `Ok((Vec<RunConfiguration>, PathBuf))` - 열린 구성 목록과 파일 경로
-/// * `Err(String)` - 열기 실패 시 에러 메시지
-pub async fn open_configurations() -> Result<(Vec<RunConfiguration>, PathBuf), String> {
+/// * `Ok((Vec<RunConfiguration>, PathBuf))` - 파일의 구성 목록과 파일 경로
+/// * `Err(String)` - 취소(`DIALOG_CANCELLED`) 또는 읽기/파싱 실패
+pub async fn import_configurations() -> Result<(Vec<RunConfiguration>, PathBuf), String> {
     // off-main 안전성을 위해 AsyncFileDialog 사용 (save_configurations 참고).
     let file_path = AsyncFileDialog::new()
         .add_filter("JSON", &["json"])

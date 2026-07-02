@@ -1,5 +1,5 @@
 use crate::messages::Message;
-use crate::utils::{ICON_ADD, ICON_FOLDER_OPEN, ICON_SAVE, ICON_SETTINGS};
+use crate::utils::{ICON_ADD, ICON_EXPORT, ICON_IMPORT, ICON_SAVE, ICON_SETTINGS};
 use crate::views::shared::{IconButtonState, icon_button_foreground, icon_tooltip};
 use iced::{
     Element, Length, Theme,
@@ -8,14 +8,16 @@ use iced::{
 
 /// `Configurations` 헤더 액션 렌더링
 ///
-/// 추가, 열기, 저장 아이콘 버튼을 헤더 우측에 배치
+/// 추가, 가져오기, 내보내기, 저장, 설정 아이콘 버튼을 헤더 우측에 배치
+/// (Import/Export는 짝 기능이므로 인접 배치)
 pub fn view_toolbar() -> Element<'static, Message> {
     let add_btn = toolbar_button("Add", ICON_ADD, Message::AddConfiguration);
-    let open_btn = toolbar_button("Open", ICON_FOLDER_OPEN, Message::OpenConfigurations);
+    let import_btn = toolbar_button("Import", ICON_IMPORT, Message::ImportConfigurations);
+    let export_btn = toolbar_button("Export", ICON_EXPORT, Message::OpenExportModal);
     let save_btn = toolbar_button("Save", ICON_SAVE, Message::SaveConfigurations);
     let settings_btn = toolbar_button("Settings", ICON_SETTINGS, Message::OpenSettingsModal);
 
-    row![add_btn, open_btn, save_btn, settings_btn]
+    row![add_btn, import_btn, export_btn, save_btn, settings_btn]
         .spacing(4)
         .into()
 }
