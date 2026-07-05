@@ -110,6 +110,8 @@ impl RunConfigManager {
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
         entries.sort_by(|a, b| a.0.cmp(&b.0));
+        // 한 번에 하나의 모달만 (계약과 근거는 close_all_modals 참고).
+        self.close_all_modals();
         self.env_modal = Some(EnvModalState {
             config_id,
             entries,

@@ -6,3 +6,4 @@
 
 pub mod configuration_list;
 pub mod pane_grid;
+pub mod title_bar_drag;

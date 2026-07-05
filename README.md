@@ -30,7 +30,8 @@ Grab the latest pre-built binary for your platform from the [Releases page](http
 - Set command, arguments, and working directory
 - Manage environment variables (add, edit, delete)
 - Reorder configurations with drag and drop
-- Open/save configurations (versioned JSON format)
+- Save configurations (versioned JSON format)
+- Export selected configurations to a file / import from a file with selective merge
 
 ### Node Project Support
 - Node-oriented commands supported (run, install, start, test, build, etc.)

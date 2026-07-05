@@ -17,6 +17,8 @@ pub const ICON_ADD: &[u8] = include_bytes!("../assets/mingcute--add-square-line.
 pub const ICON_COPY: &[u8] = include_bytes!("../assets/mingcute--copy-2-line.svg");
 pub const ICON_CONFIGURATIONS: &[u8] = include_bytes!("../assets/app--configurations.svg");
 pub const ICON_SESSIONS: &[u8] = include_bytes!("../assets/app--sessions.svg");
+pub const ICON_EXPORT: &[u8] = include_bytes!("../assets/ri--export-fill.svg");
+pub const ICON_IMPORT: &[u8] = include_bytes!("../assets/ri--import-fill.svg");
 
 // Shared sentinels
 pub const DIALOG_CANCELLED: &str = "cancelled";

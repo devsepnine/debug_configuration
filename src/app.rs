@@ -6,20 +6,22 @@ use crate::models::{
 };
 use crate::services::{
     AppSettings, UpdateOutcome, check_latest_release, export_text, load_from_path, load_settings,
-    open_configurations, register_running_pid, run_configuration_stream, save_configurations,
-    save_settings, unregister_running_pid,
+    register_running_pid, run_configuration_stream, save_configurations, save_settings,
+    unregister_running_pid,
 };
 use crate::utils::{DIALOG_CANCELLED, ICON_DELETE, ICON_PLAY, ICON_REFRESH, ICON_STOP};
 use crate::views::shared::icon_tooltip;
 use crate::views::{
-    EditorLoadingState, EditorSelectState, EnvModalView, FileDialogLoadingState, NodeLoadingState,
-    SettingsModalView, view_configuration_editor, view_configuration_list, view_env_modal,
-    view_main_tabs, view_pane_layout, view_settings_modal, view_toolbar, view_workspace_tab_bar,
+    EditorLoadingState, EditorSelectState, EnvModalView, ExportModalView, FileDialogLoadingState,
+    ImportModalView, NodeLoadingState, SettingsModalView, view_configuration_editor,
+    view_configuration_list, view_env_modal, view_export_modal, view_import_modal, view_main_tabs,
+    view_pane_layout, view_settings_modal, view_toolbar, view_workspace_tab_bar,
 };
 use crate::widgets::pane_grid;
+use crate::widgets::title_bar_drag::TitleBarDragArea;
 use iced::{
-    Alignment, Background, Border, Color, Element, Event, Length, Size, Subscription, Task, Theme,
-    border, event, keyboard, mouse,
+    Alignment, Background, Border, Color, Element, Event, Length, Point, Size, Subscription, Task,
+    Theme, border, event, keyboard, mouse,
     widget::{
         Space, button, column, container, mouse_area, row, scrollable, stack, svg, text, tooltip,
     },
@@ -34,9 +36,13 @@ use uuid::Uuid;
 
 mod chrome;
 mod env_modal;
+mod export_modal;
+mod import_modal;
 mod settings_modal;
 
 use env_modal::EnvModalState;
+use export_modal::ExportModalState;
+use import_modal::ImportModalState;
 use settings_modal::SettingsModalState;
 
 use chrome::{
@@ -50,6 +56,18 @@ use chrome::{
 
 /// 세션 리스트의 상태 배지 고정 폭 — 레이아웃 계산과 실제 렌더링이 공유한다.
 const SESSION_STATUS_BADGE_WIDTH: f32 = 52.0;
+
+/// 커스텀 타이틀바 터치 드래그의 진행 상태.
+///
+/// 좌표는 모두 logical(iced가 스케일 팩터를 반영해 변환). 손가락이 물리적으로 움직일
+/// 때만 터치 이벤트가 오고, 프로그램적 `move_to`는 터치 이벤트를 만들지 않으므로
+/// `window_pos`를 이동마다 낙관적으로 갱신해도 피드백 루프가 생기지 않는다.
+struct TouchDragState {
+    /// press 시점에 손가락이 창에서 잡은 지점 (창 좌상단 기준 offset). 이동 내내 고정.
+    grab: Point,
+    /// 현재 창 좌상단의 화면 절대 위치. 이동마다 새 위치로 갱신한다.
+    window_pos: Point,
+}
 
 #[derive(Default)]
 struct FileDialogState {
@@ -346,6 +364,10 @@ pub struct RunConfigManager {
     env_modal: Option<EnvModalState>,
     /// 앱 설정 모달 상태 (`Some`이면 모달 열림)
     settings_modal: Option<SettingsModalState>,
+    /// 구성 내보내기 모달 상태 (`Some`이면 모달 열림)
+    export_modal: Option<ExportModalState>,
+    /// 구성 가져오기 모달 상태 (`Some`이면 모달 열림)
+    import_modal: Option<ImportModalState>,
     /// 설정: 구성 실행 시 Environment 라인 표시 여부
     show_environment_on_run: bool,
     /// 설정: 새 세션의 출력 버퍼 최대 라인 수
@@ -383,7 +405,12 @@ pub struct RunConfigManager {
     tab_ui: TabUiState,
     window_id: Option<window::Id>,
     window_size: Size,
+    /// 윈도우 좌상단의 logical 좌표. `WindowMoved`로 갱신하며, 터치 드래그가 창을
+    /// 옮길 절대 위치를 계산하는 기준점이다.
+    window_pos: Point,
     is_window_maximized: bool,
+    /// 커스텀 타이틀바 터치 드래그 상태 (`Some`이면 드래그 중).
+    title_bar_touch_drag: Option<TouchDragState>,
     /// 윈도우 포커스 여부 (백그라운드에서 실행이 끝났을 때만 알림)
     is_window_focused: bool,
     /// 마지막으로 사용한 구성 파일 경로 (Open/Save)
@@ -423,6 +450,8 @@ impl RunConfigManager {
             env_bulk_inputs: HashMap::new(),
             env_modal: None,
             settings_modal: None,
+            export_modal: None,
+            import_modal: None,
             show_environment_on_run: settings.show_environment_on_run,
             max_output_lines: settings.max_output_lines,
             default_auto_scroll: settings.default_auto_scroll,
@@ -455,7 +484,9 @@ impl RunConfigManager {
             tab_ui: TabUiState::default(),
             window_id: None,
             window_size: Size::new(800.0, 600.0),
+            window_pos: Point::ORIGIN,
             is_window_maximized: false,
+            title_bar_touch_drag: None,
             is_window_focused: true,
             last_file_path: last_file_path.clone(),
             update_available: None,
@@ -536,6 +567,22 @@ impl RunConfigManager {
             Message::SettingsToggleAutoCheckUpdates(value) => {
                 self.handle_settings_toggle_auto_check_updates(value)
             }
+            Message::OpenExportModal => self.handle_open_export_modal(),
+            Message::ConfirmExportModal => self.handle_confirm_export_modal(),
+            Message::CancelExportModal => self.handle_cancel_export_modal(),
+            Message::ExportModalToggleConfig(config_id, checked) => {
+                self.handle_export_modal_toggle_config(config_id, checked)
+            }
+            Message::ExportModalToggleAll(checked) => self.handle_export_modal_toggle_all(checked),
+            Message::ConfigurationsExported(result) => self.handle_configurations_exported(result),
+            Message::ImportConfigurations => self.handle_import_configurations(),
+            Message::ImportFileLoaded(result) => self.handle_import_file_loaded(result),
+            Message::ConfirmImportModal => self.handle_confirm_import_modal(),
+            Message::CancelImportModal => self.handle_cancel_import_modal(),
+            Message::ImportModalToggleConfig(config_id, checked) => {
+                self.handle_import_modal_toggle_config(config_id, checked)
+            }
+            Message::ImportModalToggleAll(checked) => self.handle_import_modal_toggle_all(checked),
             Message::AddConfiguration
             | Message::DeleteConfiguration(_)
             | Message::CloneConfiguration(_)
@@ -602,8 +649,6 @@ impl RunConfigManager {
             | Message::MoveEditorFocus(_)
             | Message::EditorFocusAreaChanged(_)
             | Message::ConfigurationsLoaded(_)
-            | Message::OpenConfigurations
-            | Message::ConfigurationsOpened(_)
             | Message::SaveConfigurations
             | Message::ConfigurationsSaved(_) => self.handle_configuration_messages(message),
             Message::ProcessStarted(_, _)
@@ -659,7 +704,11 @@ impl RunConfigManager {
             | Message::WindowResized(_, _)
             | Message::WindowMaximized(_)
             | Message::WindowFocusChanged(_)
+            | Message::WindowMoved(_)
             | Message::StartWindowDrag
+            | Message::TitleBarTouchDragStart(_)
+            | Message::TitleBarTouchDragMove(_)
+            | Message::TitleBarTouchDragEnd
             | Message::ResizeWindow(_)
             | Message::MinimizeWindow
             | Message::ToggleWindowMaximize
@@ -767,8 +816,6 @@ impl RunConfigManager {
                 self.handle_editor_focus_area_changed(is_active)
             }
             Message::ConfigurationsLoaded(result) => self.handle_configurations_loaded(result),
-            Message::OpenConfigurations => self.handle_open_configurations(),
-            Message::ConfigurationsOpened(result) => self.handle_configurations_opened(result),
             Message::SaveConfigurations => self.handle_save_configurations(),
             Message::ConfigurationsSaved(result) => self.handle_configurations_saved(result),
             _ => unreachable!("non-configuration message routed to handle_configuration_messages"),
@@ -882,9 +929,24 @@ impl RunConfigManager {
             Message::WindowMaximized(is_maximized) => self.handle_window_maximized(is_maximized),
             Message::WindowFocusChanged(focused) => {
                 self.is_window_focused = focused;
+                // 포커스를 잃으면(시스템 다이얼로그·Alt-Tab 등) winit이 터치 취소/뗌
+                // 이벤트를 만들지 않아 드래그가 걸린 채 멈출 수 있다. 그러면 이후 모든
+                // WindowMoved가 무시되어 window_pos가 stale해지므로 여기서 드래그를 끝낸다.
+                if !focused {
+                    self.title_bar_touch_drag = None;
+                }
                 Task::none()
             }
+            Message::WindowMoved(position) => self.handle_window_moved(position),
             Message::StartWindowDrag => self.handle_start_window_drag(),
+            Message::TitleBarTouchDragStart(finger) => {
+                self.handle_title_bar_touch_drag_start(finger)
+            }
+            Message::TitleBarTouchDragMove(finger) => self.handle_title_bar_touch_drag_move(finger),
+            Message::TitleBarTouchDragEnd => {
+                self.title_bar_touch_drag = None;
+                Task::none()
+            }
             Message::ResizeWindow(direction) => self.handle_resize_window(direction),
             Message::MinimizeWindow => self.handle_minimize_window(),
             Message::ToggleWindowMaximize => self.handle_toggle_window_maximize(),
@@ -895,7 +957,24 @@ impl RunConfigManager {
 
     fn handle_window_opened(&mut self, id: window::Id) -> Task<Message> {
         self.window_id = Some(id);
-        window::is_maximized(id).map(Message::WindowMaximized)
+        // 최대화 상태와 함께 초기 창 위치도 확보한다 (터치 드래그 기준점). 이후엔
+        // WindowMoved로 계속 갱신되지만, 첫 드래그 전에 정확한 값이 필요하다.
+        let initial_position =
+            window::position(id).and_then(|p| Task::done(Message::WindowMoved(p)));
+        Task::batch([
+            window::is_maximized(id).map(Message::WindowMaximized),
+            initial_position,
+        ])
+    }
+
+    /// 창 이동 반영. 터치 드래그 중에는 우리가 방금 요청한 이동이 되돌아오는 것이므로
+    /// 기준 위치를 덮어쓰지 않는다(낙관적으로 이미 갱신됨). 그 외(마우스 OS 드래그,
+    /// 외부 요인)에는 최신 위치로 동기화한다.
+    fn handle_window_moved(&mut self, position: Point) -> Task<Message> {
+        if self.title_bar_touch_drag.is_none() {
+            self.window_pos = position;
+        }
+        Task::none()
     }
 
     fn handle_window_resized(&mut self, id: window::Id, size: Size) -> Task<Message> {
@@ -916,6 +995,47 @@ impl RunConfigManager {
         self.window_id.map_or_else(Task::none, window::drag)
     }
 
+    /// 터치 드래그 시작: 손가락이 잡은 지점과 현재 창 위치를 기록한다. OS 모달 이동
+    /// 루프(`window::drag`)를 타지 않으므로 터치 종료 신호 부재로 인한 프리징이 없다.
+    fn handle_title_bar_touch_drag_start(&mut self, finger: Point) -> Task<Message> {
+        // 최대화 상태에서는 이동하지 않는다 (리사이즈와 동일 정책).
+        if self.is_window_maximized {
+            return Task::none();
+        }
+        self.title_bar_touch_drag = Some(TouchDragState {
+            grab: finger,
+            window_pos: self.window_pos,
+        });
+        Task::none()
+    }
+
+    /// 터치 드래그 이동: 손가락(창 기준)이 잡은 지점을 계속 물도록 창을 옮긴다.
+    ///
+    /// `finger`는 현재 창 위치(`state.window_pos`) 기준의 좌표다. 잡은 지점 `grab`이
+    /// 손가락 아래에 오려면 새 창 위치 = 현재 창 위치 + (finger - grab). 손가락이 물리적
+    /// 이동할 때만 이벤트가 오므로(프로그램적 move_to는 터치 이벤트를 만들지 않음) 이
+    /// 점화식은 안정적이며, 창 위치를 낙관적으로 갱신해 다음 이벤트의 기준으로 삼는다.
+    fn handle_title_bar_touch_drag_move(&mut self, finger: Point) -> Task<Message> {
+        // 드래그 도중 최대화되면(예: 더블탭이 같은 press에서 최대화를 함께 발행) 기준
+        // 위치가 무의미해진다. move_to는 창을 강제로 unmaximize하므로 여기서 중단한다.
+        if self.is_window_maximized {
+            self.title_bar_touch_drag = None;
+            return Task::none();
+        }
+        let Some(drag) = self.title_bar_touch_drag.as_mut() else {
+            return Task::none();
+        };
+        let new_pos = Point::new(
+            drag.window_pos.x + (finger.x - drag.grab.x),
+            drag.window_pos.y + (finger.y - drag.grab.y),
+        );
+        drag.window_pos = new_pos;
+        self.window_pos = new_pos;
+        // 위치 상태는 window_id와 무관하게 갱신하고, 실제 이동 효과만 창이 있을 때 낸다.
+        self.window_id
+            .map_or_else(Task::none, |id| window::move_to(id, new_pos))
+    }
+
     fn handle_resize_window(&mut self, direction: window::Direction) -> Task<Message> {
         if self.is_window_maximized {
             Task::none()
@@ -931,6 +1051,9 @@ impl RunConfigManager {
     }
 
     fn handle_toggle_window_maximize(&mut self) -> Task<Message> {
+        // 진행 중인 터치 드래그가 있으면 끝낸다 (더블탭이 드래그 시작과 최대화를
+        // 같은 press에서 발행하는 경우 등 — 최대화된 창을 move_to하지 않도록).
+        self.title_bar_touch_drag = None;
         self.window_id.map_or_else(Task::none, |id| {
             self.is_window_maximized = !self.is_window_maximized;
             Task::batch([
@@ -2127,6 +2250,11 @@ impl RunConfigManager {
                 self.node_available_scripts.clear();
                 self.node_available_package_jsons.clear();
                 self.env_modal = None;
+                // 내보내기 모달의 선택 집합은 교체 전 구성의 id라 stale — 닫아서
+                // "선택했다고 믿은 것과 다른 것을 내보내는" 사고를 막는다.
+                self.export_modal = None;
+                // 가져오기 모달도 닫는다 — 병합 대상이 사용자가 봤던 목록과 달라지므로.
+                self.import_modal = None;
                 self.status_message = if let Some(path) = &self.last_file_path {
                     format!("Loaded: {}", path.display())
                 } else {
@@ -2170,37 +2298,6 @@ impl RunConfigManager {
         }
 
         Task::none()
-    }
-
-    fn handle_open_configurations(&mut self) -> Task<Message> {
-        self.status_message = String::from("Opening configurations...");
-        Task::perform(open_configurations(), Message::ConfigurationsOpened)
-    }
-
-    fn handle_configurations_opened(
-        &mut self,
-        result: Result<(Vec<RunConfiguration>, PathBuf), String>,
-    ) -> Task<Message> {
-        match result {
-            Ok((configs, path)) => {
-                self.configurations = configs;
-                self.env_bulk_inputs.clear();
-                self.node_available_scripts.clear();
-                self.node_available_package_jsons.clear();
-                self.env_modal = None;
-                self.selected_config_index = (!self.configurations.is_empty()).then_some(0);
-                let metadata_task = self.load_node_metadata_for_current_configurations();
-
-                self.last_file_path = Some(path.clone());
-                self.save_app_settings();
-                self.status_message = format!("Opened: {}", path.display());
-                metadata_task
-            }
-            Err(error) => {
-                self.status_message = cancellable_status(&error, "Open");
-                Task::none()
-            }
-        }
     }
 
     /// 현재 구성들의 Node 메타데이터(package.json 목록 + scripts)를 백그라운드에서 로드.
@@ -3430,7 +3527,9 @@ impl RunConfigManager {
         .align_y(Alignment::Center)
         .height(Length::Fixed(22.0));
 
-        mouse_area(
+        // 마우스는 기존 OS 드래그(window::drag), 터치는 수동 이동(window::move_to)으로
+        // 분기한다. Windows 터치에서 OS 모달 이동 루프가 프리징하는 문제를 피하기 위함.
+        TitleBarDragArea::new(
             container(
                 column![
                     container(
@@ -3469,8 +3568,11 @@ impl RunConfigManager {
                 ..container::Style::default()
             }),
         )
-        .on_press(Message::StartWindowDrag)
-        .on_double_click(Message::ToggleWindowMaximize)
+        .on_mouse_press(Message::StartWindowDrag)
+        .on_double(Message::ToggleWindowMaximize)
+        .on_touch_start(Message::TitleBarTouchDragStart)
+        .on_touch_move(Message::TitleBarTouchDragMove)
+        .on_touch_end(Message::TitleBarTouchDragEnd)
         .interaction(mouse::Interaction::Pointer)
         .into()
     }
@@ -4018,6 +4120,25 @@ impl RunConfigManager {
         content.into()
     }
 
+    /// 오버레이 모달(env/settings/export/import)이 하나라도 열려 있는지.
+    /// 전역 키보드 단축키를 비활성화해 backdrop 뒤 UI로 입력이 새는 것을 막는 가드.
+    fn any_modal_open(&self) -> bool {
+        self.env_modal.is_some()
+            || self.settings_modal.is_some()
+            || self.export_modal.is_some()
+            || self.import_modal.is_some()
+    }
+
+    /// 모든 오버레이 모달을 닫는다. 각 모달의 open 핸들러가 "한 번에 하나의 모달만"
+    /// 계약을 지키기 위해 자신을 열기 직전에 호출한다(보통 opaque backdrop이 막지만
+    /// 방어적). 새 모달 추가 시 `any_modal_open`과 이 함수만 갱신하면 된다.
+    fn close_all_modals(&mut self) {
+        self.env_modal = None;
+        self.settings_modal = None;
+        self.export_modal = None;
+        self.import_modal = None;
+    }
+
     /// 마우스 이벤트 구독 (드래그 앤 드롭용)
     pub fn subscription(&self) -> Subscription<Message> {
         let cursor_subscription = if self.drag.is_dragging_pane
@@ -4050,9 +4171,11 @@ impl RunConfigManager {
         // There is no stable app-level API here to ask whether the focused
         // widget belongs to the editor pane. We use the editor pane hover area
         // as a practical guard so Tab does not affect the whole screen.
+        // 모달이 하나라도 열려 있으면 비활성 — Tab이 backdrop 뒤 에디터 input으로
+        // focus를 옮겨 이후 타이핑이 보이지 않는 input에 들어가는 것을 막는다.
         let editor_focus_subscription = if matches!(self.current_view, ViewMode::Configuration)
             && self.configuration_ui.editor_focus_area_active
-            && self.env_modal.is_none()
+            && !self.any_modal_open()
         {
             event::listen_with(|event, status, _id| match event {
                 Event::Keyboard(keyboard::Event::KeyPressed {
@@ -4109,6 +4232,32 @@ impl RunConfigManager {
             Subscription::none()
         };
 
+        // 내보내기 모달: Esc로 닫기 (settings 모달과 동일 — 체크박스뿐이라 Tab 트랩 불필요).
+        let export_modal_keyboard_subscription = if self.export_modal.is_some() {
+            event::listen_with(|event, _status, _id| match event {
+                Event::Keyboard(keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Named(keyboard::key::Named::Escape),
+                    ..
+                }) => Some(Message::CancelExportModal),
+                _ => None,
+            })
+        } else {
+            Subscription::none()
+        };
+
+        // 가져오기 모달: Esc로 닫기 (export 모달과 동일).
+        let import_modal_keyboard_subscription = if self.import_modal.is_some() {
+            event::listen_with(|event, _status, _id| match event {
+                Event::Keyboard(keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Named(keyboard::key::Named::Escape),
+                    ..
+                }) => Some(Message::CancelImportModal),
+                _ => None,
+            })
+        } else {
+            Subscription::none()
+        };
+
         let tab_name_edit_subscription = if self.tab_ui.editing_tab_name.is_some() {
             event::listen_with(|event, _status, _id| match event {
                 Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
@@ -4123,13 +4272,16 @@ impl RunConfigManager {
         let window_focus_subscription = event::listen_with(|event, _status, _id| match event {
             Event::Window(window::Event::Focused) => Some(Message::WindowFocusChanged(true)),
             Event::Window(window::Event::Unfocused) => Some(Message::WindowFocusChanged(false)),
+            // 창 위치 추적 (터치 드래그가 이동할 절대 위치의 기준). 마우스 OS 드래그·
+            // 프로그램적 move_to 모두 WM_WINDOWPOSCHANGED → Moved로 도착한다.
+            Event::Window(window::Event::Moved(position)) => Some(Message::WindowMoved(position)),
             _ => None,
         });
 
         // 세션 화면에서 Ctrl/Cmd+F = 검색 열기. 모달이 열려 있으면 비활성화. 대상
         // 세션은 핸들러가 해석한다(클로저는 fn 포인터라 self 접근 불가).
         let sessions_active =
-            matches!(self.current_view, ViewMode::Sessions) && self.env_modal.is_none();
+            matches!(self.current_view, ViewMode::Sessions) && !self.any_modal_open();
         let search_open_subscription = if sessions_active {
             event::listen_with(|event, _status, _id| match event {
                 Event::Keyboard(keyboard::Event::KeyPressed {
@@ -4184,19 +4336,17 @@ impl RunConfigManager {
         // F1/F2 = 화면 전환(Configurations/Sessions), Cmd+1~9 = 해당 워크스페이스로 점프.
         // 모달이 열려 있거나 탭 이름 편집 중이면 비활성화해 입력/모달 작업을 보호한다.
         // 키→메시지 매핑은 nav_shortcut_message로 추출해 단위 테스트와 공유한다.
-        let nav_shortcut_subscription = if self.env_modal.is_none()
-            && self.settings_modal.is_none()
-            && self.tab_ui.editing_tab_name.is_none()
-        {
-            event::listen_with(|event, _status, _id| match event {
-                Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) => {
-                    Self::nav_shortcut_message(&key, modifiers)
-                }
-                _ => None,
-            })
-        } else {
-            Subscription::none()
-        };
+        let nav_shortcut_subscription =
+            if !self.any_modal_open() && self.tab_ui.editing_tab_name.is_none() {
+                event::listen_with(|event, _status, _id| match event {
+                    Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) => {
+                        Self::nav_shortcut_message(&key, modifiers)
+                    }
+                    _ => None,
+                })
+            } else {
+                Subscription::none()
+            };
 
         // 업데이트 확인 중에만 스피너 애니메이션 tick을 발행한다.
         let update_spinner_subscription = if self.is_checking_update {
@@ -4211,6 +4361,8 @@ impl RunConfigManager {
             editor_focus_subscription,
             env_modal_keyboard_subscription,
             settings_modal_keyboard_subscription,
+            export_modal_keyboard_subscription,
+            import_modal_keyboard_subscription,
             tab_name_edit_subscription,
             window_focus_subscription,
             search_open_subscription,
@@ -4276,6 +4428,24 @@ impl RunConfigManager {
                 auto_check_updates: modal.auto_check_updates,
             };
             layers = layers.push(view_settings_modal(props));
+        }
+
+        if let Some(modal) = self.export_modal.as_ref() {
+            let props = ExportModalView {
+                configurations: &self.configurations,
+                selected: &modal.selected,
+            };
+            layers = layers.push(view_export_modal(props));
+        }
+
+        if let Some(modal) = self.import_modal.as_ref() {
+            let props = ImportModalView {
+                source: &modal.source_path,
+                configs: &modal.configs,
+                selected: &modal.selected,
+                existing: &self.configurations,
+            };
+            layers = layers.push(view_import_modal(props));
         }
 
         layers.width(Length::Fill).height(Length::Fill).into()
@@ -4628,6 +4798,96 @@ mod tests {
         assert!(app.sessions[1].cancel_flag.load(Ordering::Relaxed));
         // 다른 세션은 영향 없음
         assert!(!app.sessions[0].cancel_flag.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn title_bar_touch_drag_moves_window_by_finger_delta() {
+        let (mut app, _task) = RunConfigManager::new();
+        app.window_pos = Point::new(100.0, 50.0);
+
+        // 창의 (30,10) 지점을 잡음
+        let _ = app.handle_title_bar_touch_drag_start(Point::new(30.0, 10.0));
+        // 손가락이 (50,10)으로 이동 → 창은 (20,0)만큼 이동
+        let _ = app.handle_title_bar_touch_drag_move(Point::new(50.0, 10.0));
+        assert_eq!(app.window_pos, Point::new(120.0, 50.0));
+    }
+
+    #[test]
+    fn title_bar_touch_drag_recurrence_is_stable_across_steps() {
+        // 각 이동 이벤트의 손가락 좌표는 "현재 창 위치" 기준이다. 손가락을 창 기준
+        // grab 지점에 유지하면 delta 0이라 창은 (어디에 있든) 제자리를 지킨다.
+        let (mut app, _task) = RunConfigManager::new();
+        app.window_pos = Point::new(200.0, 100.0);
+        let _ = app.handle_title_bar_touch_drag_start(Point::new(40.0, 12.0));
+
+        // grab 지점 그대로면 delta 0 → 창 불변 (반복해도 안정)
+        let _ = app.handle_title_bar_touch_drag_move(Point::new(40.0, 12.0));
+        let _ = app.handle_title_bar_touch_drag_move(Point::new(40.0, 12.0));
+        assert_eq!(app.window_pos, Point::new(200.0, 100.0));
+
+        // 창 기준 (60,12)로 이동 → +20,0 → (220,100)
+        let _ = app.handle_title_bar_touch_drag_move(Point::new(60.0, 12.0));
+        assert_eq!(app.window_pos, Point::new(220.0, 100.0));
+
+        // 창은 이제 220. 손가락이 물리적으로 제자리면 다음 이벤트의 창 기준 좌표는
+        // 다시 grab(40) → delta 0 → 창은 220 유지 (200으로 되돌아가지 않음).
+        let _ = app.handle_title_bar_touch_drag_move(Point::new(40.0, 12.0));
+        assert_eq!(app.window_pos, Point::new(220.0, 100.0));
+    }
+
+    #[test]
+    fn title_bar_touch_drag_ignored_when_maximized() {
+        let (mut app, _task) = RunConfigManager::new();
+        app.is_window_maximized = true;
+        let _ = app.handle_title_bar_touch_drag_start(Point::new(10.0, 10.0));
+        assert!(app.title_bar_touch_drag.is_none());
+    }
+
+    #[test]
+    fn title_bar_touch_drag_move_bails_if_maximized_mid_drag() {
+        // 드래그 시작 뒤 (더블탭 등으로) 최대화가 발생하고 이어서 move 이벤트가 오면,
+        // move_to로 창을 강제 복원하지 않고 드래그를 취소해야 한다.
+        let (mut app, _task) = RunConfigManager::new();
+        app.window_pos = Point::new(100.0, 100.0);
+        let _ = app.handle_title_bar_touch_drag_start(Point::new(10.0, 10.0));
+        assert!(app.title_bar_touch_drag.is_some());
+
+        app.is_window_maximized = true; // 최대화가 드래그 도중 발생
+        let _ = app.handle_title_bar_touch_drag_move(Point::new(40.0, 10.0));
+        assert!(app.title_bar_touch_drag.is_none());
+        assert_eq!(app.window_pos, Point::new(100.0, 100.0)); // 이동 없음
+    }
+
+    #[test]
+    fn losing_focus_ends_stuck_touch_drag() {
+        // 포커스 상실 시 터치 종료 이벤트가 유실될 수 있으므로 드래그를 끝내,
+        // 이후 WindowMoved가 계속 무시되어 window_pos가 stale해지는 것을 막는다.
+        let (mut app, _task) = RunConfigManager::new();
+        let _ = app.handle_title_bar_touch_drag_start(Point::new(5.0, 5.0));
+        assert!(app.title_bar_touch_drag.is_some());
+
+        let _ = app.dispatch_message(Message::WindowFocusChanged(false));
+        assert!(app.title_bar_touch_drag.is_none());
+
+        // 드래그가 풀렸으니 이후 이동이 정상 반영된다
+        let _ = app.handle_window_moved(Point::new(300.0, 300.0));
+        assert_eq!(app.window_pos, Point::new(300.0, 300.0));
+    }
+
+    #[test]
+    fn window_moved_ignored_while_touch_dragging() {
+        // 드래그 중에는 우리가 낸 move_to가 Moved로 되돌아오므로 기준 위치를
+        // 덮어쓰지 않아야 한다(외부 Moved만 반영).
+        let (mut app, _task) = RunConfigManager::new();
+        app.window_pos = Point::new(100.0, 100.0);
+        let _ = app.handle_title_bar_touch_drag_start(Point::new(5.0, 5.0));
+        let _ = app.handle_window_moved(Point::new(999.0, 999.0));
+        assert_eq!(app.window_pos, Point::new(100.0, 100.0));
+
+        // 드래그가 끝나면 다시 외부 이동을 반영한다
+        app.title_bar_touch_drag = None;
+        let _ = app.handle_window_moved(Point::new(300.0, 300.0));
+        assert_eq!(app.window_pos, Point::new(300.0, 300.0));
     }
 
     #[test]
