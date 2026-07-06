@@ -1,8 +1,8 @@
 use crate::messages::Message;
 use crate::models::{Pane, RunSession, SessionStatusKind};
 use crate::utils::{
-    ICON_ARROW_DOWN_FILL, ICON_ARROW_DOWN_LINE, ICON_CLOSE, ICON_MORE, ICON_PANE_MAXIMIZE,
-    ICON_PANE_RESTORE, ICON_REFRESH, ICON_SAVE, ICON_SEARCH, ICON_STOP,
+    ICON_ARROW_DOWN_FILL, ICON_ARROW_DOWN_LINE, ICON_CLOSE, ICON_ERASER, ICON_MORE,
+    ICON_PANE_MAXIMIZE, ICON_PANE_RESTORE, ICON_REFRESH, ICON_SAVE, ICON_SEARCH, ICON_STOP,
 };
 use crate::views::shared::{
     IconButtonState, icon_button_foreground, icon_button_style, icon_tooltip,
@@ -382,17 +382,26 @@ fn view_session_controls(
         is_dragging,
     );
 
-    // 출력 내보내기 (파일로 저장) — 출력이 있을 때만 활성화 (빈 0바이트 파일 방지)
+    // export(파일 저장)·clear(로그 지우기) 공용 상태 — 출력이 있을 때만 활성화
+    // (export는 빈 0바이트 파일 방지, clear는 빈 버퍼 no-op 방지)
     let has_output = !session.output_lines.is_empty();
-    let export_state = if has_output {
+    let output_action_state = if has_output {
         IconButtonState::Active
     } else {
         IconButtonState::Inactive
     };
     let export_button = control_button(
-        control_icon(svg::Handle::from_memory(ICON_SAVE), export_state),
+        control_icon(svg::Handle::from_memory(ICON_SAVE), output_action_state),
         has_output.then_some(Message::ExportSessionOutput(session_id)),
-        export_state,
+        output_action_state,
+        is_dragging,
+    );
+
+    // 로그 지우기 (실행 중인 프로세스는 유지, 화면 버퍼만 클리어)
+    let clear_button = control_button(
+        control_icon(svg::Handle::from_memory(ICON_ERASER), output_action_state),
+        has_output.then_some(Message::ClearSessionOutput(session_id)),
+        output_action_state,
         is_dragging,
     );
 
@@ -430,6 +439,8 @@ fn view_session_controls(
         search_button,
         Space::new().width(4),
         export_button,
+        Space::new().width(4),
+        clear_button,
     ]
     .align_y(Alignment::Center)
     .spacing(1.0);
@@ -570,15 +581,22 @@ fn view_session_controls_menu(
     );
 
     let has_output = !session.output_lines.is_empty();
-    let export_state = if has_output {
+    let output_action_state = if has_output {
         IconButtonState::Active
     } else {
         IconButtonState::Inactive
     };
     let export = control_button(
-        control_icon(svg::Handle::from_memory(ICON_SAVE), export_state),
+        control_icon(svg::Handle::from_memory(ICON_SAVE), output_action_state),
         has_output.then_some(Message::ExportSessionOutput(session_id)),
-        export_state,
+        output_action_state,
+        false,
+    );
+
+    let clear = control_button(
+        control_icon(svg::Handle::from_memory(ICON_ERASER), output_action_state),
+        has_output.then_some(Message::ClearSessionOutput(session_id)),
+        output_action_state,
         false,
     );
 
@@ -592,6 +610,8 @@ fn view_session_controls_menu(
         search,
         Space::new().width(4),
         export,
+        Space::new().width(4),
+        clear,
     ]
     .align_y(Alignment::Center)
     .spacing(1.0);

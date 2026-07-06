@@ -677,6 +677,7 @@ impl RunConfigManager {
             | Message::CloseActiveSearch
             | Message::SearchNextInActivePane
             | Message::SearchPrevInActivePane
+            | Message::ClearSessionOutput(_)
             | Message::ExportSessionOutput(_)
             | Message::SessionOutputExported(_)
             | Message::ToggleSessionControlsMenu(_)
@@ -888,6 +889,9 @@ impl RunConfigManager {
                 Some(session_id) => self.handle_session_search_step(session_id, -1),
                 None => Task::none(),
             },
+            Message::ClearSessionOutput(session_id) => {
+                self.handle_clear_session_output(session_id)
+            }
             Message::ExportSessionOutput(session_id) => {
                 self.handle_export_session_output(session_id)
             }
@@ -2586,6 +2590,7 @@ impl RunConfigManager {
             | Message::StopSession(id)
             | Message::ToggleAutoScroll(id)
             | Message::OpenSessionSearch(id)
+            | Message::ClearSessionOutput(id)
             | Message::ExportSessionOutput(id) => *id,
             Message::TogglePaneMaximize(pane_id) => {
                 let Some(session_id) = self
@@ -2635,6 +2640,17 @@ impl RunConfigManager {
                 search.current = 0;
             }
             // 정규식 모드 변경은 매치 집합을 바꾸므로 캐시 재계산.
+            session.refresh_search_matches();
+        }
+        Task::none()
+    }
+
+    /// 세션 출력 버퍼를 비운다. 실행 중인 프로세스와 이후 출력에는 영향이 없고, 화면에
+    /// 쌓인 로그만 클리어한다(재현 직전 초기화 등). 검색 매치 캐시의 라인 인덱스가
+    /// stale해지므로 함께 갱신한다 — `handle_rerun_session`의 clear 직후 처리와 동일.
+    fn handle_clear_session_output(&mut self, session_id: Uuid) -> Task<Message> {
+        if let Some(session) = self.session_by_id_mut(session_id) {
+            session.clear_output();
             session.refresh_search_matches();
         }
         Task::none()
@@ -5124,6 +5140,26 @@ mod tests {
             vec![0]
         );
         assert_eq!(search.current, 0);
+    }
+
+    #[test]
+    fn clear_session_output_empties_buffer_and_search_cache() {
+        let (mut app, ids) = manager_with_sessions(&["s"]);
+        let sid = ids[0];
+        {
+            let session = &mut app.sessions[0];
+            session.add_output_line("line 1");
+            session.add_output_line("error here");
+        }
+        let _ = app.handle_open_session_search(sid);
+        let _ = app.handle_session_search_changed(sid, "error".to_string());
+        assert_eq!(app.sessions[0].search.as_ref().unwrap().matches.len(), 1);
+
+        // 로그 지우기: 출력 버퍼와 검색 매치 캐시가 모두 비워져야 한다.
+        let _ = app.handle_clear_session_output(sid);
+
+        assert!(app.sessions[0].output_lines.is_empty());
+        assert!(app.sessions[0].search.as_ref().unwrap().matches.is_empty());
     }
 
     fn manager_with_named_sessions(names: &[&str]) -> RunConfigManager {
