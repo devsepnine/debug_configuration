@@ -889,9 +889,7 @@ impl RunConfigManager {
                 Some(session_id) => self.handle_session_search_step(session_id, -1),
                 None => Task::none(),
             },
-            Message::ClearSessionOutput(session_id) => {
-                self.handle_clear_session_output(session_id)
-            }
+            Message::ClearSessionOutput(session_id) => self.handle_clear_session_output(session_id),
             Message::ExportSessionOutput(session_id) => {
                 self.handle_export_session_output(session_id)
             }
