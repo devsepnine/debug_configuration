@@ -246,6 +246,8 @@ fn apply(target: ApplyTarget, payload: Vec<u8>) -> Result<RelaunchPlan, String> 
 /// `current_exe()` 경로에서 `.app` 번들 루트를 역산한다.
 /// 정확히 `<Bundle>.app/Contents/MacOS/<binary>` 형태일 때만 `Some` — 형태가 다르면
 /// (dev 빌드 등) `None`을 반환해, 상위 디렉터리를 번들로 오인해 rename하는 사고를 막는다.
+/// 프로덕션 호출부는 macOS cfg 블록 안에만 있고, 타 플랫폼에서는 테스트로만 쓰인다.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn bundle_root_from_exe(exe: &Path) -> Option<PathBuf> {
     let macos_dir = exe.parent()?;
     if macos_dir.file_name()? != "MacOS" {
@@ -561,6 +563,8 @@ pub fn cleanup_stale_update_artifacts() {
 /// 건드리지 않으며, 우리가 실제로 만드는 이름 형태(`<현재 번들명>.old-<pid>`,
 /// `.rcm-update-<pid>`)와 **정확히** 일치할 때만 삭제한다 — 부분 문자열 매칭은
 /// 사용자가 만든 무관한 백업 폴더(예: `SomeApp.app.old-2024`)까지 지울 수 있다.
+/// 프로덕션 호출부는 macOS cfg 블록 안에만 있고, 타 플랫폼에서는 테스트로만 쓰인다.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn cleanup_update_artifacts_in(dir: &Path, current: &Path) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
