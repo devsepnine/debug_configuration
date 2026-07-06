@@ -16,6 +16,15 @@ CONTENTS_DIR="${APP_DIR}/Contents"
 MACOS_DIR="${CONTENTS_DIR}/MacOS"
 BINARY_NAME="run_config_manager"
 
+# 번들 식별자는 src/main.rs의 MACOS_BUNDLE_ID를 SSOT로 삼아 파생한다. 알림 귀속에
+# 쓰는 런타임 값과 Info.plist가 어긋나면 macOS가 알림을 잘못된 앱으로 귀속시키므로,
+# APP_VERSION과 동일하게 소스에서 뽑아 이중 관리를 없앤다.
+BUNDLE_ID=$(grep -m1 '^const MACOS_BUNDLE_ID' src/main.rs | sed -E 's/.*"(.*)".*/\1/')
+if [ -z "${BUNDLE_ID}" ]; then
+    echo "ERROR: src/main.rs에서 MACOS_BUNDLE_ID를 추출하지 못했습니다." >&2
+    exit 1
+fi
+
 # Clean previous build
 rm -rf "${APP_DIR}"
 
@@ -44,7 +53,7 @@ cat > "${CONTENTS_DIR}/Info.plist" << EOF
     <key>CFBundleDisplayName</key>
     <string>Run Config Manager</string>
     <key>CFBundleIdentifier</key>
-    <string>dev.runconfigmanager.app</string>
+    <string>${BUNDLE_ID}</string>
     <key>CFBundleVersion</key>
     <string>${APP_VERSION}</string>
     <key>CFBundleShortVersionString</key>
