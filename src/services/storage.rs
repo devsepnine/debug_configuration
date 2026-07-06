@@ -2,7 +2,7 @@ use crate::models::RunConfiguration;
 use crate::utils::DIALOG_CANCELLED;
 use rfd::AsyncFileDialog;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// 앱 설정 (마지막 파일 경로, 사용자 환경설정 등).
 ///
@@ -10,7 +10,8 @@ use std::path::PathBuf;
 /// 파일도 파싱 실패 없이 로드되며 누락분은 기본값으로 채워진다(하위호환).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSettings {
-    /// 마지막으로 사용한 구성 파일 경로
+    /// legacy: 파일 기반 시절의 마지막 작업 파일 경로. 구성 영속성은 앱 저장소로 전환되어,
+    /// 이 값은 저장소 최초 시드(migration) 용도로만 읽는다. 구버전 설정 파일 호환을 위해 유지.
     pub last_file_path: Option<PathBuf>,
     /// Configuration 화면 좌우 분할 비율
     pub configuration_split_ratio: Option<f32>,
@@ -163,15 +164,95 @@ fn serialize_config_file(configurations: Vec<RunConfiguration>) -> Result<String
     serde_json::to_string_pretty(&file).map_err(|e| format!("Serialization error: {e}"))
 }
 
-/// 특정 경로에서 구성 목록 로드
-pub async fn load_from_path(path: PathBuf) -> Result<Vec<RunConfiguration>, String> {
+/// 앱 전용 구성 저장소 경로 (`data_dir/run_config_manager/configs.json`).
+///
+/// import/export 파일과 무관하게 구성이 항상 이 고정 위치에서 로드/저장된다.
+/// `data_dir`을 찾을 수 없으면 `None`으로 fail-closed한다 (CWD 폴백 금지).
+fn configs_store_path() -> Option<PathBuf> {
+    dirs::data_dir().map(|mut path| {
+        path.push("run_config_manager");
+        path.push("configs.json");
+        path
+    })
+}
+
+/// 지정 경로에서 구성을 읽는다. 파일 부재는 빈 목록(`Ok`), 읽기/파싱 실패는 `Err`.
+/// 설정 로드와 달리 파싱 실패를 조용히 삼키지 않고 호출 측이 상태로 표면화하도록 전달한다
+/// (사용자가 "왜 구성이 안 보이나"를 알 수 있어야 하므로).
+fn read_configs_at(path: &Path) -> Result<Vec<RunConfiguration>, String> {
     if !path.exists() {
-        return Err(format!("File not found: {}", path.display()));
+        return Ok(Vec::new());
     }
-
-    let content = std::fs::read_to_string(&path).map_err(|e| format!("File read error: {e}"))?;
-
+    let content = std::fs::read_to_string(path).map_err(|e| format!("File read error: {e}"))?;
     parse_config_file(&content)
+}
+
+/// 원자적 저장용 임시 파일 시퀀스 — 동시 저장 시 temp 경로 충돌을 막는다.
+static STORE_WRITE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 지정 경로에 구성을 버전 envelope으로 쓴다. 상위 디렉터리를 생성한 뒤 임시 파일에 쓰고
+/// rename으로 원자적 교체한다 — 쓰기 도중 크래시/전원차단으로 인한 torn write(잘린 파일)를
+/// 막는다. 저장소가 유일한 진실의 원천이 되었으므로 원자성이 중요하다.
+fn write_configs_at(path: &Path, configs: Vec<RunConfiguration>) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "store path has no parent directory".to_string())?;
+    std::fs::create_dir_all(parent)
+        .map_err(|e| format!("Failed to create store directory: {e}"))?;
+    let json = serialize_config_file(configs)?;
+    let seq = STORE_WRITE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = parent.join(format!(".configs.{}.{}.tmp", std::process::id(), seq));
+    std::fs::write(&tmp, json).map_err(|e| format!("File write error: {e}"))?;
+    std::fs::rename(&tmp, path).map_err(|e| format!("File rename error: {e}"))
+}
+
+/// 저장소가 있으면 로드하고, 없으면 `legacy` 파일에서 1회 마이그레이션(시드) 후 반환한다.
+/// - 저장소 존재: 저장소를 읽는다 (손상 시 `Err` 표면화).
+/// - 저장소 없음 + legacy 유효(비어있지 않음): 저장소에 시드한 뒤 반환.
+/// - 저장소 없음 + legacy 손상: `Err`로 표면화 (조용히 삼키지 않음 — 이동/삭제와 손상을 구분).
+/// - 저장소 없음 + legacy 부재/빈 목록: 빈 목록 (신규 설치).
+///
+/// 경로를 명시로 받아 실제 `data_dir` 없이 종단 테스트할 수 있다.
+fn load_or_migrate_at(
+    store: &Path,
+    legacy: Option<&Path>,
+) -> Result<Vec<RunConfiguration>, String> {
+    if store.exists() {
+        return read_configs_at(store);
+    }
+    if let Some(legacy) = legacy
+        && legacy.exists()
+    {
+        let configs = read_configs_at(legacy)?; // 손상 시 Err로 표면화
+        if !configs.is_empty() {
+            write_configs_at(store, configs.clone())?;
+        }
+        return Ok(configs);
+    }
+    Ok(Vec::new())
+}
+
+/// startup 구성 로드 진입점. 앱 저장소에서 로드하되, 저장소가 없으면 legacy 작업 파일
+/// (`last_file_path`)에서 1회 마이그레이션한다. `data_dir`을 못 찾으면 `Err`로 fail-closed
+/// 한다 (신규 설치로 오인해 조용히 빈 목록을 보이지 않도록 — save_to_store와 대칭).
+///
+/// 모든 파일 I/O가 이 async 본문에서 일어나므로, 반환된 Task를 폴링하지 않는 단위 테스트는
+/// 실제 데이터 디렉터리를 건드리지 않는다.
+pub async fn load_or_migrate_store(
+    legacy: Option<PathBuf>,
+) -> Result<Vec<RunConfiguration>, String> {
+    let store = configs_store_path()
+        .ok_or_else(|| "No data directory available for the configuration store".to_string())?;
+    load_or_migrate_at(&store, legacy.as_deref())
+}
+
+/// 구성 목록을 앱 저장소에 저장한다 (Save). 저장 위치는 항상 고정 저장소이며
+/// 다이얼로그를 띄우지 않는다 (import/export와 분리).
+pub async fn save_to_store(configs: Vec<RunConfiguration>) -> Result<PathBuf, String> {
+    let path = configs_store_path()
+        .ok_or_else(|| "No data directory available for the configuration store".to_string())?;
+    write_configs_at(&path, configs)?;
+    Ok(path)
 }
 
 /// 구성 목록을 버전 envelope으로 직렬화해 `target_path`(없으면 저장 다이얼로그로
@@ -205,18 +286,6 @@ async fn save_configs_to(
     Ok(file_path)
 }
 
-/// 구성 목록을 현재 파일 또는 사용자가 선택한 파일로 저장
-///
-/// # Returns
-/// * `Ok(PathBuf)` - 저장된 파일 경로
-/// * `Err(String)` - 저장 실패 시 에러 메시지
-pub async fn save_configurations(
-    configs: Vec<RunConfiguration>,
-    current_path: Option<PathBuf>,
-) -> Result<PathBuf, String> {
-    save_configs_to(configs, current_path, "configurations.json").await
-}
-
 /// 선택된 구성들을 사용자가 지정한 파일로 내보내기.
 ///
 /// 저장(save)과 달리 현재 파일 경로를 건드리지 않고 항상 저장 다이얼로그를 띄운다.
@@ -231,7 +300,7 @@ pub async fn export_configurations(configs: Vec<RunConfiguration>) -> Result<Pat
 
 /// 임의 텍스트(세션 출력 등)를 사용자가 선택한 파일로 저장.
 ///
-/// off-main 안전성을 위해 `AsyncFileDialog` 사용 (save_configurations 참고).
+/// off-main 안전성을 위해 `AsyncFileDialog` 사용 (`save_configs_to` 참고).
 ///
 /// # Returns
 /// * `Ok(PathBuf)` - 저장된 파일 경로
@@ -258,7 +327,7 @@ pub async fn export_text(content: String, suggested_name: String) -> Result<Path
 /// * `Ok((Vec<RunConfiguration>, PathBuf))` - 파일의 구성 목록과 파일 경로
 /// * `Err(String)` - 취소(`DIALOG_CANCELLED`) 또는 읽기/파싱 실패
 pub async fn import_configurations() -> Result<(Vec<RunConfiguration>, PathBuf), String> {
-    // off-main 안전성을 위해 AsyncFileDialog 사용 (save_configurations 참고).
+    // off-main 안전성을 위해 AsyncFileDialog 사용 (save_configs_to 참고).
     let file_path = AsyncFileDialog::new()
         .add_filter("JSON", &["json"])
         .pick_file()
@@ -377,5 +446,114 @@ mod tests {
         assert_eq!(back.max_output_lines, 12_345);
         assert!(!back.default_auto_scroll);
         assert!(!back.auto_check_updates);
+    }
+
+    // ---- 앱 전용 저장소 (configs) ----
+
+    static STORE_TEST_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+    /// 테스트 격리용 고유 임시 경로 (외부 crate 없이 pid+카운터로 충돌 회피).
+    fn unique_temp_dir(tag: &str) -> PathBuf {
+        let n = STORE_TEST_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        std::env::temp_dir().join(format!("rcm_store_{}_{}_{}", std::process::id(), n, tag))
+    }
+
+    #[test]
+    fn store_write_then_read_round_trips() {
+        let dir = unique_temp_dir("rt");
+        let file = dir.join("configs.json");
+        write_configs_at(&file, sample()).unwrap();
+        let loaded = read_configs_at(&file).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].name, "A");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn store_read_missing_is_empty() {
+        // 저장소 파일이 없으면 빈 목록(신규 설치) — 에러가 아님.
+        let file = unique_temp_dir("missing").join("configs.json");
+        assert!(read_configs_at(&file).unwrap().is_empty());
+    }
+
+    #[test]
+    fn store_read_corrupt_surfaces_error() {
+        // 손상된 저장소는 조용히 빈 목록이 아니라 Err로 표면화된다.
+        let dir = unique_temp_dir("corrupt");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("configs.json");
+        std::fs::write(&file, "{ this is not valid json").unwrap();
+        assert!(read_configs_at(&file).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn migrate_seeds_store_from_legacy_when_store_missing() {
+        let base = unique_temp_dir("mig");
+        let store = base.join("store/configs.json");
+        let legacy = base.join("legacy.json");
+        write_configs_at(&legacy, sample()).unwrap();
+        // 저장소 없음 + legacy 유효 → 반환 + 저장소 시드
+        let loaded = load_or_migrate_at(&store, Some(&legacy)).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert!(store.exists());
+        assert_eq!(read_configs_at(&store).unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn migrate_prefers_existing_store_over_legacy() {
+        // 저장소가 있으면 legacy를 무시하고 저장소를 읽는다 (덮어쓰지 않음).
+        let base = unique_temp_dir("mig_store");
+        let store = base.join("store/configs.json");
+        let legacy = base.join("legacy.json");
+        write_configs_at(&store, Vec::new()).unwrap(); // 저장소는 비어 있음
+        write_configs_at(&legacy, sample()).unwrap(); // legacy엔 1개
+        let loaded = load_or_migrate_at(&store, Some(&legacy)).unwrap();
+        assert!(loaded.is_empty()); // 저장소(빈 것)를 따른다
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn migrate_surfaces_corrupt_legacy_as_error() {
+        // 저장소 없음 + legacy 손상 → 조용히 빈 목록이 아니라 Err (이동/삭제와 손상을 구분).
+        let base = unique_temp_dir("mig_corrupt");
+        std::fs::create_dir_all(&base).unwrap();
+        let store = base.join("store/configs.json");
+        let legacy = base.join("legacy.json");
+        std::fs::write(&legacy, "{ not valid json").unwrap();
+        assert!(load_or_migrate_at(&store, Some(&legacy)).is_err());
+        assert!(!store.exists()); // 손상 시 저장소를 만들지 않는다
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn migrate_empty_when_no_store_and_no_or_empty_legacy() {
+        let base = unique_temp_dir("mig_fresh");
+        let store = base.join("store/configs.json");
+        // legacy 없음 → 빈 목록, 저장소 미생성 (신규 설치)
+        assert!(load_or_migrate_at(&store, None).unwrap().is_empty());
+        assert!(!store.exists());
+        // legacy가 빈 목록 → 빈 목록, 저장소 미생성
+        let legacy = base.join("legacy.json");
+        write_configs_at(&legacy, Vec::new()).unwrap();
+        assert!(
+            load_or_migrate_at(&store, Some(&legacy))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(!store.exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn migrate_surfaces_corrupt_store_as_error() {
+        // 저장소 자체가 손상이면 Err로 표면화 (조용히 빈 목록이 아님).
+        let base = unique_temp_dir("mig_store_corrupt");
+        std::fs::create_dir_all(&base).unwrap();
+        let store = base.join("configs.json");
+        std::fs::write(&store, "{ not valid json").unwrap();
+        assert!(load_or_migrate_at(&store, None).is_err());
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

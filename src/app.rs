@@ -5,8 +5,8 @@ use crate::models::{
     SessionStatusKind, WorkspaceTab,
 };
 use crate::services::{
-    AppSettings, UpdateOutcome, check_latest_release, export_text, load_from_path, load_settings,
-    register_running_pid, run_configuration_stream, save_configurations, save_settings,
+    AppSettings, UpdateOutcome, check_latest_release, export_text, load_or_migrate_store,
+    load_settings, register_running_pid, run_configuration_stream, save_settings, save_to_store,
     unregister_running_pid,
 };
 use crate::utils::{DIALOG_CANCELLED, ICON_DELETE, ICON_PLAY, ICON_REFRESH, ICON_STOP};
@@ -413,8 +413,13 @@ pub struct RunConfigManager {
     title_bar_touch_drag: Option<TouchDragState>,
     /// 윈도우 포커스 여부 (백그라운드에서 실행이 끝났을 때만 알림)
     is_window_focused: bool,
-    /// 마지막으로 사용한 구성 파일 경로 (Open/Save)
+    /// legacy: 파일 기반 시절의 마지막 작업 파일 경로. 구성 영속성은 앱 저장소
+    /// (`data_dir/run_config_manager/configs.json`)로 전환되어, 이 값은 startup 시
+    /// 저장소 최초 시드(migration) 용도로만 읽는다.
     last_file_path: Option<PathBuf>,
+    /// 초기 구성 로드(`ConfigurationsLoaded`)가 처리되었는지 여부. 로드가 끝나기 전에는
+    /// Save를 막아, 빈/부실 목록이 저장소를 덮어써 데이터를 잃는 것을 방지한다.
+    configs_ready: bool,
     /// 사용 가능한 새 버전 `(latest, release_url)`. 없으면 `None`.
     /// 상태바의 업데이트 링크 표시에 사용한다.
     update_available: Option<(String, String)>,
@@ -434,7 +439,7 @@ impl RunConfigManager {
     ///
     /// # Returns
     /// (애플리케이션 인스턴스, 초기 Task)
-    /// 마지막으로 사용한 파일이 있으면 자동으로 로드
+    /// 구성은 앱 저장소에서 로드하며, 저장소가 없으면 legacy 작업 파일에서 1회 마이그레이션한다.
     pub fn new() -> (Self, Task<Message>) {
         // 앱 설정에서 마지막 파일 경로 확인
         let settings = load_settings();
@@ -489,6 +494,7 @@ impl RunConfigManager {
             title_bar_touch_drag: None,
             is_window_focused: true,
             last_file_path: last_file_path.clone(),
+            configs_ready: false,
             update_available: None,
             // 설정이 켜진 경우에만 아래에서 자동 체크 Task를 큐잉하므로 그에 맞춰 스피너 시작.
             is_checking_update: auto_check_updates,
@@ -510,15 +516,13 @@ impl RunConfigManager {
             Message::JdksDetected,
         ));
 
-        // 2. 마지막 파일이 있으면 자동 로드
-        if let Some(path) = last_file_path
-            && path.exists()
-        {
-            tasks.push(Task::perform(
-                load_from_path(path),
-                Message::ConfigurationsLoaded,
-            ));
-        }
+        // 2. 앱 저장소에서 구성 로드 (저장소가 없으면 legacy 작업 파일에서 1회 마이그레이션).
+        //    모든 파일 I/O가 이 Task 안에서 일어나므로, Task를 폴링하지 않는 단위 테스트는
+        //    실제 데이터 디렉터리를 건드리지 않는다. 손상은 ConfigurationsLoaded(Err)로 표면화.
+        tasks.push(Task::perform(
+            load_or_migrate_store(last_file_path),
+            Message::ConfigurationsLoaded,
+        ));
 
         // 3. 최신 버전 확인 (설정이 켜진 경우만; 백그라운드, 실패는 비치명적)
         if auto_check_updates {
@@ -2245,6 +2249,8 @@ impl RunConfigManager {
         &mut self,
         result: Result<Vec<RunConfiguration>, String>,
     ) -> Task<Message> {
+        // 로드가 (성공/실패 무관하게) 끝났음을 표시 — 이 시점부터 Save가 허용된다.
+        self.configs_ready = true;
         match result {
             Ok(configs) => {
                 self.configurations = configs;
@@ -2257,11 +2263,8 @@ impl RunConfigManager {
                 self.export_modal = None;
                 // 가져오기 모달도 닫는다 — 병합 대상이 사용자가 봤던 목록과 달라지므로.
                 self.import_modal = None;
-                self.status_message = if let Some(path) = &self.last_file_path {
-                    format!("Loaded: {}", path.display())
-                } else {
-                    String::from("Configurations loaded")
-                };
+                self.status_message =
+                    format!("Loaded {} configuration(s)", self.configurations.len());
 
                 if !self.configurations.is_empty() {
                     self.selected_config_index = Some(0);
@@ -2278,20 +2281,21 @@ impl RunConfigManager {
     }
 
     fn handle_save_configurations(&mut self) -> Task<Message> {
+        // 초기 로드가 끝나기 전(또는 로드 실패로 빈 상태일 때) Save를 허용하면 빈/부실
+        // 목록이 저장소를 덮어써 데이터를 잃을 수 있다. 로드 완료 전에는 저장을 막는다.
+        if !self.configs_ready {
+            self.status_message =
+                String::from("Still loading configurations; please wait before saving");
+            return Task::none();
+        }
         let configs = self.configurations.clone();
-        let current_path = self.last_file_path.clone();
         self.status_message = String::from("Saving configurations...");
-        Task::perform(
-            save_configurations(configs, current_path),
-            Message::ConfigurationsSaved,
-        )
+        Task::perform(save_to_store(configs), Message::ConfigurationsSaved)
     }
 
     fn handle_configurations_saved(&mut self, result: Result<PathBuf, String>) -> Task<Message> {
         match result {
             Ok(path) => {
-                self.last_file_path = Some(path.clone());
-                self.save_app_settings();
                 self.status_message = format!("Saved: {}", path.display());
             }
             Err(error) => {
@@ -4546,6 +4550,26 @@ mod tests {
 
     fn names(app: &RunConfigManager) -> Vec<String> {
         app.configurations.iter().map(|c| c.name.clone()).collect()
+    }
+
+    #[test]
+    fn save_is_blocked_until_initial_load_completes() {
+        // 초기 로드 전에는 Save가 no-op이어야 한다 (빈 목록이 저장소를 덮어쓰는 것 방지).
+        // new()의 로드 Task는 테스트에서 폴링되지 않으므로 configs_ready=false로 시작한다.
+        let (mut app, _task) = RunConfigManager::new();
+        assert!(!app.configs_ready);
+        let _ = app.handle_save_configurations();
+        assert!(
+            app.status_message.contains("loading"),
+            "expected a still-loading message, got: {}",
+            app.status_message
+        );
+
+        // 로드가 (성공/실패 무관하게) 처리되면 ready가 되어 Save가 열린다.
+        let _ = app.handle_configurations_loaded(Err(String::from("boom")));
+        assert!(app.configs_ready);
+        let _ = app.handle_save_configurations();
+        assert!(app.status_message.contains("Saving"));
     }
 
     #[test]
