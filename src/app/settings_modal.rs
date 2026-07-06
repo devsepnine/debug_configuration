@@ -53,8 +53,9 @@ impl RunConfigManager {
         self.auto_check_updates = modal.auto_check_updates;
         self.save_app_settings();
         // 업데이트 자동 확인을 새로 켜면 다음 시작까지 기다리지 않고 즉시 1회 확인한다
-        // (시작 시 자동 체크와 동일 경로). 이미 확인 중이면 중복 발행하지 않는다.
-        if updates_newly_enabled && !self.is_checking_update {
+        // (시작 시 자동 체크와 동일 경로). 이미 확인 중이거나 인앱 업데이트 설치가
+        // 진행 중이면 중복 발행하지 않는다 (진행 상태 메시지를 덮어쓰는 것 방지).
+        if updates_newly_enabled && !self.is_checking_update && !self.is_updating {
             self.is_checking_update = true;
             return Task::perform(check_latest_release(), Message::UpdateCheckCompleted);
         }

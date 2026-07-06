@@ -18,7 +18,13 @@ open = "5.3"
 ctrlc = { version = "3.5", features = ["termination"] }
 rfd = "0.17"
 notify-rust = "4.18.0"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+# 인앱 자기 업데이트: 다운로드 무결성(sha2) + 서명 검증(minisign-verify) + 자산 추출(flate2/tar).
+# 전부 순수 Rust — 시스템 의존성/크로스컴파일 부담 없음 (rustls 정책과 일관).
+sha2 = "0.10"
+flate2 = "1"
+tar = "0.4"
+minisign-verify = "0.2"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

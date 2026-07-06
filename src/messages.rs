@@ -350,6 +350,10 @@ pub enum Message {
     UpdateCheckCompleted(Result<crate::services::UpdateOutcome, String>),
     /// 확인 중 로딩 스피너 프레임 진행 (타이머 tick)
     UpdateSpinnerTick,
+    /// 인앱 업데이트 설치 시작 (상태바 업데이트 버튼 클릭)
+    InstallUpdate,
+    /// 인앱 업데이트 다운로드·검증·적용 완료 (성공 시 재실행 계획 포함)
+    UpdateInstallCompleted(Result<crate::services::RelaunchPlan, String>),
 
     // 윈도우 chrome 제어
     /// 메인 윈도우가 열림

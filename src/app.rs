@@ -287,6 +287,33 @@ fn notify_update_available(latest: &str, url: &str) {
     });
 }
 
+/// 인앱 업데이트 적용 후 재실행 계획을 실행한다. spawn 성공 여부만 확인하며,
+/// 프로세스 종료는 호출 측(`handle_update_install_completed`)이 담당한다.
+/// - macOS: 새 번들을 `open -n`으로 실행 (이미 제자리에 설치된 상태)
+/// - Windows: 검증된 MSI를 `msiexec /i`(full UI)로 실행 — 설치·재실행은 설치관리자가 담당
+/// - Linux: 교체된 바이너리를 그대로 재실행
+fn execute_relaunch(plan: &crate::services::RelaunchPlan) -> Result<(), String> {
+    use crate::services::RelaunchPlan;
+    match plan {
+        RelaunchPlan::MacOs { app_path } => std::process::Command::new("open")
+            .arg("-n")
+            .arg(app_path)
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| format!("failed to launch updated app: {e}")),
+        RelaunchPlan::Windows { msi_path } => std::process::Command::new("msiexec")
+            .arg("/i")
+            .arg(msi_path)
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| format!("failed to launch installer: {e}")),
+        RelaunchPlan::Linux { exe_path } => std::process::Command::new(exe_path)
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| format!("failed to relaunch: {e}")),
+    }
+}
+
 /// Node 구성에서 (`config_id`, `project_directory`, `working_directory`)를 추출.
 /// Node 타입이 아니거나 `project_directory`가 비어 있으면 `None`.
 fn node_paths(config: &RunConfiguration) -> Option<(Uuid, String, String)> {
@@ -420,14 +447,30 @@ pub struct RunConfigManager {
     /// 초기 구성 로드(`ConfigurationsLoaded`)가 처리되었는지 여부. 로드가 끝나기 전에는
     /// Save를 막아, 빈/부실 목록이 저장소를 덮어써 데이터를 잃는 것을 방지한다.
     configs_ready: bool,
-    /// 사용 가능한 새 버전 `(latest, release_url)`. 없으면 `None`.
-    /// 상태바의 업데이트 링크 표시에 사용한다.
-    update_available: Option<(String, String)>,
+    /// 사용 가능한 새 버전 정보. 없으면 `None`. 상태바 업데이트 버튼 표시에 사용한다.
+    update_available: Option<AvailableUpdate>,
     /// 업데이트 확인이 진행 중인지. 상태바에 로딩 스피너를 표시하고
     /// 스피너 타이머 subscription을 활성화하는 데 쓴다.
     is_checking_update: bool,
+    /// 인앱 업데이트(다운로드·검증·적용)가 진행 중인지. 중복 시작을 막고
+    /// 상태바 버튼을 비활성 표시한다.
+    is_updating: bool,
+    /// 인앱 업데이트가 실패했는지. 실패 후 상태바 버튼은 릴리스 페이지 열기로
+    /// 폴백해 사용자가 수동으로 내려받을 수 있게 한다.
+    update_install_failed: bool,
     /// 로딩 스피너 프레임 인덱스 (확인 중 타이머 tick마다 증가).
     update_spinner_frame: usize,
+}
+
+/// 상태바에 표시할 사용 가능한 업데이트.
+#[derive(Debug, Clone)]
+struct AvailableUpdate {
+    /// 새 버전 (v 접두사 없는 정규화 형태).
+    latest: String,
+    /// 릴리스 페이지 URL (인앱 설치 불가/실패 시 폴백 진입점).
+    url: String,
+    /// 인앱 설치용 다운로드 정보. 구 릴리스처럼 자산이 없으면 `None`.
+    download: Option<crate::services::UpdateDownload>,
 }
 
 /// 상태바 업데이트 확인 로딩 스피너 프레임. D2Coding(모노스페이스)에서 항상
@@ -498,6 +541,8 @@ impl RunConfigManager {
             update_available: None,
             // 설정이 켜진 경우에만 아래에서 자동 체크 Task를 큐잉하므로 그에 맞춰 스피너 시작.
             is_checking_update: auto_check_updates,
+            is_updating: false,
+            update_install_failed: false,
             update_spinner_frame: 0,
         };
 
@@ -531,6 +576,15 @@ impl RunConfigManager {
                 Message::UpdateCheckCompleted,
             ));
         }
+
+        // 4. 이전 인앱 업데이트가 남긴 잔여물(.app.old-* 백업, 스테이징) 정리.
+        //    파일 I/O이므로 Task 안에서 수행한다 (결과 통지는 불필요 — discard).
+        tasks.push(
+            Task::future(async {
+                crate::services::cleanup_stale_update_artifacts();
+            })
+            .discard(),
+        );
 
         (app, Task::batch(tasks))
     }
@@ -687,7 +741,9 @@ impl RunConfigManager {
             | Message::ToggleSessionControlsMenu(_)
             | Message::CheckForUpdates
             | Message::UpdateCheckCompleted(_)
-            | Message::UpdateSpinnerTick => self.handle_session_messages(message),
+            | Message::UpdateSpinnerTick
+            | Message::InstallUpdate
+            | Message::UpdateInstallCompleted(_) => self.handle_session_messages(message),
             Message::AddWorkspaceTab
             | Message::JumpToWorkspace(_)
             | Message::CloseTab(_)
@@ -856,6 +912,8 @@ impl RunConfigManager {
             Message::CheckForUpdates => self.handle_check_for_updates(),
             Message::UpdateCheckCompleted(result) => self.handle_update_check_completed(result),
             Message::UpdateSpinnerTick => self.handle_update_spinner_tick(),
+            Message::InstallUpdate => self.handle_install_update(),
+            Message::UpdateInstallCompleted(result) => self.handle_update_install_completed(result),
             Message::SessionScrollChanged(session_id, progress, at_bottom) => {
                 self.handle_session_scroll_changed(session_id, progress, at_bottom)
             }
@@ -1316,6 +1374,12 @@ impl RunConfigManager {
     }
 
     fn handle_run_configuration(&mut self, index_opt: Option<usize>) -> Task<Message> {
+        // 인앱 업데이트 진행 중에는 새 실행을 막는다 — 설치 성공 시 앱이 재시작되므로
+        // 그 사이 시작된 세션이 경고 없이 종료되는 것을 방지한다 (InstallUpdate 가드의 짝).
+        if self.is_updating {
+            self.status_message = String::from("Update in progress — wait before running");
+            return Task::none();
+        }
         let index = index_opt.or(self.selected_config_index);
 
         if let Some(idx) = index
@@ -2486,10 +2550,21 @@ impl RunConfigManager {
     ) -> Task<Message> {
         self.is_checking_update = false;
         match result {
-            Ok(UpdateOutcome::Available { latest, url, .. }) => {
+            Ok(UpdateOutcome::Available {
+                latest,
+                url,
+                download,
+                ..
+            }) => {
                 self.status_message = format!("Update available: v{latest}");
-                self.update_available = Some((latest.clone(), url.clone()));
                 notify_update_available(&latest, &url);
+                self.update_available = Some(AvailableUpdate {
+                    latest,
+                    url,
+                    download,
+                });
+                // 새 업데이트를 발견하면 이전 설치 실패 상태는 리셋한다.
+                self.update_install_failed = false;
             }
             Ok(UpdateOutcome::UpToDate { current }) => {
                 self.status_message = format!("You're on the latest version (v{current})");
@@ -2497,6 +2572,102 @@ impl RunConfigManager {
             }
             Err(error) => {
                 self.status_message = format!("Update check failed: {error}");
+            }
+        }
+        Task::none()
+    }
+
+    /// 인앱 업데이트 시작 (상태바 업데이트 버튼 클릭).
+    /// 다운로드 정보가 없거나(구 릴리스) 이전 설치가 실패했으면 릴리스 페이지로 폴백한다.
+    fn handle_install_update(&mut self) -> Task<Message> {
+        if self.is_updating {
+            return Task::none();
+        }
+        let Some(update) = &self.update_available else {
+            return Task::none();
+        };
+        // 인앱 설치 불가/실패 → 브라우저 폴백 (기존 수동 설치 경로).
+        if update.download.is_none() || self.update_install_failed {
+            let url = update.url.clone();
+            return self.handle_open_url(&url);
+        }
+        // 실행 중인 세션이 있으면 거부 — 업데이트 재시작이 자식 프로세스를 조용히
+        // 죽이는 것을 막는다 (사용자가 직접 정리한 뒤 다시 시도).
+        if self.sessions.iter().any(|session| session.is_running) {
+            self.status_message = String::from("Stop running sessions before updating");
+            return Task::none();
+        }
+        let download = update
+            .download
+            .clone()
+            .expect("checked download.is_some() above");
+        self.is_updating = true;
+        self.status_message = String::from("Downloading and verifying update…");
+        Task::perform(
+            crate::services::download_and_apply(download),
+            Message::UpdateInstallCompleted,
+        )
+    }
+
+    /// 인앱 업데이트 적용 결과 처리. 성공 시 새 버전을 실행하고 이 프로세스를 종료한다.
+    /// 실패하면 상태만 남기고 릴리스 페이지 폴백으로 전환한다 (기존 설치는 무손상).
+    fn handle_update_install_completed(
+        &mut self,
+        result: Result<crate::services::RelaunchPlan, String>,
+    ) -> Task<Message> {
+        use crate::services::RelaunchPlan;
+        self.is_updating = false;
+        match result {
+            Ok(plan) => {
+                // 방어 재검사: 다운로드가 도는 동안 세션이 시작됐다면(가드 우회 경로 대비)
+                // kill+exit로 조용히 죽이지 않는다. macOS/Linux는 새 버전이 이미 제자리에
+                // 설치된 상태이므로 재클릭 유도 대신 수동 재시작을 안내하고, Windows는
+                // 아직 미설치라 재시도(재다운로드)가 안전하므로 버튼을 유지한다.
+                if self.sessions.iter().any(|session| session.is_running) {
+                    self.status_message = match &plan {
+                        RelaunchPlan::Windows { msi_path } => format!(
+                            "Update downloaded — stop sessions, then run the installer: {}",
+                            msi_path.display()
+                        ),
+                        RelaunchPlan::MacOs { .. } | RelaunchPlan::Linux { .. } => {
+                            self.update_available = None;
+                            String::from(
+                                "Update installed — stop sessions and restart the app to finish",
+                            )
+                        }
+                    };
+                    return Task::none();
+                }
+                match execute_relaunch(&plan) {
+                    Ok(()) => {
+                        // 시그널 핸들러(main.rs)와 동일한 종료 경로: 자식 정리 후 즉시 종료.
+                        // 위 가드로 실행 중 세션은 없지만, 방어적으로 정리한다.
+                        crate::services::kill_all_running_processes();
+                        std::process::exit(0);
+                    }
+                    Err(error) => {
+                        // 재실행만 실패한 상태. macOS/Linux는 새 버전이 이미 설치돼 있어
+                        // 재클릭 시 혼란스러운 에러(개명된 .old 번들에서 resolve 실패)만
+                        // 나므로 버튼을 내리고 수동 재시작을 안내한다. Windows는 설치가
+                        // 시작되지 않았으므로 MSI 위치를 안내하고 재시도를 허용한다.
+                        self.status_message = match &plan {
+                            RelaunchPlan::Windows { msi_path } => format!(
+                                "Relaunch failed ({error}); run the installer manually: {}",
+                                msi_path.display()
+                            ),
+                            RelaunchPlan::MacOs { .. } | RelaunchPlan::Linux { .. } => {
+                                self.update_available = None;
+                                format!(
+                                    "Update installed, but relaunch failed ({error}) — restart the app manually"
+                                )
+                            }
+                        };
+                    }
+                }
+            }
+            Err(error) => {
+                self.status_message = format!("Update failed: {error}");
+                self.update_install_failed = true;
             }
         }
         Task::none()
@@ -3455,10 +3626,21 @@ impl RunConfigManager {
                 .into();
         }
 
+        // 인앱 업데이트 진행 중에는 버튼을 비활성(on_press 없음)으로 표시해
+        // 중복 클릭을 view 단계에서도 차단한다 (핸들러 가드와 이중 방어).
+        if self.is_updating {
+            return button(text("updating…").size(12))
+                .padding([1, 6])
+                .style(move |theme: &Theme, status| status_bar_version_style(theme, status, true))
+                .into();
+        }
+
         let (label, on_press) = match &self.update_available {
-            Some((latest, url)) => (
-                format!("v{current} → v{latest} ⬆"),
-                Message::OpenUrl(url.clone()),
+            // 인앱 설치 가능(자산+서명 존재, 미실패) → 클릭 시 다운로드·설치.
+            // 불가/실패 시에도 InstallUpdate가 릴리스 페이지 열기로 폴백한다.
+            Some(update) => (
+                format!("v{current} → v{latest} ⬆", latest = update.latest),
+                Message::InstallUpdate,
             ),
             None => (format!("v{current}"), Message::CheckForUpdates),
         };
