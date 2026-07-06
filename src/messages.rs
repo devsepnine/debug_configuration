@@ -321,6 +321,8 @@ pub enum Message {
     SearchNextInActivePane,
     /// 활성 pane 검색의 이전 매치로 이동 (Shift+Enter — 대상 세션은 핸들러가 해석)
     SearchPrevInActivePane,
+    /// 세션 출력 버퍼 비우기 (`session_id`) — 실행 중인 프로세스는 유지, 화면 로그만 클리어
+    ClearSessionOutput(Uuid),
     /// 세션 출력을 파일로 내보내기 (`session_id`)
     ExportSessionOutput(Uuid),
     /// 출력 내보내기 완료 (저장 경로 또는 에러/취소)

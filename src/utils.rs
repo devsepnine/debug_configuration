@@ -111,6 +111,7 @@ pub const ICON_PANE_MAXIMIZE: &[u8] = include_bytes!("../assets/app--pane-maximi
 pub const ICON_PANE_RESTORE: &[u8] = include_bytes!("../assets/app--pane-restore.svg");
 pub const ICON_SEARCH: &[u8] = include_bytes!("../assets/app--search.svg");
 pub const ICON_MORE: &[u8] = include_bytes!("../assets/app--more.svg");
+pub const ICON_ERASER: &[u8] = include_bytes!("../assets/mingcute--eraser-line.svg");
 
 // ============================================================================
 // Node package manager utility functions
