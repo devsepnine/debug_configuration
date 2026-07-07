@@ -134,6 +134,8 @@ struct ScrollState {
     /// 판정할 때, 세션 전환/재시작으로 line_id가 우연히 겹치는 경우를 배제하는 판별자.
     /// 불일치면 증분을 시도하지 않고 전체 재빌드한다.
     cached_session_id: Option<Uuid>,
+    /// 마지막으로 앱에 통지한 PTY 뷰포트 (cols, rows). 변경 프레임에서만 publish.
+    last_reported_viewport: Option<(u16, u16)>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -671,7 +673,27 @@ impl<'a> canvas::Program<Message> for TerminalCanvas<'a> {
             if let Some(action) = self.apply_scroll_target(state, metrics) {
                 return Some(action);
             }
-            return self.apply_auto_scroll(state, metrics);
+            if let Some(action) = self.apply_auto_scroll(state, metrics) {
+                return Some(action);
+            }
+            // PTY 뷰포트 통지: 스크롤 액션이 없는 조용한 프레임에서, 크기가 실제로
+            // 바뀌었을 때만 publish한다 (한 update는 한 액션만 반환 가능 — 점프/재고정을
+            // 선점하면 그 프레임의 스크롤 동작이 밀린다. 리사이즈는 드물고 프레임은
+            // 연속이라 다음 조용한 프레임에 즉시 수렴한다). cols는 wrap 계산과 동일한
+            // max_chars, rows는 보이는 행 수. 최소값 clamp는 병적인 소형 pane 방어.
+            let viewport = (
+                u16::try_from(max_chars).unwrap_or(u16::MAX).max(20),
+                (Self::calculate_visible_lines(bounds.height).max(0.0) as u16).max(5),
+            );
+            if state.last_reported_viewport != Some(viewport) {
+                state.last_reported_viewport = Some(viewport);
+                return Some(canvas::Action::publish(Message::SessionViewportResized(
+                    self.session_id,
+                    viewport.0,
+                    viewport.1,
+                )));
+            }
+            return None;
         }
 
         match event {
@@ -2131,6 +2153,27 @@ mod tests {
         let (lines, _, target_row) = prepare_lines(&session);
         assert_eq!(lines.len(), 2, "filter must show only matched lines");
         assert_eq!(target_row, Some(1));
+    }
+
+    #[test]
+    fn viewport_publishes_once_per_change_on_quiet_frames() {
+        // 조용한(스크롤 액션 없는) redraw 프레임: 첫 관측에 1회 publish(action 발생 +
+        // last_reported 기록), 이후 동일 크기면 침묵 — 매 프레임 메시지 낭비 방지.
+        // (canvas::Action 내부는 불투명 — 발생 여부 + 상태 부수효과로 검증한다.)
+        let (canvas, id) = canvas_with_lines(3, false);
+        let mut state = ready_state(id);
+        let redraw = Event::Window(window::Event::RedrawRequested(std::time::Instant::now()));
+
+        let first = canvas.update(&mut state, &redraw, test_bounds(), cursor_inside());
+        assert!(first.is_some(), "첫 조용한 프레임에 뷰포트 publish");
+        let recorded = state
+            .last_reported_viewport
+            .expect("viewport must be recorded");
+        assert!(recorded.0 >= 20 && recorded.1 >= 5, "clamp 하한 보장");
+
+        let second = canvas.update(&mut state, &redraw, test_bounds(), cursor_inside());
+        assert!(second.is_none(), "크기 불변이면 재발행 없음");
+        assert_eq!(state.last_reported_viewport, Some(recorded));
     }
 
     #[test]

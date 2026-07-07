@@ -177,6 +177,9 @@ pub struct RunSession {
     /// stdin 입력바 드래프트. `Some`이면 바가 열려 있음 (`search`와 동일 컨벤션).
     /// 프로세스 종료/rerun에도 생존한다 — 타이핑 중이던 내용을 잃지 않기 위함.
     pub stdin_input: Option<String>,
+    /// 마지막으로 관측된 터미널 뷰포트 (cols, rows). rerun의 초기 PTY 크기와
+    /// `ProcessStarted` 직후 재푸시에 쓴다 (신규 pane은 첫 프레임 publish가 채움).
+    pub pty_viewport: Option<(u16, u16)>,
     /// 컨트롤 오버플로 메뉴(⋯) 열림 여부. pane이 좁아 전체 컨트롤 버튼이 들어가지
     /// 않을 때 `⋯` 버튼으로 펼치는 세로 액션 메뉴의 토글 상태(터미널 위에 표시).
     pub controls_menu_open: bool,
@@ -228,6 +231,7 @@ impl RunSession {
             search: None,
             scroll_target: None,
             stdin_input: None,
+            pty_viewport: None,
             controls_menu_open: false,
             max_output_lines: DEFAULT_MAX_OUTPUT_LINES,
         }

@@ -236,6 +236,8 @@ pub enum Message {
     OutputReceived(Uuid, Vec<crate::models::OutputEvent>),
     /// 프로세스 실행 완료 (세션 ID, 종료 코드 또는 에러 메시지)
     RunCompleted(Uuid, Result<i32, String>),
+    /// 터미널 뷰포트 크기 변경 (세션 ID, cols, rows) — PTY resize로 전달 (변경 시에만 발행)
+    SessionViewportResized(Uuid, u16, u16),
 
     // 세션 관리 메시지 (세션은 안정적인 `Uuid`로 식별 — stale 인덱스 방지)
     /// 세션 재실행 (`session_id`)

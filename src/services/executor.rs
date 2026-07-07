@@ -128,8 +128,6 @@ fn unregister_session_io(session_id: Uuid) {
 }
 
 /// 세션 PTY의 화면 크기를 갱신한다. pipe 세션/미등록 세션은 no-op.
-// TODO(v0.5.0 슬라이스5): 뷰포트 배선에서 호출 — 그 전까지 임시 allow.
-#[allow(dead_code)]
 pub fn resize_session_pty(session_id: Uuid, cols: u16, rows: u16) {
     if let Ok(map) = SESSION_IO.lock()
         && let Some(io) = map.get(&session_id)
@@ -294,10 +292,14 @@ pub fn run_configuration_stream(
     session_id: Uuid,
     cancel_flag: Arc<AtomicBool>,
     show_env: bool,
+    initial_viewport: Option<(u16, u16)>,
 ) -> impl iced::futures::Stream<Item = Message> {
     stream::channel(
         100,
         move |mut output: iced::futures::channel::mpsc::Sender<Message>| async move {
+            // pipe 전용 플랫폼(Windows)에서는 초기 뷰포트를 쓸 곳이 없다 (PTY 전용).
+            #[cfg(not(unix))]
+            let _ = initial_viewport;
             // 종료 보장 가드: 정상 경로의 끝에서 disarm한다.
             let mut completion = CompletionGuard::new(output.clone(), session_id);
 
@@ -317,7 +319,10 @@ pub fn run_configuration_stream(
             // 폴백 없이 그대로 보고한다. Windows는 pipe 경로 고정(ConPTY는 후속).
             #[cfg(unix)]
             {
-                match spawn_in_pty(&config, &command_str, &extra_env, session_id, (120, 40)) {
+                // 초기 크기: 마지막 관측 뷰포트(rerun/재사용 pane) 또는 기본 120×40.
+                // 신규 pane은 첫 프레임의 SessionViewportResized가 실측값으로 보정한다.
+                let viewport = initial_viewport.unwrap_or((120, 40));
+                match spawn_in_pty(&config, &command_str, &extra_env, session_id, viewport) {
                     Ok(pty) => {
                         handle_pty_process(&mut output, session_id, pty, cancel_flag).await;
                         completion.disarm();

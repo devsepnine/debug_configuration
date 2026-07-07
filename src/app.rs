@@ -729,6 +729,7 @@ impl RunConfigManager {
             Message::ProcessStarted(_, _)
             | Message::OutputReceived(_, _)
             | Message::RunCompleted(_, _)
+            | Message::SessionViewportResized(_, _, _)
             | Message::RerunSession(_)
             | Message::StopSession(_)
             | Message::RemoveSession(_)
@@ -925,6 +926,9 @@ impl RunConfigManager {
             }
             Message::RunCompleted(session_id, result) => {
                 self.handle_run_completed(session_id, result)
+            }
+            Message::SessionViewportResized(session_id, cols, rows) => {
+                self.handle_session_viewport_resized(session_id, cols, rows)
             }
             Message::RerunSession(session_id) => self.handle_rerun_session(session_id),
             Message::StopSession(session_id) => self.handle_stop_session(session_id),
@@ -1482,6 +1486,8 @@ impl RunConfigManager {
                     session_id,
                     cancel_flag,
                     self.show_environment_on_run,
+                    // 신규 세션 — 첫 프레임의 SessionViewportResized가 실측값을 채운다.
+                    None,
                 ),
                 |msg| msg,
             );
@@ -1550,6 +1556,7 @@ impl RunConfigManager {
                     session_id,
                     cancel_flag,
                     self.show_environment_on_run,
+                    None,
                 ),
                 |msg| msg,
             ));
@@ -2504,8 +2511,30 @@ impl RunConfigManager {
             register_running_pid(pid);
             session.process_pid = Some(pid);
             eprintln!("[Process] Started {} (PID: {})", session.config_name, pid);
+            // rerun/재사용 pane: 관측된 뷰포트를 스폰 직후 재푸시해 초기 크기를 실측값으로
+            // 맞춘다 (신규 pane은 아직 None — 첫 프레임 publish가 담당).
+            if let Some((cols, rows)) = session.pty_viewport {
+                crate::services::resize_session_pty(session_id, cols, rows);
+            }
         }
 
+        Task::none()
+    }
+
+    /// 터미널 뷰포트 변경 통지 → 세션에 기록하고 PTY에 전달 (pipe 세션은 no-op).
+    fn handle_session_viewport_resized(
+        &mut self,
+        session_id: Uuid,
+        cols: u16,
+        rows: u16,
+    ) -> Task<Message> {
+        if let Some(session) = self.session_by_id_mut(session_id) {
+            if session.pty_viewport == Some((cols, rows)) {
+                return Task::none();
+            }
+            session.pty_viewport = Some((cols, rows));
+            crate::services::resize_session_pty(session_id, cols, rows);
+        }
         Task::none()
     }
 
@@ -3377,6 +3406,8 @@ impl RunConfigManager {
                 session.cancel_flag =
                     std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                 let cancel_flag = session.cancel_flag.clone();
+                // rerun은 pane을 재사용하므로 마지막 관측 뷰포트를 초기 PTY 크기로 넘긴다.
+                let initial_viewport = session.pty_viewport;
 
                 for tab in &mut self.workspace_tabs {
                     for pane in tab.pane_layout.panes.values_mut() {
@@ -3411,6 +3442,7 @@ impl RunConfigManager {
                         new_id,
                         cancel_flag,
                         self.show_environment_on_run,
+                        initial_viewport,
                     ),
                     |msg| msg,
                 );
