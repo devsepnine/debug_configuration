@@ -13,7 +13,9 @@ use uuid::Uuid;
 pub enum OutputEvent {
     /// 새 라인 추가 (확정된 라인, 또는 새로 열린 라이브 라인)
     Line(String),
-    /// 가장 최근에 추가된 라인의 내용 교체 (라이브 진행바 갱신)
+    /// 가장 최근에 추가된 라인의 내용 교체 (라이브 진행바 갱신).
+    /// PTY(unix) 경로에서만 생성된다 — Windows(pipe)는 Line만 방출.
+    #[cfg_attr(windows, allow(dead_code))]
     Replace(String),
 }
 

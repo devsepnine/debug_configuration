@@ -885,6 +885,11 @@ impl<'a> TerminalCanvas<'a> {
         // 바뀌면 content_version/줄 수가 달라 rebuild_wrap_cache_if_needed가 캐시 미스로
         // 전체 재빌드하며 자연스럽게 새 세션 기준으로 갱신되고, 증분 경로도 line_id 범위
         // 불일치(checked_sub None / 변화 0 가드)로 차단되므로 명시적 리셋이 불필요하다.
+        //
+        // 단, 뷰포트 보고 기억은 리셋한다 — State는 pane(위젯)에 붙어 세션 교체를 넘어
+        // 살아남으므로, 같은 크기라도 **새 세션**에게는 아직 통지된 적이 없다. 리셋하지
+        // 않으면 새 세션의 PTY가 실측 크기(SIGWINCH)를 영영 못 받아 기본 120×40에 고정된다.
+        state.last_reported_viewport = None;
 
         let metrics = self.scroll_metrics(state, bounds);
         state.offset =
@@ -2173,6 +2178,37 @@ mod tests {
 
         let second = canvas.update(&mut state, &redraw, test_bounds(), cursor_inside());
         assert!(second.is_none(), "크기 불변이면 재발행 없음");
+        assert_eq!(state.last_reported_viewport, Some(recorded));
+    }
+
+    #[test]
+    fn session_swap_republishes_viewport_for_new_session() {
+        // State는 pane(위젯)에 붙어 세션 교체를 넘어 살아남는다. 교체 후 크기가 같아도
+        // 새 세션에게는 통지된 적이 없으므로, init이 last_reported_viewport를 리셋해
+        // 다음 조용한 프레임에 새 세션 id로 재발행되어야 한다 — 아니면 새 세션 PTY가
+        // 실측 크기(SIGWINCH)를 영영 못 받아 기본 120×40에 고정된다.
+        let (canvas_a, id_a) = canvas_with_lines(3, false);
+        let mut state = ready_state(id_a);
+        let redraw = Event::Window(window::Event::RedrawRequested(std::time::Instant::now()));
+
+        canvas_a.update(&mut state, &redraw, test_bounds(), cursor_inside());
+        let recorded = state
+            .last_reported_viewport
+            .expect("세션 A viewport 기록 전제");
+
+        // 같은 pane(State 재사용)에 다른 세션 마운트: 첫 프레임은 init(request_redraw)이
+        // 선점하며 보고 기억을 리셋한다.
+        let (canvas_b, _id_b) = canvas_with_lines(3, false);
+        let swap_frame = canvas_b.update(&mut state, &redraw, test_bounds(), cursor_inside());
+        assert!(swap_frame.is_some(), "스왑 프레임은 init 액션");
+        assert_eq!(
+            state.last_reported_viewport, None,
+            "세션 교체 시 보고 기억 리셋"
+        );
+
+        // 다음 조용한 프레임: 크기가 이전과 동일해도 새 세션 앞으로 재발행.
+        let quiet = canvas_b.update(&mut state, &redraw, test_bounds(), cursor_inside());
+        assert!(quiet.is_some(), "새 세션에 viewport 재발행");
         assert_eq!(state.last_reported_viewport, Some(recorded));
     }
 

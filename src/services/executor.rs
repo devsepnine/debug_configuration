@@ -98,6 +98,8 @@ fn force_kill_process_tree(pid: u32) {
 /// Windows pipe는 tokio `ChildStdin`(AsyncWrite) — 통합 blocking 타입이 불가능해 분기.
 enum SessionWriter {
     /// PTY master writer — 라인 디시플린이 에코를 담당한다 (앱 에코 금지).
+    /// Windows에서는 PTY 경로가 없어 미구성 (cfg 대신 allow — 타입/매치 팔은 공유).
+    #[cfg_attr(windows, allow(dead_code))]
     Pty(Arc<Mutex<Box<dyn std::io::Write + Send>>>),
     /// Windows pipe stdin — 에코가 없으므로 제출 시 앱이 로컬 에코한다.
     #[cfg(windows)]
@@ -550,26 +552,63 @@ struct PtyProcess {
     pid: Option<u32>,
     chunks_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
     exit_rx: tokio::sync::oneshot::Receiver<Result<i32, String>>,
+    // 프로덕션은 스레드를 join하지 않는다(자체 회수) — 회수 회귀 테스트 전용 핸들.
+    #[cfg_attr(not(test), allow(dead_code))]
+    reader_thread: Option<std::thread::JoinHandle<()>>,
 }
 
-/// PTY reader 스레드: blocking read → bounded 채널로 전달.
+/// 리더 스레드의 poll 타임아웃(ms) — 수신측 drop 감지 주기이자 스레드 회수 지연 상한.
+#[cfg(unix)]
+const READER_POLL_INTERVAL_MS: libc::c_int = 200;
+
+/// PTY reader 스레드: poll(POLLIN, 200ms) → read → bounded 채널로 전달.
 /// `blocking_send`(드롭 아님)라 UI가 밀리면 커널 pty 버퍼→자식 write 블록으로
 /// 배압이 전파된다 — 진짜 터미널과 동일한 시맨틱, 메모리 상수 유지.
-/// 종료: EOF/EIO(자식 종료 후 slave 닫힘) 또는 수신측 drop(스트림 태스크 종료).
+///
+/// 무조건 blocking read가 아니라 poll을 앞세우는 이유: 자식이 데몬화한 손자에게
+/// slave fd를 물려주고 죽으면 EOF가 영영 오지 않는데, 그때 read에 갇힌 스레드는
+/// 수신측이 사라져도 회수할 방법이 없다(fd를 밖에서 닫는 것은 blocked read와의
+/// 경합으로 미정의 동작). poll 타임아웃 틱마다 `tx.is_closed()`를 확인해 세션이
+/// 정리되면 스스로 종료한다.
+/// 종료: EOF(0)/EIO(자식 종료 후 slave 닫힘) 또는 수신측 drop.
 #[cfg(unix)]
-fn pty_reader_thread(
-    mut reader: Box<dyn std::io::Read + Send>,
-    tx: tokio::sync::mpsc::Sender<Vec<u8>>,
-) {
+fn pty_reader_thread(fd: std::os::fd::OwnedFd, tx: tokio::sync::mpsc::Sender<Vec<u8>>) {
+    use std::os::fd::AsRawFd;
+
     let mut buf = [0u8; 8192];
     loop {
-        match reader.read(&mut buf) {
-            Ok(0) | Err(_) => break,
-            Ok(n) => {
-                if tx.blocking_send(buf[..n].to_vec()).is_err() {
-                    break;
-                }
+        let mut pfd = libc::pollfd {
+            fd: fd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ready = unsafe { libc::poll(&mut pfd, 1, READER_POLL_INTERVAL_MS) };
+        if ready < 0 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
             }
+            break;
+        }
+        if ready == 0 {
+            if tx.is_closed() {
+                break;
+            }
+            continue;
+        }
+        // POLLIN/POLLHUP/POLLERR 어느 쪽이든 read는 즉시 반환한다(데이터/EOF/EIO).
+        let n = unsafe { libc::read(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
+        if n < 0 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            break;
+        }
+        if n == 0 {
+            break;
+        }
+        #[allow(clippy::cast_sign_loss)] // 위에서 n >= 1 보장
+        if tx.blocking_send(buf[..n as usize].to_vec()).is_err() {
+            break;
         }
     }
 }
@@ -614,10 +653,25 @@ fn spawn_in_pty(
 
     let pid = child.process_id();
 
-    let reader = pair
-        .master
-        .try_clone_reader()
-        .map_err(|e| PtySpawnError::Spawn(format!("Failed to open pty reader: {e}")))?;
+    // 리더용 fd는 try_clone_reader(Box<dyn Read> — raw fd 접근 불가) 대신 직접 dup한다:
+    // pty_reader_thread가 poll하려면 raw fd가 필요하다. F_DUPFD_CLOEXEC로 복제해
+    // 이후 스폰되는 다른 세션 자식에게 새지 않게 한다(try_clone_reader 내부와 동일 방식).
+    let reader_fd = {
+        use std::os::fd::{FromRawFd, OwnedFd};
+
+        let raw = pair
+            .master
+            .as_raw_fd()
+            .ok_or_else(|| PtySpawnError::Spawn("Failed to access pty master fd".to_string()))?;
+        let dup = unsafe { libc::fcntl(raw, libc::F_DUPFD_CLOEXEC, 0) };
+        if dup < 0 {
+            return Err(PtySpawnError::Spawn(format!(
+                "Failed to dup pty fd: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        unsafe { OwnedFd::from_raw_fd(dup) }
+    };
     let writer = pair
         .master
         .take_writer()
@@ -633,9 +687,10 @@ fn spawn_in_pty(
     );
 
     let (chunks_tx, chunks_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
-    let _ = std::thread::Builder::new()
+    let reader_thread = std::thread::Builder::new()
         .name(format!("pty-read-{session_id}"))
-        .spawn(move || pty_reader_thread(reader, chunks_tx));
+        .spawn(move || pty_reader_thread(reader_fd, chunks_tx))
+        .ok();
 
     // waiter가 child를 소유하고 blocking wait로 reap한다 (좀비 방지, 스트림 패닉과 무관).
     let (exit_tx, exit_rx) = tokio::sync::oneshot::channel();
@@ -651,6 +706,7 @@ fn spawn_in_pty(
         pid,
         chunks_rx,
         exit_rx,
+        reader_thread,
     })
 }
 
@@ -767,6 +823,9 @@ async fn pty_output_loop(
             biased;
 
             () = wait_for_cancel(cancel_flag) => {
+                // Stop은 즉시성이 우선: chunks_rx에 이미 버퍼된 청크(≤64×8KiB)는
+                // 드레인하지 않고 버린다 — pipe 경로의 기존 "중단 시 꼬리 유실"과
+                // 같은 종류의 트레이드오프(창이 조금 더 클 뿐).
                 assembler.emit_partial(&mut batch);
                 flush_event_batch(output, session_id, &mut batch).await;
                 return PtyLoopEnd::Cancelled;
@@ -869,8 +928,9 @@ async fn handle_spawned_process(
     mut child: Child,
     cancel_flag: Arc<AtomicBool>,
 ) {
-    send_process_started(output, session_id, &child).await;
     // Windows: stdin pipe를 세션 I/O 레지스트리에 등록 (stdin 입력바 지원).
+    // PTY 경로와 동일하게 ProcessStarted 발송 **전에** 등록한다 — 앱이 시작 알림에
+    // 반응해 곧바로 stdin/resize 핸들을 찾는 경우의 공백을 없앤다.
     #[cfg(windows)]
     if let Some(stdin) = child.stdin.take() {
         register_session_io(
@@ -883,6 +943,7 @@ async fn handle_spawned_process(
             },
         );
     }
+    send_process_started(output, session_id, &child).await;
     let (mut stdout_reader, mut stderr_reader) = take_process_streams(&mut child);
 
     let cancelled = process_output_loop(
@@ -1124,12 +1185,17 @@ fn lines_to_events(payload: &str) -> Vec<OutputEvent> {
 /// flush 대기 중인 출력 이벤트 배치. 같은 논리 라인에 대한 연속 `Replace`는 직전
 /// 이벤트에 제자리 병합된다 — Replace는 항상 "직전에 방출된 라인"을 겨냥하므로 배치
 /// 안에서는 마지막 상태만 의미가 있다 ([Line a, Replace a', Replace a''] → [Line a'']).
+// EventBatch/LineAssembler는 PTY(unix) 경로에서만 구성된다. Windows에서 타입 자체를
+// cfg로 걷어내면 유닛 테스트도 함께 게이트해야 하므로, dead_code allow로 갈음한다
+// (windows CI는 check라 경고로만 보이지만, 게이트가 조여져도 깨지지 않게 선제 적용).
 #[derive(Default)]
+#[cfg_attr(windows, allow(dead_code))]
 struct EventBatch {
     events: Vec<OutputEvent>,
     bytes: usize,
 }
 
+#[cfg_attr(windows, allow(dead_code))]
 impl EventBatch {
     fn push(&mut self, event: OutputEvent) {
         if let OutputEvent::Replace(new_text) = &event
@@ -1171,6 +1237,7 @@ impl EventBatch {
 /// - 방출 텍스트에 `\r`은 절대 포함되지 않는다 (session측 collapse는 방어선)
 /// - UTF-8 경계: flush 방출은 유효 prefix까지만 표시하고 잔여 바이트는 보류
 ///   (멀티바이트 문자가 청크에 걸릴 때 U+FFFD 깜빡임 방지); 라인 확정 시엔 lossy 전체
+#[cfg_attr(windows, allow(dead_code))]
 struct LineAssembler {
     /// 현재 미완 논리 라인의 바이트 (\r 미포함).
     partial: Vec<u8>,
@@ -1182,6 +1249,7 @@ struct LineAssembler {
     dirty: bool,
 }
 
+#[cfg_attr(windows, allow(dead_code))]
 impl LineAssembler {
     fn new() -> Self {
         Self {
@@ -1377,9 +1445,7 @@ async fn terminate_and_reap(child: &mut Child) {
         // None을 반환할 수 있어, 보존하지 않으면 SIGKILL이 누락될 수 있다.
         let pid = child.id();
         if let Some(p) = pid {
-            unsafe {
-                libc::killpg(p as i32, libc::SIGTERM);
-            }
+            signal_process_group(p, libc::SIGTERM);
         }
         if tokio::time::timeout(Duration::from_secs(2), child.wait())
             .await
@@ -1387,9 +1453,7 @@ async fn terminate_and_reap(child: &mut Child) {
         {
             // SIGTERM 무시 → SIGKILL 에스컬레이션 후 reap.
             if let Some(p) = pid {
-                unsafe {
-                    libc::killpg(p as i32, libc::SIGKILL);
-                }
+                signal_process_group(p, libc::SIGKILL);
             }
             let _ = child.wait().await;
         }
@@ -1867,6 +1931,151 @@ mod tests {
         assert_eq!(batch.bytes, 5);
     }
 
+    // ---- pty_output_loop 직접 구동 (합성 채널 — 실프로세스 불필요) ----
+
+    #[cfg(unix)]
+    mod pty_loop {
+        use super::*;
+        use iced::futures::StreamExt;
+
+        /// 수신된 메시지에서 OutputReceived 이벤트만 평탄화.
+        fn collect_events(messages: &[Message]) -> Vec<OutputEvent> {
+            messages
+                .iter()
+                .filter_map(|m| match m {
+                    Message::OutputReceived(_, events) => Some(events.clone()),
+                    _ => None,
+                })
+                .flatten()
+                .collect()
+        }
+
+        /// Stop 시 이미 조립된 미완 라인은 유실되지 않아야 한다 (flush 마감 또는
+        /// 취소 직전 emit_partial 어느 쪽이 실어 보내든 — 관측 가능한 불변식만 단언).
+        #[tokio::test]
+        async fn cancel_delivers_open_partial_line_and_returns_cancelled() {
+            let (mut tx, mut rx) = iced::futures::channel::mpsc::channel::<Message>(100);
+            let cancel = Arc::new(AtomicBool::new(false));
+            let (chunks_tx, mut chunks_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+            let (_exit_tx, mut exit_rx) = tokio::sync::oneshot::channel::<Result<i32, String>>();
+
+            chunks_tx.send(b"partial-line".to_vec()).await.unwrap();
+            let cancel_setter = cancel.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                cancel_setter.store(true, std::sync::atomic::Ordering::SeqCst);
+            });
+
+            let end = tokio::time::timeout(
+                Duration::from_secs(5),
+                pty_output_loop(
+                    &mut tx,
+                    Uuid::new_v4(),
+                    &mut chunks_rx,
+                    &mut exit_rx,
+                    &cancel,
+                ),
+            )
+            .await
+            .expect("loop timed out");
+            assert!(matches!(end, PtyLoopEnd::Cancelled));
+
+            drop(tx);
+            let mut messages = Vec::new();
+            while let Some(msg) = rx.next().await {
+                messages.push(msg);
+            }
+            let events = collect_events(&messages);
+            assert!(
+                events.contains(&OutputEvent::Line(String::from("partial-line"))),
+                "취소 전 조립된 라인은 전달되어야 함: {events:?}"
+            );
+        }
+
+        /// EOF가 exit 통지보다 먼저 도달하는 경로: EOF 분기의 내부 select가 exit_rx를
+        /// 기다려 Completed로 끝나야 한다 (oneshot 이중 폴 없이).
+        #[tokio::test]
+        async fn eof_before_exit_awaits_status_then_completes() {
+            let (mut tx, mut rx) = iced::futures::channel::mpsc::channel::<Message>(100);
+            let cancel = Arc::new(AtomicBool::new(false));
+            let (chunks_tx, mut chunks_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+            let (exit_tx, mut exit_rx) = tokio::sync::oneshot::channel::<Result<i32, String>>();
+
+            chunks_tx.send(b"tail\n".to_vec()).await.unwrap();
+            drop(chunks_tx); // 즉시 EOF — biased 순서상 chunk 팔이 exit 팔보다 먼저 소비
+            exit_tx.send(Ok(0)).unwrap();
+
+            let end = tokio::time::timeout(
+                Duration::from_secs(5),
+                pty_output_loop(
+                    &mut tx,
+                    Uuid::new_v4(),
+                    &mut chunks_rx,
+                    &mut exit_rx,
+                    &cancel,
+                ),
+            )
+            .await
+            .expect("loop timed out");
+            assert!(matches!(end, PtyLoopEnd::Completed(Ok(0))));
+
+            drop(tx);
+            let mut messages = Vec::new();
+            while let Some(msg) = rx.next().await {
+                messages.push(msg);
+            }
+            let events = collect_events(&messages);
+            assert!(
+                events.contains(&OutputEvent::Line(String::from("tail"))),
+                "EOF 직전 라인 전달: {events:?}"
+            );
+        }
+
+        /// exit 통지가 먼저 오고 출력이 뒤따르는 경로(손자 프로세스 스트림): 종료 코드를
+        /// 기록한 뒤에도 EOF까지 드레인하고, 늦게 도착한 출력을 보존해야 한다.
+        #[tokio::test]
+        async fn exit_before_eof_keeps_draining_grandchild_output() {
+            let (mut tx, mut rx) = iced::futures::channel::mpsc::channel::<Message>(100);
+            let cancel = Arc::new(AtomicBool::new(false));
+            let (chunks_tx, mut chunks_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+            let (exit_tx, mut exit_rx) = tokio::sync::oneshot::channel::<Result<i32, String>>();
+
+            exit_tx.send(Ok(7)).unwrap();
+            let feeder = tokio::spawn(async move {
+                // 루프가 exit 팔을 먼저 소비하도록 한 턴 양보 후 늦은 출력 전달.
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                chunks_tx.send(b"grandchild-tail\n".to_vec()).await.unwrap();
+                // drop(chunks_tx) → EOF
+            });
+
+            let end = tokio::time::timeout(
+                Duration::from_secs(5),
+                pty_output_loop(
+                    &mut tx,
+                    Uuid::new_v4(),
+                    &mut chunks_rx,
+                    &mut exit_rx,
+                    &cancel,
+                ),
+            )
+            .await
+            .expect("loop timed out");
+            feeder.await.unwrap();
+            assert!(matches!(end, PtyLoopEnd::Completed(Ok(7))));
+
+            drop(tx);
+            let mut messages = Vec::new();
+            while let Some(msg) = rx.next().await {
+                messages.push(msg);
+            }
+            let events = collect_events(&messages);
+            assert!(
+                events.contains(&OutputEvent::Line(String::from("grandchild-tail"))),
+                "exit 후 도착한 출력도 보존: {events:?}"
+            );
+        }
+    }
+
     // ---- PTY 통합 (unix 실프로세스; openpty 불가 환경은 self-skip) ----
 
     #[cfg(unix)]
@@ -1999,6 +2208,45 @@ mod tests {
             assert!(
                 out.matches("hello").count() >= 2,
                 "tty echo + child print expected: {out:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn pty_reader_thread_reclaims_after_receiver_drop() {
+            // 데몬화한 손자가 slave를 계속 쥐면 EOF가 오지 않는다. 그 상태에서 세션이
+            // 정리되면(수신측 drop) 리더 스레드가 poll 타임아웃 틱에서 스스로 종료해야
+            // 한다 — 침묵하는 자식(sleep)으로 "EOF 없음 + 출력 없음"을 재현한다.
+            let config = test_config("/tmp");
+            let session_id = Uuid::new_v4();
+            let pty = match spawn_in_pty(&config, "sleep 30", &[], session_id, (80, 24)) {
+                Ok(p) => p,
+                Err(PtySpawnError::PtyUnavailable(_)) => {
+                    eprintln!("[skip] pty unavailable in this environment");
+                    return;
+                }
+                Err(PtySpawnError::Spawn(e)) => panic!("spawn failed: {e}"),
+            };
+            let handle = pty.reader_thread.expect("reader thread must spawn");
+
+            drop(pty.chunks_rx); // 세션 정리 시뮬레이션 — 수신측 소멸
+
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = handle.join();
+                let _ = done_tx.send(());
+            });
+            // 회수는 자식이 살아있는 동안 관측되어야 한다 (kill이 만드는 EOF로 끝나면
+            // 무의미) — 판정 후에 정리한다.
+            let reclaimed = done_rx.recv_timeout(Duration::from_secs(3)).is_ok();
+
+            if let Some(pid) = pty.pid {
+                signal_process_group(pid, libc::SIGKILL);
+            }
+            let _ = pty.exit_rx.await;
+            unregister_session_io(session_id);
+            assert!(
+                reclaimed,
+                "reader thread must self-reclaim within poll interval after receiver drop"
             );
         }
     }

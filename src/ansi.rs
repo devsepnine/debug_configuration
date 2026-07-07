@@ -242,8 +242,9 @@ pub fn parse_ansi_text(text: &str) -> Vec<TextSegment> {
                         }
                     }
                 }
-                // 문자셋 지정 (ESC ( ) * +): 뒤따르는 1바이트까지 소비.
-                Some('(') | Some(')') | Some('*') | Some('+') => {
+                // 문자셋 지정 (ESC ( ) * +) 및 2바이트 중간문자 시퀀스
+                // (ESC # — DEC 라인 크기, ESC SPACE — ANSI 준수 수준): 뒤 1바이트까지 소비.
+                Some('(') | Some(')') | Some('*') | Some('+') | Some('#') | Some(' ') => {
                     chars.next();
                     chars.next();
                 }
@@ -407,6 +408,14 @@ mod tests {
         assert_eq!(joined("\x1b(Bplain"), "plain");
         // 단일 문자 ESC (커서 저장/복원 7/8)
         assert_eq!(joined("\x1b7save\x1b8"), "save");
+    }
+
+    #[test]
+    fn two_byte_intermediate_escapes_are_swallowed() {
+        // ESC # — DEC 라인 크기 (예: DECDHL/DECALN). 두 번째 바이트('8')가 새면 안 된다.
+        assert_eq!(joined("\x1b#8filled"), "filled");
+        // ESC SPACE — ANSI 준수 수준 지정. 'F'가 새면 안 된다.
+        assert_eq!(joined("\x1b F7bit"), "7bit");
     }
 
     #[test]
