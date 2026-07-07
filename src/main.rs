@@ -17,8 +17,31 @@ mod views;
 mod widgets;
 
 use app::RunConfigManager;
-use iced::{Color, Element, Font, Size, Subscription, Task, Theme, theme, window};
+use iced::{Color, Element, Font, Point, Size, Subscription, Task, Theme, theme, window};
 use messages::Message;
+
+/// 창 최소 크기. `window::Settings`와 저장된 geometry 복원 clamp가 공유하는 SSOT.
+const MIN_WINDOW_SIZE: Size = Size::new(600.0, 400.0);
+
+/// 저장된 창 배치를 window 설정값으로 변환한다.
+/// 크기는 최소 크기 미만으로 줄지 않게 clamp하고, 위치는 좌표가 비정상 범위(모니터
+/// 좌표로 볼 수 없는 값)면 무시해 OS 기본 배치로 폴백한다 (멀티 모니터 음수는 유효).
+fn restore_window_geometry(settings: &services::AppSettings) -> (Size, window::Position) {
+    // 유한성 검사를 clamp보다 먼저 — f32::max는 NaN.max(x) == x라 NaN이 유한값으로
+    // 세탁되어 뒤의 is_finite 필터가 무력화된다.
+    let size = settings
+        .window_size
+        .filter(|(w, h)| w.is_finite() && h.is_finite())
+        .map(|(w, h)| Size::new(w.max(MIN_WINDOW_SIZE.width), h.max(MIN_WINDOW_SIZE.height)))
+        .unwrap_or(Size::new(800.0, 600.0));
+    let position = settings
+        .window_position
+        .filter(|(x, y)| x.is_finite() && y.is_finite() && x.abs() < 16_384.0 && y.abs() < 16_384.0)
+        .map_or(window::Position::Default, |(x, y)| {
+            window::Position::Specific(Point::new(x, y))
+        });
+    (size, position)
+}
 
 /// D2 Coding 폰트 임베드
 pub(crate) const D2CODING_FONT: &[u8] = include_bytes!("../fonts/D2Coding.ttf");
@@ -66,14 +89,20 @@ fn main() -> iced::Result {
         );
     }
 
+    // 저장된 창 배치 복원 (없으면 800×600 / OS 기본 위치).
+    // RunConfigManager::new()도 load_settings를 호출하지만, 창 설정은 앱 상태 생성
+    // 이전에 필요해 여기서 한 번 더 읽는다 (수 KB 파일 1회 읽기 — 공유 상태보다 단순).
+    let (window_size, window_position) = restore_window_geometry(&services::load_settings());
+
     iced::application(RunConfigManager::new, update, view)
         .subscription(subscription)
         .font(D2CODING_FONT)
         .theme(theme)
         .style(application_style)
         .window(window::Settings {
-            size: Size::new(800.0, 600.0),           // 초기 창 크기
-            min_size: Some(Size::new(600.0, 400.0)), // 최소 크기: 가로 600px, 세로 400px
+            size: window_size,
+            position: window_position,
+            min_size: Some(MIN_WINDOW_SIZE),
             decorations: false,
             transparent: true,
             ..Default::default()
@@ -107,4 +136,56 @@ fn update(state: &mut RunConfigManager, message: Message) -> Task<Message> {
 /// View 함수 - UI 렌더링을 위임
 fn view(state: &RunConfigManager) -> Element<'_, Message> {
     state.view()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use services::AppSettings;
+
+    fn settings_with(size: Option<(f32, f32)>, position: Option<(f32, f32)>) -> AppSettings {
+        AppSettings {
+            window_size: size,
+            window_position: position,
+            ..AppSettings::default()
+        }
+    }
+
+    #[test]
+    fn geometry_defaults_when_unset() {
+        let (size, position) = restore_window_geometry(&settings_with(None, None));
+        assert_eq!(size, Size::new(800.0, 600.0));
+        assert!(matches!(position, window::Position::Default));
+    }
+
+    #[test]
+    fn geometry_clamps_size_to_minimum() {
+        let (size, _) = restore_window_geometry(&settings_with(Some((100.0, 5000.0)), None));
+        assert_eq!(size.width, MIN_WINDOW_SIZE.width);
+        assert_eq!(size.height, 5000.0);
+    }
+
+    #[test]
+    fn geometry_keeps_negative_multi_monitor_position() {
+        // 주 모니터 왼쪽 배치는 음수 x가 정상이다 (실사용 값: -1552).
+        let (_, position) = restore_window_geometry(&settings_with(None, Some((-1552.0, 197.0))));
+        assert!(matches!(
+            position,
+            window::Position::Specific(p) if p.x == -1552.0 && p.y == 197.0
+        ));
+    }
+
+    #[test]
+    fn geometry_rejects_nonfinite_and_out_of_range() {
+        // NaN 크기: clamp 전에 걸러져 기본 크기로 (f32::max의 NaN 세탁 방지 회귀 테스트).
+        let (size, _) = restore_window_geometry(&settings_with(Some((f32::NAN, 600.0)), None));
+        assert_eq!(size, Size::new(800.0, 600.0));
+        let (size, _) = restore_window_geometry(&settings_with(Some((f32::INFINITY, 600.0)), None));
+        assert_eq!(size, Size::new(800.0, 600.0));
+        // 비정상 위치 → OS 기본 배치 폴백.
+        let (_, position) = restore_window_geometry(&settings_with(None, Some((f32::NAN, 0.0))));
+        assert!(matches!(position, window::Position::Default));
+        let (_, position) = restore_window_geometry(&settings_with(None, Some((99_999.0, 0.0))));
+        assert!(matches!(position, window::Position::Default));
+    }
 }

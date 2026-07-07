@@ -820,6 +820,58 @@ pub fn view_settings_modal(props: SettingsModalView<'_>) -> Element<'_, Message>
     )
 }
 
+/// 구성 삭제 확인 모달 뷰 모델.
+pub struct ConfirmDeleteModalView<'a> {
+    /// 삭제 대상 구성 이름.
+    pub name: &'a str,
+    /// 이 구성을 참조 중인 Compound 이름들 (비어 있지 않으면 경고 표시).
+    pub referencing_compounds: &'a [String],
+}
+
+/// 구성 삭제 확인 모달. 삭제는 undo가 없으므로 대상 이름을 명시해 확인을 받는다.
+/// 다른 모달과 동일한 오버레이 패턴이며 Delete / Cancel / X / Esc 로만 닫힌다.
+pub fn view_confirm_delete_modal<'a>(props: ConfirmDeleteModalView<'a>) -> Element<'a, Message> {
+    let header = row![
+        text("Delete Configuration").size(15),
+        Space::new().width(Length::Fill),
+        icon_button(ICON_CLOSE, Some(Message::CancelDeleteConfiguration)),
+    ]
+    .align_y(Alignment::Center)
+    .width(Length::Fill);
+
+    let mut body = column![
+        text(format!("Delete \"{}\"?", props.name)).size(13),
+        text("This cannot be undone.")
+            .size(12)
+            .color(Color::from_rgba8(255, 255, 255, 0.55)),
+    ]
+    .spacing(6);
+    if !props.referencing_compounds.is_empty() {
+        body = body.push(
+            text(format!(
+                "Referenced by compound: {} — the reference will be removed.",
+                props.referencing_compounds.join(", ")
+            ))
+            .size(12)
+            .color(Color::from_rgba8(250, 179, 135, 1.0)), // 경고(Peach) 톤
+        );
+    }
+
+    let content = column![
+        header,
+        Space::new().height(12),
+        body,
+        Space::new().height(16),
+        modal_footer(
+            Message::CancelDeleteConfiguration,
+            "Delete",
+            Some(Message::ConfirmDeleteConfiguration),
+        ),
+    ];
+
+    modal_dialog(content.into(), 420.0, 230.0)
+}
+
 /// 구성 내보내기 모달 뷰 모델 (app의 staging 선택 상태를 참조로 전달).
 pub struct ExportModalView<'a> {
     pub configurations: &'a [RunConfiguration],

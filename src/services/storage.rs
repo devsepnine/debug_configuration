@@ -27,6 +27,13 @@ pub struct AppSettings {
     /// 앱 시작 시 업데이트를 자동으로 확인할지 여부
     #[serde(default = "default_true")]
     pub auto_check_updates: bool,
+    /// 마지막 창 크기 `(width, height)` (logical px). 시작 시 복원하며, 최소 크기
+    /// 미만 값은 복원 시 clamp된다. 구버전 설정 파일엔 없으므로 default 필수.
+    #[serde(default)]
+    pub window_size: Option<(f32, f32)>,
+    /// 마지막 창 좌상단 위치 `(x, y)` (logical px). 멀티 모니터에서 음수 좌표도 유효하다.
+    #[serde(default)]
+    pub window_position: Option<(f32, f32)>,
 }
 
 /// serde 기본값 헬퍼: bool 필드의 기본은 `true` (켜짐). `#[derive(Default)]`의
@@ -49,6 +56,8 @@ impl Default for AppSettings {
             max_output_lines: default_max_output_lines(),
             default_auto_scroll: true,
             auto_check_updates: true,
+            window_size: None,
+            window_position: None,
         }
     }
 }
@@ -429,6 +438,8 @@ mod tests {
         );
         assert!(settings.default_auto_scroll);
         assert!(settings.auto_check_updates);
+        assert!(settings.window_size.is_none());
+        assert!(settings.window_position.is_none());
     }
 
     #[test]
@@ -438,6 +449,8 @@ mod tests {
             max_output_lines: 12_345,
             default_auto_scroll: false,
             auto_check_updates: false,
+            window_size: Some((1024.0, 768.0)),
+            window_position: Some((-100.0, 42.0)), // 멀티 모니터 음수 좌표
             ..AppSettings::default()
         };
         let json = serde_json::to_string(&settings).unwrap();
@@ -446,6 +459,8 @@ mod tests {
         assert_eq!(back.max_output_lines, 12_345);
         assert!(!back.default_auto_scroll);
         assert!(!back.auto_check_updates);
+        assert_eq!(back.window_size, Some((1024.0, 768.0)));
+        assert_eq!(back.window_position, Some((-100.0, 42.0)));
     }
 
     // ---- 앱 전용 저장소 (configs) ----

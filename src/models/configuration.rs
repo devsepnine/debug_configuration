@@ -624,6 +624,15 @@ impl ConfigTypeData {
         }
     }
 
+    /// Compound 변형이면 멤버 id 목록 반환.
+    pub fn compound_members(&self) -> Option<&[Uuid]> {
+        if let ConfigTypeData::Compound { members, .. } = self {
+            Some(members)
+        } else {
+            None
+        }
+    }
+
     /// Compound 변형이면 멤버 id 목록의 가변 참조 반환.
     pub fn compound_members_mut(&mut self) -> Option<&mut Vec<Uuid>> {
         if let ConfigTypeData::Compound { members, .. } = self {

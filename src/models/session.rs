@@ -349,16 +349,48 @@ impl RunSession {
             .and_then(|finished| finished.duration_since(self.started_at).ok())
     }
 
-    /// 상태 배지에 표시할 짧은 라벨 (예: "✓ 1.2s", "✕ exit 1", "Stopped", "Running").
-    pub fn status_badge_label(&self) -> String {
+    /// 실행 시작 후 현재까지의 경과 시간 (라이브 표시용). 시스템 시계가 뒤로 간
+    /// 경우(NTP 보정 등) 0으로 처리한다.
+    pub fn elapsed_since_start(&self) -> Duration {
+        SystemTime::now()
+            .duration_since(self.started_at)
+            .unwrap_or_default()
+    }
+
+    /// 사이드바(고정 폭 배지)용 압축 라벨. 실행 중엔 경과시간만("12.3s"), 종료 상태는
+    /// 소요시간 없는 짧은 형태 — 전체 정보는 pane 타이틀의 `status_badge_label`이 담당.
+    pub fn status_badge_label_compact(&self) -> String {
         match self.status_kind() {
-            SessionStatusKind::Running => String::from("Running"),
+            SessionStatusKind::Running => format_duration(self.elapsed_since_start()),
             SessionStatusKind::Succeeded => self.run_duration().map_or_else(
                 || String::from("✓ done"),
                 |d| format!("✓ {}", format_duration(d)),
             ),
             SessionStatusKind::Failed(code) => format!("✕ exit {code}"),
             SessionStatusKind::Stopped => String::from("Stopped"),
+        }
+    }
+
+    /// 상태 배지에 표시할 라벨 (pane 타이틀 등 폭 여유가 있는 표면용).
+    /// 실행 중엔 라이브 경과 시간을, 종료 후엔 결과와 소요 시간을 함께 표시한다
+    /// (예: "Running 12.3s", "✓ 1.2s", "✕ exit 1 · 3.4s", "Stopped · 3.4s").
+    pub fn status_badge_label(&self) -> String {
+        match self.status_kind() {
+            SessionStatusKind::Running => {
+                format!("Running {}", format_duration(self.elapsed_since_start()))
+            }
+            SessionStatusKind::Succeeded => self.run_duration().map_or_else(
+                || String::from("✓ done"),
+                |d| format!("✓ {}", format_duration(d)),
+            ),
+            SessionStatusKind::Failed(code) => self.run_duration().map_or_else(
+                || format!("✕ exit {code}"),
+                |d| format!("✕ exit {code} · {}", format_duration(d)),
+            ),
+            SessionStatusKind::Stopped => self.run_duration().map_or_else(
+                || String::from("Stopped"),
+                |d| format!("Stopped · {}", format_duration(d)),
+            ),
         }
     }
 }
@@ -583,6 +615,58 @@ mod tests {
 
         session.exit_code = None; // 사용자 중지
         assert_eq!(session.status_kind(), SessionStatusKind::Stopped);
+    }
+
+    #[test]
+    fn status_badge_includes_duration_for_all_terminal_states() {
+        let mut session = RunSession::new("x".to_string());
+        session.is_running = false;
+        session.finished_at = Some(session.started_at + Duration::from_millis(3400));
+
+        session.exit_code = Some(0);
+        assert_eq!(session.status_badge_label(), "✓ 3.4s");
+        session.exit_code = Some(1);
+        assert_eq!(session.status_badge_label(), "✕ exit 1 · 3.4s");
+        session.exit_code = None; // 사용자 중지
+        assert_eq!(session.status_badge_label(), "Stopped · 3.4s");
+    }
+
+    #[test]
+    fn compact_badge_stays_short_for_fixed_width_sidebar() {
+        let mut session = RunSession::new("x".to_string());
+        // 실행 중: 경과시간만 (접두사 없음 — 고정 폭 배지에 맞춤).
+        assert!(!session.status_badge_label_compact().starts_with("Running"));
+
+        session.is_running = false;
+        session.finished_at = Some(session.started_at + Duration::from_millis(3400));
+        session.exit_code = Some(130);
+        // 종료 상태는 소요시간 없이 짧게 (풀 라벨은 pane 타이틀 담당).
+        assert_eq!(session.status_badge_label_compact(), "✕ exit 130");
+        session.exit_code = None;
+        assert_eq!(session.status_badge_label_compact(), "Stopped");
+        session.exit_code = Some(0);
+        assert_eq!(session.status_badge_label_compact(), "✓ 3.4s");
+    }
+
+    #[test]
+    fn status_badge_shows_live_elapsed_while_running() {
+        let session = RunSession::new("x".to_string());
+        let label = session.status_badge_label();
+        // 경과 시간은 비결정적이므로 형식만 검증 ("Running <duration>").
+        assert!(
+            label.starts_with("Running ") && label.len() > "Running ".len(),
+            "unexpected running label: {label}"
+        );
+    }
+
+    #[test]
+    fn status_badge_without_finish_time_omits_duration() {
+        let mut session = RunSession::new("x".to_string());
+        session.is_running = false;
+        session.exit_code = Some(1);
+        assert_eq!(session.status_badge_label(), "✕ exit 1");
+        session.exit_code = None;
+        assert_eq!(session.status_badge_label(), "Stopped");
     }
 
     #[test]

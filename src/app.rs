@@ -12,10 +12,11 @@ use crate::services::{
 use crate::utils::{DIALOG_CANCELLED, ICON_DELETE, ICON_PLAY, ICON_REFRESH, ICON_STOP};
 use crate::views::shared::icon_tooltip;
 use crate::views::{
-    EditorLoadingState, EditorSelectState, EnvModalView, ExportModalView, FileDialogLoadingState,
-    ImportModalView, NodeLoadingState, SettingsModalView, view_configuration_editor,
-    view_configuration_list, view_env_modal, view_export_modal, view_import_modal, view_main_tabs,
-    view_pane_layout, view_settings_modal, view_toolbar, view_workspace_tab_bar,
+    ConfirmDeleteModalView, EditorLoadingState, EditorSelectState, EnvModalView, ExportModalView,
+    FileDialogLoadingState, ImportModalView, NodeLoadingState, SettingsModalView,
+    view_configuration_editor, view_configuration_list, view_confirm_delete_modal, view_env_modal,
+    view_export_modal, view_import_modal, view_main_tabs, view_pane_layout, view_settings_modal,
+    view_toolbar, view_workspace_tab_bar,
 };
 use crate::widgets::pane_grid;
 use crate::widgets::title_bar_drag::TitleBarDragArea;
@@ -35,11 +36,13 @@ use std::time::{Duration, Instant, SystemTime};
 use uuid::Uuid;
 
 mod chrome;
+mod confirm_delete_modal;
 mod env_modal;
 mod export_modal;
 mod import_modal;
 mod settings_modal;
 
+use confirm_delete_modal::ConfirmDeleteModalState;
 use env_modal::EnvModalState;
 use export_modal::ExportModalState;
 use import_modal::ImportModalState;
@@ -55,7 +58,9 @@ use chrome::{
 };
 
 /// 세션 리스트의 상태 배지 고정 폭 — 레이아웃 계산과 실제 렌더링이 공유한다.
-const SESSION_STATUS_BADGE_WIDTH: f32 = 52.0;
+/// 압축 라벨의 최장 형태("✕ exit 130", "12m 05s")가 10px 폰트에서 들어가는 크기
+/// (기존 52px는 세 자리 exit code에서 이미 넘쳤다).
+const SESSION_STATUS_BADGE_WIDTH: f32 = 64.0;
 
 /// 커스텀 타이틀바 터치 드래그의 진행 상태.
 ///
@@ -395,6 +400,8 @@ pub struct RunConfigManager {
     export_modal: Option<ExportModalState>,
     /// 구성 가져오기 모달 상태 (`Some`이면 모달 열림)
     import_modal: Option<ImportModalState>,
+    /// 구성 삭제 확인 모달 상태 (`Some`이면 모달 열림)
+    confirm_delete_modal: Option<ConfirmDeleteModalState>,
     /// 설정: 구성 실행 시 Environment 라인 표시 여부
     show_environment_on_run: bool,
     /// 설정: 새 세션의 출력 버퍼 최대 라인 수
@@ -500,6 +507,7 @@ impl RunConfigManager {
             settings_modal: None,
             export_modal: None,
             import_modal: None,
+            confirm_delete_modal: None,
             show_environment_on_run: settings.show_environment_on_run,
             max_output_lines: settings.max_output_lines,
             default_auto_scroll: settings.default_auto_scroll,
@@ -642,7 +650,9 @@ impl RunConfigManager {
             }
             Message::ImportModalToggleAll(checked) => self.handle_import_modal_toggle_all(checked),
             Message::AddConfiguration
-            | Message::DeleteConfiguration(_)
+            | Message::RequestDeleteConfiguration(_)
+            | Message::ConfirmDeleteConfiguration
+            | Message::CancelDeleteConfiguration
             | Message::CloneConfiguration(_)
             | Message::RunConfiguration(_)
             | Message::StartConfigurationDrag(_)
@@ -742,6 +752,7 @@ impl RunConfigManager {
             | Message::CheckForUpdates
             | Message::UpdateCheckCompleted(_)
             | Message::UpdateSpinnerTick
+            | Message::SessionTimerTick
             | Message::InstallUpdate
             | Message::UpdateInstallCompleted(_) => self.handle_session_messages(message),
             Message::AddWorkspaceTab
@@ -757,6 +768,8 @@ impl RunConfigManager {
             | Message::ConfigurationPaneResized(_)
             | Message::PaneGridResized(_)
             | Message::ClosePane(_)
+            | Message::CloseFocusedPane
+            | Message::RunShortcut
             | Message::TogglePaneMaximize(_)
             | Message::PaneClicked(_)
             | Message::TabBarHovered(_)
@@ -780,7 +793,11 @@ impl RunConfigManager {
     fn handle_configuration_messages(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::AddConfiguration => self.handle_add_configuration(),
-            Message::DeleteConfiguration(index_opt) => self.handle_delete_configuration(index_opt),
+            Message::RequestDeleteConfiguration(index_opt) => {
+                self.handle_request_delete_configuration(index_opt)
+            }
+            Message::ConfirmDeleteConfiguration => self.handle_confirm_delete_configuration(),
+            Message::CancelDeleteConfiguration => self.handle_cancel_delete_configuration(),
             Message::CloneConfiguration(index_opt) => self.handle_clone_configuration(index_opt),
             Message::RunConfiguration(index_opt) => self.handle_run_configuration(index_opt),
             Message::StartConfigurationDrag(index) => self.handle_start_configuration_drag(index),
@@ -912,6 +929,8 @@ impl RunConfigManager {
             Message::CheckForUpdates => self.handle_check_for_updates(),
             Message::UpdateCheckCompleted(result) => self.handle_update_check_completed(result),
             Message::UpdateSpinnerTick => self.handle_update_spinner_tick(),
+            // 상태 변경 없음 — 메시지 수신 자체가 재렌더를 유발해 라이브 경과시간이 갱신된다.
+            Message::SessionTimerTick => Task::none(),
             Message::InstallUpdate => self.handle_install_update(),
             Message::UpdateInstallCompleted(result) => self.handle_update_install_completed(result),
             Message::SessionScrollChanged(session_id, progress, at_bottom) => {
@@ -984,6 +1003,8 @@ impl RunConfigManager {
             Message::CursorMoved(position) => self.handle_cursor_moved(position),
             Message::PaneGridResized(event) => self.handle_pane_grid_resized(event),
             Message::ClosePane(pane_id) => self.handle_close_pane(pane_id),
+            Message::CloseFocusedPane => self.handle_close_focused_pane(),
+            Message::RunShortcut => self.handle_run_shortcut(),
             Message::TogglePaneMaximize(pane_id) => self.handle_toggle_pane_maximize(pane_id),
             Message::PaneClicked(pane_id) => self.handle_pane_clicked(pane_id),
             Message::TabBarHovered(tab_index) => self.handle_tab_bar_hovered(tab_index),
@@ -998,6 +1019,10 @@ impl RunConfigManager {
                 // WindowMoved가 무시되어 window_pos가 stale해지므로 여기서 드래그를 끝낸다.
                 if !focused {
                     self.title_bar_touch_drag = None;
+                    // 창 배치(크기/위치)를 blur 시점에 영속화한다. 리사이즈/이동 이벤트마다
+                    // 쓰면 드래그 중 초당 수십 회 디스크 쓰기가 생기므로, "정리하고 다른 곳을
+                    // 본 순간"에 저장하는 편이 싸고 충분하다 (닫기 버튼 경로도 별도 저장).
+                    self.save_app_settings();
                 }
                 Task::none()
             }
@@ -1128,6 +1153,8 @@ impl RunConfigManager {
     }
 
     fn handle_close_window(&mut self) -> Task<Message> {
+        // 종료 직전 창 배치를 영속화한다 (다음 실행에서 크기/위치 복원).
+        self.save_app_settings();
         self.prepare_running_sessions_for_shutdown();
         self.window_id.map_or_else(Task::none, window::close)
     }
@@ -1150,6 +1177,12 @@ impl RunConfigManager {
     }
 
     fn save_app_settings(&self) {
+        // 단위 테스트가 핸들러(설정 확인, pane 리사이즈, blur 등)를 거쳐 여기 도달하면
+        // 실제 사용자 설정 파일(~/.run_config_settings.json)이 테스트 기본값으로 덮인다 —
+        // 저장소 테스트 격리와 같은 원칙으로 테스트에서는 디스크에 쓰지 않는다.
+        if cfg!(test) {
+            return;
+        }
         save_settings(&AppSettings {
             last_file_path: self.last_file_path.clone(),
             configuration_split_ratio: Some(configuration_split_ratio(&self.configuration_layout)),
@@ -1157,6 +1190,8 @@ impl RunConfigManager {
             max_output_lines: self.max_output_lines,
             default_auto_scroll: self.default_auto_scroll,
             auto_check_updates: self.auto_check_updates,
+            window_size: Some((self.window_size.width, self.window_size.height)),
+            window_position: Some((self.window_pos.x, self.window_pos.y)),
         });
     }
 
@@ -2947,11 +2982,14 @@ impl RunConfigManager {
             keyboard::Key::Character(c)
                 if modifiers.command() && !modifiers.shift() && !modifiers.alt() =>
             {
-                c.as_str()
-                    .chars()
-                    .next()
-                    .filter(|ch| ('1'..='9').contains(ch))
-                    .map(|ch| Message::JumpToWorkspace((ch as u8 - b'1') as usize))
+                match c.as_str().chars().next()? {
+                    ch @ '1'..='9' => Some(Message::JumpToWorkspace((ch as u8 - b'1') as usize)),
+                    's' => Some(Message::SaveConfigurations),
+                    'r' => Some(Message::RunShortcut),
+                    'w' => Some(Message::CloseFocusedPane),
+                    ',' => Some(Message::OpenSettingsModal),
+                    _ => None,
+                }
             }
             _ => None,
         }
@@ -3398,6 +3436,35 @@ impl RunConfigManager {
 
         self.status_message = String::from("Tab closed");
         Task::none()
+    }
+
+    /// Cmd+W: 포커스된 세션 pane을 워크스페이스에서 숨긴다 (`ClosePane`과 동일 효과 —
+    /// 세션 자체는 좌측 목록에 남고 프로세스도 유지된다). Sessions 뷰에서만 동작.
+    fn handle_close_focused_pane(&mut self) -> Task<Message> {
+        if !matches!(self.current_view, ViewMode::Sessions) {
+            return Task::none();
+        }
+        if let Some(tab) = self.workspace_tabs.get_mut(self.selected_tab_index)
+            && let Some(focused) = tab.focused_session()
+        {
+            tab.remove_session(focused);
+            self.status_message = String::from("Session hidden from workspace");
+        }
+        Task::none()
+    }
+
+    /// Cmd+R: 컨텍스트 실행. Sessions 뷰에서 포커스된 세션이 있으면 그 세션을 재실행하고,
+    /// 그 외에는 Configurations 뷰의 선택된 구성을 실행한다 (Run 버튼과 동일 경로).
+    fn handle_run_shortcut(&mut self) -> Task<Message> {
+        if matches!(self.current_view, ViewMode::Sessions)
+            && let Some(focused) = self
+                .workspace_tabs
+                .get(self.selected_tab_index)
+                .and_then(|tab| tab.focused_session())
+        {
+            return self.handle_rerun_session(focused);
+        }
+        self.handle_run_configuration(None)
     }
 
     fn handle_close_pane(&mut self, pane_id: pane_grid::Pane) -> Task<Message> {
@@ -4072,13 +4139,12 @@ impl RunConfigManager {
         )
         .gap(4);
 
-        // 상태 배지 (고정 폭, 완료된 세션만 텍스트 표시 — 실행 중은 점으로 충분)
+        // 상태 배지 (고정 폭 — 압축 라벨 사용: 실행 중엔 라이브 경과시간, 종료 후엔
+        // 짧은 결과. 소요시간까지 담은 풀 라벨은 pane 타이틀이 표시한다.)
+        // Windows 크래시 코드처럼 거대한 exit code("✕ exit -1073741819")도 고정 폭을
+        // 넘지 않도록 표시 문자 수를 배지 폭에 맞춰 자른다 (no-wrap이라 넘치면 이름을 침범).
         let is_failed = matches!(session.status_kind(), SessionStatusKind::Failed(_));
-        let badge_text = if session.is_running {
-            String::new()
-        } else {
-            session.status_badge_label()
-        };
+        let badge_text = crate::utils::truncate_text(&session.status_badge_label_compact(), 11);
         let badge = text(badge_text)
             .size(10)
             .width(Length::Fixed(SESSION_STATUS_BADGE_WIDTH))
@@ -4320,13 +4386,14 @@ impl RunConfigManager {
         content.into()
     }
 
-    /// 오버레이 모달(env/settings/export/import)이 하나라도 열려 있는지.
+    /// 오버레이 모달(env/settings/export/import/삭제확인) 중 하나라도 열려 있는지.
     /// 전역 키보드 단축키를 비활성화해 backdrop 뒤 UI로 입력이 새는 것을 막는 가드.
     fn any_modal_open(&self) -> bool {
         self.env_modal.is_some()
             || self.settings_modal.is_some()
             || self.export_modal.is_some()
             || self.import_modal.is_some()
+            || self.confirm_delete_modal.is_some()
     }
 
     /// 모든 오버레이 모달을 닫는다. 각 모달의 open 핸들러가 "한 번에 하나의 모달만"
@@ -4337,6 +4404,7 @@ impl RunConfigManager {
         self.settings_modal = None;
         self.export_modal = None;
         self.import_modal = None;
+        self.confirm_delete_modal = None;
     }
 
     /// 마우스 이벤트 구독 (드래그 앤 드롭용)
@@ -4458,6 +4526,19 @@ impl RunConfigManager {
             Subscription::none()
         };
 
+        // 삭제 확인 모달: Esc로 취소 (다른 모달과 동일 — 버튼 2개뿐이라 Tab 트랩 불필요).
+        let confirm_delete_keyboard_subscription = if self.confirm_delete_modal.is_some() {
+            event::listen_with(|event, _status, _id| match event {
+                Event::Keyboard(keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Named(keyboard::key::Named::Escape),
+                    ..
+                }) => Some(Message::CancelDeleteConfiguration),
+                _ => None,
+            })
+        } else {
+            Subscription::none()
+        };
+
         let tab_name_edit_subscription = if self.tab_ui.editing_tab_name.is_some() {
             event::listen_with(|event, _status, _id| match event {
                 Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
@@ -4548,6 +4629,13 @@ impl RunConfigManager {
                 Subscription::none()
             };
 
+        // 실행 중 세션이 있을 때만 라이브 경과시간 tick(1초)을 발행한다.
+        let session_timer_subscription = if self.sessions.iter().any(|s| s.is_running) {
+            iced::time::every(Duration::from_secs(1)).map(|_| Message::SessionTimerTick)
+        } else {
+            Subscription::none()
+        };
+
         // 업데이트 확인 중에만 스피너 애니메이션 tick을 발행한다.
         let update_spinner_subscription = if self.is_checking_update {
             iced::time::every(Duration::from_millis(120)).map(|_| Message::UpdateSpinnerTick)
@@ -4563,12 +4651,14 @@ impl RunConfigManager {
             settings_modal_keyboard_subscription,
             export_modal_keyboard_subscription,
             import_modal_keyboard_subscription,
+            confirm_delete_keyboard_subscription,
             tab_name_edit_subscription,
             window_focus_subscription,
             search_open_subscription,
             search_close_subscription,
             search_nav_subscription,
             nav_shortcut_subscription,
+            session_timer_subscription,
             update_spinner_subscription,
             window::open_events().map(Message::WindowOpened),
             window::resize_events().map(|(id, size)| Message::WindowResized(id, size)),
@@ -4646,6 +4736,14 @@ impl RunConfigManager {
                 existing: &self.configurations,
             };
             layers = layers.push(view_import_modal(props));
+        }
+
+        if let Some(modal) = self.confirm_delete_modal.as_ref() {
+            let props = ConfirmDeleteModalView {
+                name: &modal.name,
+                referencing_compounds: &modal.referencing_compounds,
+            };
+            layers = layers.push(view_confirm_delete_modal(props));
         }
 
         layers.width(Length::Fill).height(Length::Fill).into()
@@ -4921,6 +5019,61 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    /// Cmd+<글자> 매핑 헬퍼 — 순수 Cmd일 때의 메시지를 얻는다.
+    fn cmd_shortcut(ch: &str, modifiers: keyboard::Modifiers) -> Option<Message> {
+        RunConfigManager::nav_shortcut_message(&keyboard::Key::Character(ch.into()), modifiers)
+    }
+
+    #[test]
+    fn nav_shortcut_cmd_letters_map_to_actions() {
+        use keyboard::Modifiers;
+        assert!(matches!(
+            cmd_shortcut("s", Modifiers::COMMAND),
+            Some(Message::SaveConfigurations)
+        ));
+        assert!(matches!(
+            cmd_shortcut("r", Modifiers::COMMAND),
+            Some(Message::RunShortcut)
+        ));
+        assert!(matches!(
+            cmd_shortcut("w", Modifiers::COMMAND),
+            Some(Message::CloseFocusedPane)
+        ));
+        assert!(matches!(
+            cmd_shortcut(",", Modifiers::COMMAND),
+            Some(Message::OpenSettingsModal)
+        ));
+        // Shift/Alt 조합과 수식키 없는 입력은 무시 (기존 정책과 동일).
+        for ch in ["s", "r", "w", ","] {
+            assert!(cmd_shortcut(ch, Modifiers::COMMAND | Modifiers::SHIFT).is_none());
+            assert!(cmd_shortcut(ch, Modifiers::COMMAND | Modifiers::ALT).is_none());
+            assert!(cmd_shortcut(ch, Modifiers::empty()).is_none());
+        }
+    }
+
+    #[test]
+    fn close_focused_pane_hides_session_but_keeps_it_in_list() {
+        let (mut app, ids) = manager_with_open_panes(&["a", "b"]);
+        app.current_view = ViewMode::Sessions;
+        // 마지막으로 연 세션(b)이 포커스 상태.
+        let focused = app.workspace_tabs[0].focused_session().unwrap();
+        assert_eq!(focused, ids[1]);
+
+        let _ = app.handle_close_focused_pane();
+
+        // 워크스페이스에서는 사라지고, 세션 목록에는 남는다.
+        assert!(!app.workspace_tabs[0].contains_session(ids[1]));
+        assert!(app.sessions.iter().any(|s| s.id == ids[1]));
+    }
+
+    #[test]
+    fn close_focused_pane_is_noop_outside_sessions_view() {
+        let (mut app, ids) = manager_with_open_panes(&["a"]);
+        app.current_view = ViewMode::Configuration;
+        let _ = app.handle_close_focused_pane();
+        assert!(app.workspace_tabs[0].contains_session(ids[0]));
     }
 
     #[test]

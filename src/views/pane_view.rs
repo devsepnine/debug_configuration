@@ -195,10 +195,9 @@ fn view_pane_content<'a>(
     let session_name =
         current_session.map_or_else(|| String::from("Empty"), |s| s.config_name.clone());
     let session_status = current_session.map(RunSession::status_kind);
-    // 상태 배지는 완료된 세션에만 표시 (실행 중은 점으로 충분).
-    let session_badge = current_session
-        .filter(|session| !session.is_running)
-        .map(RunSession::status_badge_label);
+    // 상태 배지: 실행 중엔 라이브 경과시간("Running 12.3s" — 1초 tick으로 갱신),
+    // 종료 후엔 결과와 소요 시간을 표시한다.
+    let session_badge = current_session.map(RunSession::status_badge_label);
 
     let mut title_controls: Option<(Element<'a, Message>, Element<'a, Message>)> = None;
     let content: Element<'a, Message> = if let Some(session_id) = pane.session_id {

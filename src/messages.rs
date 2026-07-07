@@ -27,8 +27,12 @@ pub enum Message {
     // 구성 관리 메시지
     /// 새 구성 추가
     AddConfiguration,
-    /// 지정된 구성 삭제
-    DeleteConfiguration(Option<usize>),
+    /// 구성 삭제 요청 — 즉시 지우지 않고 확인 모달을 연다 (undo 없는 파괴적 조작)
+    RequestDeleteConfiguration(Option<usize>),
+    /// 삭제 확인 모달의 Delete 확정 → 실제 삭제
+    ConfirmDeleteConfiguration,
+    /// 삭제 확인 모달 취소 (Cancel/X/Esc)
+    CancelDeleteConfiguration,
     /// 지정된 구성 복제 (옵션을 그대로 복사한 새 구성 생성)
     CloneConfiguration(Option<usize>),
     /// 지정된 구성 실행
@@ -350,6 +354,12 @@ pub enum Message {
     UpdateCheckCompleted(Result<crate::services::UpdateOutcome, String>),
     /// 확인 중 로딩 스피너 프레임 진행 (타이머 tick)
     UpdateSpinnerTick,
+    /// 실행 중 세션의 라이브 경과시간 갱신 tick (1초, 상태 변경 없음 — 재렌더 트리거)
+    SessionTimerTick,
+    /// Cmd+R: 컨텍스트 실행 — Sessions 뷰에서 포커스 세션이 있으면 재실행, 아니면 선택 구성 실행
+    RunShortcut,
+    /// Cmd+W: 포커스된 세션 pane을 현재 워크스페이스에서 숨김 (세션은 목록에 유지)
+    CloseFocusedPane,
     /// 인앱 업데이트 설치 시작 (상태바 업데이트 버튼 클릭)
     InstallUpdate,
     /// 인앱 업데이트 다운로드·검증·적용 완료 (성공 시 재실행 계획 포함)

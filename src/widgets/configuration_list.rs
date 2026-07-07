@@ -106,7 +106,8 @@ fn view_configuration_item(
             ICON_DELETE,
             16,
             24,
-            Message::DeleteConfiguration(Some(item_state.index)),
+            // 즉시 삭제하지 않고 확인 모달을 연다 (undo 없는 파괴적 조작).
+            Message::RequestDeleteConfiguration(Some(item_state.index)),
         ),
     ]
     .spacing(4)
