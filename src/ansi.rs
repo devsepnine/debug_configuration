@@ -181,35 +181,77 @@ pub fn parse_ansi_text(text: &str) -> Vec<TextSegment> {
 
     while let Some(ch) = chars.next() {
         if ch == '\x1b' {
-            // ESC 문자를 만나면 ANSI 시퀀스 처리
-            if chars.peek() == Some(&'[') {
-                chars.next(); // '[' 소비
+            // ESC를 만나면 종류별로 시퀀스 전체를 소비한다. PTY 환경(TERM 설정)에서는
+            // 셸/도구가 OSC 타이틀·DCS·커서 제어를 활발히 내보내므로, 시퀀스를 텍스트로
+            // 흘리지 않는 것이 핵심이다 (해석은 여전히 SGR만 — 나머지는 조용히 폐기).
+            match chars.peek() {
+                Some('[') => {
+                    chars.next(); // '[' 소비
 
-                // 현재까지의 텍스트를 세그먼트로 추가
-                if !current_text.is_empty() {
-                    segments.push(TextSegment::with_style(
-                        current_text.clone(),
-                        state.foreground,
-                        state.background,
-                        state.bold,
-                        state.italic,
-                        state.underline,
-                    ));
-                    current_text.clear();
-                }
-
-                // CSI (Control Sequence Introducer) 시퀀스 파싱
-                let mut params = String::new();
-                for next_ch in chars.by_ref() {
-                    if next_ch.is_ascii_alphabetic() {
-                        // 'm' 종료 문자 (SGR - Select Graphic Rendition)
-                        if next_ch == 'm' {
-                            parse_sgr_params(&params, &mut state);
-                        }
-                        break;
+                    // 현재까지의 텍스트를 세그먼트로 추가
+                    if !current_text.is_empty() {
+                        segments.push(TextSegment::with_style(
+                            current_text.clone(),
+                            state.foreground,
+                            state.background,
+                            state.bold,
+                            state.italic,
+                            state.underline,
+                        ));
+                        current_text.clear();
                     }
-                    params.push(next_ch);
+
+                    // CSI 시퀀스: 종료 바이트는 0x40..=0x7E 전 범위 (알파벳만이 아님 —
+                    // `~`(기능키)·`@`(ICH) 등이 종료 문자라 알파벳 판정은 뒤 텍스트를 잠식했다).
+                    let mut params = String::new();
+                    for next_ch in chars.by_ref() {
+                        if ('\u{40}'..='\u{7e}').contains(&next_ch) {
+                            // 'm'(SGR)만 해석, 나머지 CSI는 폐기
+                            if next_ch == 'm' {
+                                parse_sgr_params(&params, &mut state);
+                            }
+                            break;
+                        }
+                        params.push(next_ch);
+                    }
                 }
+                // OSC (ESC ]): BEL(\x07) 또는 ST(ESC \)까지 소비. 라인 단위 파서라
+                // 미종결 OSC는 라인 끝에서 자연 종료된다 (타이틀 설정 `]0;...` 누수 방지).
+                Some(']') => {
+                    chars.next();
+                    while let Some(c) = chars.next() {
+                        if c == '\x07' {
+                            break;
+                        }
+                        if c == '\x1b' && chars.peek() == Some(&'\\') {
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+                // DCS/SOS/PM/APC (ESC P / X / ^ / _): OSC와 동일하게 ST/BEL까지 소비.
+                Some('P') | Some('X') | Some('^') | Some('_') => {
+                    chars.next();
+                    while let Some(c) = chars.next() {
+                        if c == '\x07' {
+                            break;
+                        }
+                        if c == '\x1b' && chars.peek() == Some(&'\\') {
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+                // 문자셋 지정 (ESC ( ) * +): 뒤따르는 1바이트까지 소비.
+                Some('(') | Some(')') | Some('*') | Some('+') => {
+                    chars.next();
+                    chars.next();
+                }
+                // 그 외 단일 문자 ESC 시퀀스 (ESC 7/8/=/>/M/c/D/E/H 등): 1바이트 소비.
+                Some(_) => {
+                    chars.next();
+                }
+                None => {}
             }
         } else {
             current_text.push(ch);
@@ -323,6 +365,48 @@ mod tests {
         assert!(segments[0].foreground.is_some());
         assert_eq!(segments[1].text, " Normal Text");
         assert!(segments[1].foreground.is_none());
+    }
+
+    /// 세그먼트들의 순수 텍스트 결합 (시퀀스 누수 검증용).
+    fn joined(text: &str) -> String {
+        parse_ansi_text(text)
+            .iter()
+            .map(|s| s.text.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn osc_sequences_are_swallowed() {
+        // 타이틀 설정 (BEL 종료) — PTY+TERM 환경에서 셸이 흔히 내보낸다.
+        assert_eq!(joined("\x1b]0;my title\x07hello"), "hello");
+        // ST(ESC \) 종료
+        assert_eq!(
+            joined("\x1b]8;;https://x\x1b\\link\x1b]8;;\x1b\\!"),
+            "link!"
+        );
+        // 미종결 OSC는 라인 끝에서 자연 소멸 (다음 라인을 잠식하지 않음 — 라인 단위 파서)
+        assert_eq!(joined("\x1b]0;unterminated"), "");
+    }
+
+    #[test]
+    fn csi_terminates_on_full_final_byte_range() {
+        // '~'(0x7E)·'@'(0x40)는 알파벳이 아니지만 CSI 종료 바이트 — 과거엔 뒤 텍스트를 잠식했다.
+        assert_eq!(joined("\x1b[200~pasted\x1b[201~"), "pasted");
+        assert_eq!(joined("\x1b[4@after"), "after");
+        // 커서 숨김/표시 (?25l/h) — 폐기되고 텍스트만 남는다.
+        assert_eq!(joined("\x1b[?25lspin\x1b[?25h"), "spin");
+        // 줄 지우기(K)와 SGR 혼합
+        assert_eq!(joined("\x1b[K\x1b[32mok\x1b[0m"), "ok");
+    }
+
+    #[test]
+    fn dcs_charset_and_single_char_escapes_are_swallowed() {
+        // DCS (ESC P … ST)
+        assert_eq!(joined("\x1bPq#0;2;0;0;0#0!~~\x1b\\txt"), "txt");
+        // 문자셋 지정 (ESC ( B) — 뒤 1바이트까지 소비
+        assert_eq!(joined("\x1b(Bplain"), "plain");
+        // 단일 문자 ESC (커서 저장/복원 7/8)
+        assert_eq!(joined("\x1b7save\x1b8"), "save");
     }
 
     #[test]
