@@ -859,9 +859,8 @@ impl<'a> TerminalCanvas<'a> {
     ///
     /// 불변식: `line_counts`는 update 선두의 `rebuild_wrap_cache_if_needed`로 항상 `lines`와
     /// 길이가 일치하므로 슬라이스 경계가 안전하다.
-    /// 한계: `scroll_target`은 `output_lines`의 현재 인덱스라, 실행 중 스트리밍으로 앞쪽 줄이
-    /// evict되면 stale해져 점프가 어긋날 수 있다(드묾·비치명적). 근본 해결은 line_id 기반
-    /// 앵커(deferred)로 다룬다.
+    /// `scroll_target`은 뷰 빌드 시점에 안정 line_id에서 해석된 **이 프레임의 canvas 행**
+    /// 이라(`prepare_lines` 참고), 스트리밍 eviction으로 어긋나지 않는다.
     fn apply_scroll_target(
         &self,
         state: &mut ScrollState,
@@ -1898,7 +1897,7 @@ fn render_key_for(session: &RunSession) -> RenderKey {
 /// # Arguments
 /// * `session` - 렌더링할 세션의 참조
 pub fn view_terminal_for_session(session: &RunSession, is_dragging: bool) -> Element<'_, Message> {
-    let (lines, highlights) = prepare_lines(session);
+    let (lines, highlights, scroll_target_row) = prepare_lines(session);
 
     let canvas = Canvas::new(TerminalCanvas {
         lines,
@@ -1906,7 +1905,8 @@ pub fn view_terminal_for_session(session: &RunSession, is_dragging: bool) -> Ele
         session_id: session.id,
         initial_scroll_progress: session.scroll_progress,
         auto_scroll: session.auto_scroll,
-        scroll_target: session.scroll_target,
+        // 안정 line_id(session.scroll_target)를 이 프레임의 canvas 행으로 해석한 값.
+        scroll_target: scroll_target_row,
         first_line_id: session.output_lines.front().map(|(id, _)| *id),
         last_line_id: session.output_lines.back().map(|(id, _)| *id),
         render_key: render_key_for(session),
@@ -1948,7 +1948,14 @@ pub fn view_terminal_for_session(session: &RunSession, is_dragging: bool) -> Ele
 /// 줄을 표시한다(버퍼가 MAX_OUTPUT_LINES로 상한되고 가상화로 가시 영역만 그리므로 별도
 /// 렌더 상한/"older lines hidden" 헤더는 없다). 줄은 세션 버퍼를 빌려(zero-copy) 전달하며,
 /// 각 출력 라인의 매치 글자 범위로 `LineSearch`(매치/현재 매치 강조)를 부여한다.
-fn prepare_lines(session: &RunSession) -> (Vec<LineRef<'_>>, Vec<LineSearch>) {
+/// 세션 출력에서 canvas에 넘길 (줄, 강조, 검색 점프 목표 행)을 구성한다.
+///
+/// `scroll_target`(안정 line_id)은 여기서 **현재 프레임의 canvas 행 인덱스**로 해석된다 —
+/// 필터 모드(매치 줄만 표시)에서도 실제로 그려지는 행 기준이라 정확하고, 스트리밍으로
+/// 앞쪽 줄이 evict돼도 id 비교라 어긋나지 않는다. 목표 줄이 이미 evict됐거나(드묾)
+/// 필터로 가려졌으면 행 0으로 clamp한다 — 점프가 반드시 1회 적용·소비돼야
+/// `SessionScrollChanged`가 목표를 클리어하고 auto_scroll 판정이 정상 복귀한다.
+fn prepare_lines(session: &RunSession) -> (Vec<LineRef<'_>>, Vec<LineSearch>, Option<usize>) {
     use crate::ansi::TextSegment;
 
     let search = session.search.as_ref();
@@ -1979,6 +1986,8 @@ fn prepare_lines(session: &RunSession) -> (Vec<LineRef<'_>>, Vec<LineSearch>) {
 
     let mut lines: Vec<LineRef<'_>> = Vec::new();
     let mut highlights = Vec::new();
+    let target_id = session.scroll_target;
+    let mut target_row: Option<usize> = None;
 
     if active && filter {
         // 필터 모드: 매치된 라인만(같은 라인의 매치가 여러 개여도 한 줄만, 입력 순서 유지).
@@ -1988,27 +1997,48 @@ fn prepare_lines(session: &RunSession) -> (Vec<LineRef<'_>>, Vec<LineSearch>) {
                 "No lines match \"{query}\""
             ))]));
             highlights.push(LineSearch::default());
-            return (lines, highlights);
+            // 목표 미소비 방지: 안내 줄뿐이어도 목표가 있으면 행 0으로 소비시킨다.
+            return (lines, highlights, target_id.map(|_| 0));
         }
         let mut seen = HashSet::new();
         for m in matches {
             if seen.insert(m.line_idx)
-                && let Some((_, segments)) = session.output_lines.get(m.line_idx)
+                && let Some((line_id, segments)) = session.output_lines.get(m.line_idx)
             {
+                if target_id == Some(*line_id) {
+                    target_row = Some(lines.len());
+                }
                 lines.push(LineRef::Ref(segments));
                 highlights.push(by_line.remove(&m.line_idx).unwrap_or_default());
             }
         }
-        return (lines, highlights);
+        target_row = clamp_unresolved_target(target_id, target_row, lines.len());
+        return (lines, highlights, target_row);
     }
 
     // 일반 모드: 보관된 모든 줄을 빌려서 그대로 표시(zero-copy). 출력 인덱스로 매치 범위 판정.
-    for (output_idx, (_, segments)) in session.output_lines.iter().enumerate() {
+    for (output_idx, (line_id, segments)) in session.output_lines.iter().enumerate() {
+        if target_id == Some(*line_id) {
+            target_row = Some(output_idx);
+        }
         lines.push(LineRef::Ref(segments));
         highlights.push(by_line.remove(&output_idx).unwrap_or_default());
     }
 
-    (lines, highlights)
+    target_row = clamp_unresolved_target(target_id, target_row, lines.len());
+    (lines, highlights, target_row)
+}
+
+/// 점프 목표가 있는데 현재 프레임 행으로 해석되지 못한 경우(evict/필터 가림)
+/// 행 0으로 clamp한다 — 목표는 반드시 1회 적용·소비돼야 `SessionScrollChanged`가
+/// 클리어하고 auto_scroll 판정이 정상 복귀한다. 그릴 줄이 없으면 clamp하지 않는다
+/// (빈 버퍼는 `clear_output`이 목표 자체를 함께 버린다).
+fn clamp_unresolved_target(
+    target_id: Option<usize>,
+    target_row: Option<usize>,
+    line_count: usize,
+) -> Option<usize> {
+    target_row.or_else(|| (target_id.is_some() && line_count > 0).then_some(0))
 }
 
 #[cfg(test)]
@@ -2017,6 +2047,67 @@ mod tests {
     use crate::ansi::TextSegment;
     use iced::Size;
     use iced::widget::canvas::Program as _;
+
+    // ---- 검색 점프 앵커: prepare_lines의 line_id → canvas 행 해석 ----
+
+    /// n개 라인("line 0"..)을 가진 세션. `keep`을 지정하면 그만큼만 보관(FIFO evict 유발).
+    fn session_with_lines(n: usize, keep: Option<usize>) -> RunSession {
+        let mut session = RunSession::new("t".to_string());
+        if let Some(keep) = keep {
+            session.max_output_lines = keep;
+        }
+        for i in 0..n {
+            session.add_output_line(&format!("line {i}"));
+        }
+        session
+    }
+
+    #[test]
+    fn scroll_target_resolves_by_line_id_after_eviction() {
+        // 5줄 추가, 3줄만 보관 → id 0,1 evict, 버퍼엔 id 2,3,4 (행 0,1,2).
+        let mut session = session_with_lines(5, Some(3));
+        session.scroll_target = Some(3); // 안정 id 3 → 현재 행 1
+        let (lines, _, target_row) = prepare_lines(&session);
+        assert_eq!(lines.len(), 3);
+        assert_eq!(
+            target_row,
+            Some(1),
+            "id 3 must resolve to row 1 after eviction"
+        );
+    }
+
+    #[test]
+    fn evicted_scroll_target_clamps_to_row_zero() {
+        let mut session = session_with_lines(5, Some(3));
+        session.scroll_target = Some(0); // 이미 evict된 id → 반드시 소비되도록 행 0
+        let (_, _, target_row) = prepare_lines(&session);
+        assert_eq!(target_row, Some(0));
+    }
+
+    #[test]
+    fn scroll_target_resolves_within_filtered_rows() {
+        // 필터 모드: 매치된 줄만 그려지므로 목표 행도 필터된 목록 기준이어야 한다.
+        let mut session = session_with_lines(6, None); // "line 0".."line 5"
+        session.search = Some(crate::models::SearchState {
+            query: String::from("line 3|line 5"),
+            filter: true,
+            current: 0,
+            regex: true,
+            matches: Vec::new(),
+        });
+        session.refresh_search_matches();
+        session.scroll_target = Some(5); // id 5 ("line 5") → 필터 행 1
+        let (lines, _, target_row) = prepare_lines(&session);
+        assert_eq!(lines.len(), 2, "filter must show only matched lines");
+        assert_eq!(target_row, Some(1));
+    }
+
+    #[test]
+    fn no_scroll_target_yields_no_row() {
+        let session = session_with_lines(3, None);
+        let (_, _, target_row) = prepare_lines(&session);
+        assert_eq!(target_row, None);
+    }
 
     #[test]
     fn match_rect_in_chunk_clips_and_uses_display_width() {

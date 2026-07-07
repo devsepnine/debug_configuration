@@ -12,11 +12,12 @@ use crate::services::{
 use crate::utils::{DIALOG_CANCELLED, ICON_DELETE, ICON_PLAY, ICON_REFRESH, ICON_STOP};
 use crate::views::shared::icon_tooltip;
 use crate::views::{
-    ConfirmDeleteModalView, EditorLoadingState, EditorSelectState, EnvModalView, ExportModalView,
-    FileDialogLoadingState, ImportModalView, NodeLoadingState, SettingsModalView,
-    view_configuration_editor, view_configuration_list, view_confirm_delete_modal, view_env_modal,
-    view_export_modal, view_import_modal, view_main_tabs, view_pane_layout, view_settings_modal,
-    view_toolbar, view_workspace_tab_bar,
+    ConfirmDeleteModalView, ConfirmUpdateModalView, EditorLoadingState, EditorSelectState,
+    EnvModalView, ExportModalView, FileDialogLoadingState, ImportModalView, NodeLoadingState,
+    SettingsModalView, view_configuration_editor, view_configuration_list,
+    view_confirm_delete_modal, view_confirm_update_modal, view_env_modal, view_export_modal,
+    view_import_modal, view_main_tabs, view_pane_layout, view_settings_modal, view_toolbar,
+    view_workspace_tab_bar,
 };
 use crate::widgets::pane_grid;
 use crate::widgets::title_bar_drag::TitleBarDragArea;
@@ -37,12 +38,14 @@ use uuid::Uuid;
 
 mod chrome;
 mod confirm_delete_modal;
+mod confirm_update_modal;
 mod env_modal;
 mod export_modal;
 mod import_modal;
 mod settings_modal;
 
 use confirm_delete_modal::ConfirmDeleteModalState;
+use confirm_update_modal::ConfirmUpdateModalState;
 use env_modal::EnvModalState;
 use export_modal::ExportModalState;
 use import_modal::ImportModalState;
@@ -402,6 +405,8 @@ pub struct RunConfigManager {
     import_modal: Option<ImportModalState>,
     /// 구성 삭제 확인 모달 상태 (`Some`이면 모달 열림)
     confirm_delete_modal: Option<ConfirmDeleteModalState>,
+    /// 인앱 업데이트 확인 모달 상태 (`Some`이면 모달 열림)
+    confirm_update_modal: Option<ConfirmUpdateModalState>,
     /// 설정: 구성 실행 시 Environment 라인 표시 여부
     show_environment_on_run: bool,
     /// 설정: 새 세션의 출력 버퍼 최대 라인 수
@@ -470,14 +475,15 @@ pub struct RunConfigManager {
 }
 
 /// 상태바에 표시할 사용 가능한 업데이트.
+/// (crate 가시성: 자식 모듈 `confirm_update_modal`의 핸들러/테스트가 사용한다.)
 #[derive(Debug, Clone)]
-struct AvailableUpdate {
+pub(crate) struct AvailableUpdate {
     /// 새 버전 (v 접두사 없는 정규화 형태).
-    latest: String,
+    pub(crate) latest: String,
     /// 릴리스 페이지 URL (인앱 설치 불가/실패 시 폴백 진입점).
-    url: String,
+    pub(crate) url: String,
     /// 인앱 설치용 다운로드 정보. 구 릴리스처럼 자산이 없으면 `None`.
-    download: Option<crate::services::UpdateDownload>,
+    pub(crate) download: Option<crate::services::UpdateDownload>,
 }
 
 /// 상태바 업데이트 확인 로딩 스피너 프레임. D2Coding(모노스페이스)에서 항상
@@ -508,6 +514,7 @@ impl RunConfigManager {
             export_modal: None,
             import_modal: None,
             confirm_delete_modal: None,
+            confirm_update_modal: None,
             show_environment_on_run: settings.show_environment_on_run,
             max_output_lines: settings.max_output_lines,
             default_auto_scroll: settings.default_auto_scroll,
@@ -753,7 +760,9 @@ impl RunConfigManager {
             | Message::UpdateCheckCompleted(_)
             | Message::UpdateSpinnerTick
             | Message::SessionTimerTick
-            | Message::InstallUpdate
+            | Message::RequestInstallUpdate
+            | Message::ConfirmInstallUpdate
+            | Message::CancelInstallUpdate
             | Message::UpdateInstallCompleted(_) => self.handle_session_messages(message),
             Message::AddWorkspaceTab
             | Message::JumpToWorkspace(_)
@@ -931,7 +940,9 @@ impl RunConfigManager {
             Message::UpdateSpinnerTick => self.handle_update_spinner_tick(),
             // 상태 변경 없음 — 메시지 수신 자체가 재렌더를 유발해 라이브 경과시간이 갱신된다.
             Message::SessionTimerTick => Task::none(),
-            Message::InstallUpdate => self.handle_install_update(),
+            Message::RequestInstallUpdate => self.handle_request_install_update(),
+            Message::ConfirmInstallUpdate => self.handle_confirm_install_update(),
+            Message::CancelInstallUpdate => self.handle_cancel_install_update(),
             Message::UpdateInstallCompleted(result) => self.handle_update_install_completed(result),
             Message::SessionScrollChanged(session_id, progress, at_bottom) => {
                 self.handle_session_scroll_changed(session_id, progress, at_bottom)
@@ -1410,7 +1421,7 @@ impl RunConfigManager {
 
     fn handle_run_configuration(&mut self, index_opt: Option<usize>) -> Task<Message> {
         // 인앱 업데이트 진행 중에는 새 실행을 막는다 — 설치 성공 시 앱이 재시작되므로
-        // 그 사이 시작된 세션이 경고 없이 종료되는 것을 방지한다 (InstallUpdate 가드의 짝).
+        // 그 사이 시작된 세션이 경고 없이 종료되는 것을 방지한다 (RequestInstallUpdate 가드의 짝).
         if self.is_updating {
             self.status_message = String::from("Update in progress — wait before running");
             return Task::none();
@@ -2937,14 +2948,19 @@ impl RunConfigManager {
         // 매치 라인으로 점프한다. 논리줄 인덱스를 scroll_target에 실어 보내면 터미널 뷰가
         // wrapped offset으로 변환해 스크롤한다(이슈 1). 비율 기반은 wrapping과 어긋날뿐더러
         // 같은 세션에서는 offset에 반영조차 되지 않았다. 자동 추적은 해제.
-        let Some(line) = session
+        let Some(line_idx) = session
             .search
             .as_ref()
             .and_then(|s| s.matches.get(new_current).map(|m| m.line_idx))
         else {
             return Task::none();
         };
-        session.scroll_target = Some(line);
+        // 인덱스가 아니라 안정 line_id를 목표로 저장한다 — 스트리밍 중 앞쪽 줄이
+        // evict돼 인덱스가 밀려도 점프가 어긋나지 않는다 (뷰 빌드 시점에 행으로 해석).
+        let Some(target_id) = session.output_lines.get(line_idx).map(|(id, _)| *id) else {
+            return Task::none();
+        };
+        session.scroll_target = Some(target_id);
         session.auto_scroll = false;
         Task::none()
     }
@@ -3703,11 +3719,11 @@ impl RunConfigManager {
         }
 
         let (label, on_press) = match &self.update_available {
-            // 인앱 설치 가능(자산+서명 존재, 미실패) → 클릭 시 다운로드·설치.
-            // 불가/실패 시에도 InstallUpdate가 릴리스 페이지 열기로 폴백한다.
+            // 인앱 설치 가능(자산+서명 존재, 미실패) → 클릭 시 확인 모달을 거쳐 설치.
+            // 불가/실패 시에는 RequestInstallUpdate가 릴리스 페이지 열기로 폴백한다.
             Some(update) => (
                 format!("v{current} → v{latest} ⬆", latest = update.latest),
-                Message::InstallUpdate,
+                Message::RequestInstallUpdate,
             ),
             None => (format!("v{current}"), Message::CheckForUpdates),
         };
@@ -4386,7 +4402,7 @@ impl RunConfigManager {
         content.into()
     }
 
-    /// 오버레이 모달(env/settings/export/import/삭제확인) 중 하나라도 열려 있는지.
+    /// 오버레이 모달(env/settings/export/import/삭제확인/업데이트확인) 중 하나라도 열려 있는지.
     /// 전역 키보드 단축키를 비활성화해 backdrop 뒤 UI로 입력이 새는 것을 막는 가드.
     fn any_modal_open(&self) -> bool {
         self.env_modal.is_some()
@@ -4394,6 +4410,7 @@ impl RunConfigManager {
             || self.export_modal.is_some()
             || self.import_modal.is_some()
             || self.confirm_delete_modal.is_some()
+            || self.confirm_update_modal.is_some()
     }
 
     /// 모든 오버레이 모달을 닫는다. 각 모달의 open 핸들러가 "한 번에 하나의 모달만"
@@ -4405,6 +4422,7 @@ impl RunConfigManager {
         self.export_modal = None;
         self.import_modal = None;
         self.confirm_delete_modal = None;
+        self.confirm_update_modal = None;
     }
 
     /// 마우스 이벤트 구독 (드래그 앤 드롭용)
@@ -4539,6 +4557,19 @@ impl RunConfigManager {
             Subscription::none()
         };
 
+        // 업데이트 확인 모달: Esc로 취소 (삭제 확인 모달과 동일).
+        let confirm_update_keyboard_subscription = if self.confirm_update_modal.is_some() {
+            event::listen_with(|event, _status, _id| match event {
+                Event::Keyboard(keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Named(keyboard::key::Named::Escape),
+                    ..
+                }) => Some(Message::CancelInstallUpdate),
+                _ => None,
+            })
+        } else {
+            Subscription::none()
+        };
+
         let tab_name_edit_subscription = if self.tab_ui.editing_tab_name.is_some() {
             event::listen_with(|event, _status, _id| match event {
                 Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
@@ -4652,6 +4683,7 @@ impl RunConfigManager {
             export_modal_keyboard_subscription,
             import_modal_keyboard_subscription,
             confirm_delete_keyboard_subscription,
+            confirm_update_keyboard_subscription,
             tab_name_edit_subscription,
             window_focus_subscription,
             search_open_subscription,
@@ -4744,6 +4776,14 @@ impl RunConfigManager {
                 referencing_compounds: &modal.referencing_compounds,
             };
             layers = layers.push(view_confirm_delete_modal(props));
+        }
+
+        if let Some(modal) = self.confirm_update_modal.as_ref() {
+            let props = ConfirmUpdateModalView {
+                current: crate::services::CURRENT_VERSION,
+                latest: &modal.latest,
+            };
+            layers = layers.push(view_confirm_update_modal(props));
         }
 
         layers.width(Length::Fill).height(Length::Fill).into()

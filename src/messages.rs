@@ -360,8 +360,12 @@ pub enum Message {
     RunShortcut,
     /// Cmd+W: 포커스된 세션 pane을 현재 워크스페이스에서 숨김 (세션은 목록에 유지)
     CloseFocusedPane,
-    /// 인앱 업데이트 설치 시작 (상태바 업데이트 버튼 클릭)
-    InstallUpdate,
+    /// 인앱 업데이트 요청 — 즉시 설치하지 않고 확인 모달을 연다 (설치 성공 시 재시작되므로)
+    RequestInstallUpdate,
+    /// 업데이트 확인 모달의 Update 확정 → 실제 설치 시작
+    ConfirmInstallUpdate,
+    /// 업데이트 확인 모달 취소 (Cancel/X/Esc)
+    CancelInstallUpdate,
     /// 인앱 업데이트 다운로드·검증·적용 완료 (성공 시 재실행 계획 포함)
     UpdateInstallCompleted(Result<crate::services::RelaunchPlan, String>),
 

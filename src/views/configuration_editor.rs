@@ -872,6 +872,52 @@ pub fn view_confirm_delete_modal<'a>(props: ConfirmDeleteModalView<'a>) -> Eleme
     modal_dialog(content.into(), 420.0, 230.0)
 }
 
+/// 인앱 업데이트 확인 모달 뷰 모델.
+pub struct ConfirmUpdateModalView<'a> {
+    /// 현재 버전 (v 접두사 없는 형태).
+    pub current: &'a str,
+    /// 설치할 새 버전 (v 접두사 없는 형태).
+    pub latest: &'a str,
+}
+
+/// 인앱 업데이트 확인 모달. 설치가 성공하면 앱이 곧바로 재시작되므로 확인을 받는다.
+/// 다른 확인 모달과 동일한 오버레이 패턴이며 Update / Cancel / X / Esc 로만 닫힌다.
+pub fn view_confirm_update_modal<'a>(props: ConfirmUpdateModalView<'a>) -> Element<'a, Message> {
+    let header = row![
+        text("Update Available").size(15),
+        Space::new().width(Length::Fill),
+        icon_button(ICON_CLOSE, Some(Message::CancelInstallUpdate)),
+    ]
+    .align_y(Alignment::Center)
+    .width(Length::Fill);
+
+    let body = column![
+        text(format!(
+            "Update from v{} to v{}?",
+            props.current, props.latest
+        ))
+        .size(13),
+        text("The app will restart automatically to finish the update.")
+            .size(12)
+            .color(Color::from_rgba8(255, 255, 255, 0.55)),
+    ]
+    .spacing(6);
+
+    let content = column![
+        header,
+        Space::new().height(12),
+        body,
+        Space::new().height(16),
+        modal_footer(
+            Message::CancelInstallUpdate,
+            "Update",
+            Some(Message::ConfirmInstallUpdate),
+        ),
+    ];
+
+    modal_dialog(content.into(), 420.0, 210.0)
+}
+
 /// 구성 내보내기 모달 뷰 모델 (app의 staging 선택 상태를 참조로 전달).
 pub struct ExportModalView<'a> {
     pub configurations: &'a [RunConfiguration],

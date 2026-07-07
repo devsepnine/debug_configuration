@@ -29,7 +29,7 @@ const MAX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 /// 단일 줄의 최대 저장 바이트. 개행 없는 초대형 줄 하나가 바이트 예산·폭 계산을 한 번에
 /// 폭증시키지 못하도록, 이 크기를 넘는 줄은 char 경계에서 잘라 마커를 붙여 저장한다.
 /// (executor의 1 MiB per-line read 상한보다 작은 표시/저장 상한.)
-const MAX_LINE_BYTES: usize = 64 * 1024;
+const MAX_STORED_LINE_BYTES: usize = 64 * 1024;
 
 /// 잘린 줄 끝에 붙는 마커.
 const TRUNCATED_MARKER: &str = "…[truncated]";
@@ -144,8 +144,10 @@ pub struct RunSession {
     pub process_pid: Option<u32>,
     /// 출력 검색/필터 상태 (검색바가 열려 있으면 `Some`)
     pub search: Option<SearchState>,
-    /// 검색 점프 1회성 목표 (논리줄 인덱스). 터미널 뷰가 이 값을 읽어 wrapped offset으로
-    /// 변환해 스크롤한 뒤, `SessionScrollChanged` 핸들러에서 `None`으로 클리어한다.
+    /// 검색 점프 1회성 목표 (**안정 line_id** — `output_lines`의 튜플 첫 요소).
+    /// 뷰 빌드 시점에 현재 canvas 행으로 해석되므로, 스트리밍 중 앞쪽 줄이 evict돼도
+    /// 목표가 어긋나지 않는다. 터미널 뷰가 wrapped offset으로 변환해 스크롤한 뒤
+    /// `SessionScrollChanged` 핸들러에서 `None`으로 클리어한다.
     /// (app→terminal 역방향 스크롤 명령 경로 — 비율 기반으론 매치로 점프가 안 됐다)
     pub scroll_target: Option<usize>,
     /// 컨트롤 오버플로 메뉴(⋯) 열림 여부. pane이 좁아 전체 컨트롤 버튼이 들어가지
@@ -281,10 +283,18 @@ impl RunSession {
 
         // \n으로 분리하여 각 줄을 별도로 추가
         for single_line in line.split('\n') {
+            // CR 덮어쓰기 시맨틱: 진행바(cargo/npm/pip)는 "10%\r50%\r100%"처럼 같은 줄을
+            // \r로 되감아 다시 그린다. 터미널처럼 커서를 옮길 수 없으므로 마지막 \r 이후
+            // 내용(=최종 상태)만 남긴다 — 그대로 두면 모든 중간 상태가 한 줄에 이어붙어
+            // 로그가 오염된다. (\r 앞에 오는 \x1b[K 등 지우기 시퀀스는 ANSI 파서가 소비한다)
+            // 끝의 bare \r은 "아직 아무것도 덮어쓰지 않음"이므로 먼저 제거한다 —
+            // 안 그러면 "42%\r"가 빈 줄로 붕괴해 마지막 상태를 잃는다.
+            let single_line = single_line.trim_end_matches('\r');
+            let single_line = single_line.rsplit('\r').next().unwrap_or(single_line);
             // 초대형 단일 줄은 char 경계에서 잘라 저장(바이트 예산·폭 계산 폭증 방지).
             let truncated;
-            let stored: &str = if single_line.len() > MAX_LINE_BYTES {
-                let mut end = MAX_LINE_BYTES;
+            let stored: &str = if single_line.len() > MAX_STORED_LINE_BYTES {
+                let mut end = MAX_STORED_LINE_BYTES;
                 while end > 0 && !single_line.is_char_boundary(end) {
                     end -= 1;
                 }
@@ -307,7 +317,7 @@ impl RunSession {
             // 줄 수와 바이트 예산을 모두 만족할 때까지 앞에서 제거(FIFO, O(1) per pop).
             // 방금 추가한 줄 하나만 남을 때까지는 비우지 않는다(최소 1줄 유지).
             // worst-case: 단일 줄이 예산을 넘으면 total_bytes가 MAX_OUTPUT_BYTES + 마지막 줄
-            // 크기(≤ MAX_LINE_BYTES + 마커)까지 일시 초과한다 — 버퍼를 완전히 비우는 것보다
+            // 크기(≤ MAX_STORED_LINE_BYTES + 마커)까지 일시 초과한다 — 버퍼를 완전히 비우는 것보다
             // 1줄 유지가 낫다는 의도적 트레이드오프이며, 메모리는 여전히 상수로 묶인다.
             while self.output_lines.len() > self.max_output_lines
                 || (self.total_bytes > MAX_OUTPUT_BYTES && self.output_lines.len() > 1)
@@ -327,6 +337,9 @@ impl RunSession {
     pub fn clear_output(&mut self) {
         self.output_lines.clear();
         self.total_bytes = 0;
+        // 점프할 대상이 사라졌으므로 1회성 목표도 함께 버린다 — 남겨두면 빈 버퍼에선
+        // 소비(clamp)가 게이트돼 영영 Some으로 남아 auto_scroll 판정을 계속 우회시킨다.
+        self.scroll_target = None;
         self.content_version = self.content_version.wrapping_add(1);
     }
 
@@ -557,7 +570,7 @@ mod tests {
     #[test]
     fn long_line_is_truncated_with_marker() {
         let mut session = RunSession::new("x".to_string());
-        let huge = "a".repeat(200 * 1024); // 200KB > MAX_LINE_BYTES(64KB)
+        let huge = "a".repeat(200 * 1024); // 200KB > MAX_STORED_LINE_BYTES(64KB)
         session.add_output_line(&huge);
 
         let stored: String = session
@@ -573,7 +586,7 @@ mod tests {
             "초대형 줄은 truncation 마커로 끝나야 함"
         );
         assert!(
-            stored.len() <= MAX_LINE_BYTES + TRUNCATED_MARKER.len(),
+            stored.len() <= MAX_STORED_LINE_BYTES + TRUNCATED_MARKER.len(),
             "저장 길이가 상한 + 마커 이내여야 함 (got {})",
             stored.len()
         );
@@ -615,6 +628,67 @@ mod tests {
 
         session.exit_code = None; // 사용자 중지
         assert_eq!(session.status_kind(), SessionStatusKind::Stopped);
+    }
+
+    /// 저장된 라인의 순수 텍스트 (세그먼트 join) — CR 붕괴 검증용.
+    fn line_text_at(session: &RunSession, idx: usize) -> String {
+        session.output_lines[idx]
+            .1
+            .iter()
+            .map(|seg| seg.text.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn cr_collapses_progress_bar_to_final_state() {
+        // cargo/npm 진행바 형태: 같은 줄을 \r로 되감아 재그림 → 최종 상태만 남는다.
+        let mut session = RunSession::new("x".to_string());
+        session.add_output_line("Downloading 10%\rDownloading 55%\rDownloading 100%");
+        assert_eq!(session.output_lines.len(), 1);
+        assert_eq!(line_text_at(&session, 0), "Downloading 100%");
+    }
+
+    #[test]
+    fn cr_collapse_respects_newline_boundaries() {
+        let mut session = RunSession::new("x".to_string());
+        session.add_output_line("a\rb\nc");
+        assert_eq!(session.output_lines.len(), 2);
+        assert_eq!(line_text_at(&session, 0), "b");
+        assert_eq!(line_text_at(&session, 1), "c");
+    }
+
+    #[test]
+    fn trailing_bare_cr_preserves_last_content() {
+        // 청크 경계/EOF가 \r 직후에 떨어진 경우 — 아직 덮어쓴 내용이 없으므로
+        // 마지막 상태를 보존해야 한다 (빈 줄로 붕괴 금지).
+        let mut session = RunSession::new("x".to_string());
+        session.add_output_line("Downloading 42%\r");
+        assert_eq!(line_text_at(&session, 0), "Downloading 42%");
+
+        let mut session = RunSession::new("x".to_string());
+        session.add_output_line("a\rb\r\r\r");
+        assert_eq!(line_text_at(&session, 0), "b");
+    }
+
+    #[test]
+    fn clear_output_drops_pending_scroll_target() {
+        // Clear Log 시 1회성 점프 목표도 함께 버린다 — 남으면 빈 버퍼에서 소비되지
+        // 못해 auto_scroll 판정을 계속 우회시킨다 (리뷰 회귀 테스트).
+        let mut session = RunSession::new("x".to_string());
+        session.add_output_line("hello");
+        session.scroll_target = Some(0);
+        session.clear_output();
+        assert!(session.scroll_target.is_none());
+    }
+
+    #[test]
+    fn cr_with_erase_sequence_keeps_clean_final_text() {
+        // "\r\x1b[K" (줄 되감기 + 지우기) — 지우기 시퀀스는 ANSI 파서가 소비해
+        // 최종 텍스트만 남는다.
+        let mut session = RunSession::new("x".to_string());
+        session.add_output_line("building 3/10\r\x1b[Kbuilding 10/10 done");
+        assert_eq!(session.output_lines.len(), 1);
+        assert_eq!(line_text_at(&session, 0), "building 10/10 done");
     }
 
     #[test]
