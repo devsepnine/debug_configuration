@@ -14,8 +14,6 @@ pub enum OutputEvent {
     /// 새 라인 추가 (확정된 라인, 또는 새로 열린 라이브 라인)
     Line(String),
     /// 가장 최근에 추가된 라인의 내용 교체 (라이브 진행바 갱신)
-    // TODO(v0.5.0 슬라이스3): PTY LineAssembler가 생성자 — 그 전까지 임시 allow.
-    #[allow(dead_code)]
     Replace(String),
 }
 
