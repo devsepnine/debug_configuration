@@ -46,7 +46,12 @@ Rust와 iced GUI 프레임워크로 개발되었으며, 여러 프로그램 실�
 
 ### 실행 세션 관리
 - 다중 세션 동시 실행
-- 실시간 출력 표시 (ANSI 색상 지원)
+- macOS/Linux에서 진짜 PTY 실행: 프로그램이 터미널을 감지해 색상·진행바·
+  대화형 프롬프트가 실제 셸처럼 동작 (`TERM=xterm-256color`, 뷰포트 연동 resize)
+- 라이브 한 줄 진행바 (캐리지 리턴 재그리기를 제자리에서 렌더)
+- 세션별 stdin 입력바 (토글 버튼 또는 Cmd+I): 프롬프트 응답·REPL 입력 —
+  PTY가 에코를 자연 처리, Windows(pipe)는 앱이 로컬 에코
+- 실시간 출력 표시 (ANSI 색상 지원; OSC/DCS 제어 시퀀스는 걸러냄)
 - 세션 재실행, 중지, 제거, 워크스페이스에서 숨김
 - 완료된 세션의 상태 배지 (성공 / 실패 종료 코드 / 실행 시간)
 - 창이 비활성 상태에서 실행이 끝나면 데스크톱 알림
@@ -220,6 +225,19 @@ open /Applications/RunConfigManager.app
 - **Linux**: `~/.config/run_config_manager/configs.json`
 - **macOS**: `~/Library/Application Support/run_config_manager/configs.json`
 - **Windows**: `%APPDATA%\run_config_manager\configs.json`
+
+## 알려진 한계
+
+- **풀스크린 TUI 앱은 비지원**: 터미널이 스크린 그리드가 아니라 라인 스크롤백
+  렌더러라 `vim`, `htop`, `less` 같은 alt-screen 프로그램은 화면이 깨집니다
+  (앱은 정상 동작 — Stop으로 복구). `input()`, `read`, REPL 같은 라인 기반
+  대화형 프롬프트는 동작합니다.
+- **Windows는 pipe로 실행** (ConPTY는 후속 예정): 색상/진행바는 도구의 비-tty
+  출력 지원에 따르고, stdin 입력은 로컬 에코로 동작합니다. `-NonInteractive`
+  제거로 예기치 않은 PowerShell 프롬프트가 대기(행처럼 보임)할 수 있습니다 —
+  Stop으로 종료하세요.
+- macOS/Linux에서 `sh -l` + 진짜 tty 조합이라 셸 프로파일의 배너가 세션 출력에
+  나타날 수 있습니다.
 
 ## 종료 처리
 

@@ -46,7 +46,12 @@ Rust と iced GUI フレームワークで開発されたクロスプラット�
 
 ### 実行セッション管理
 - 複数セッションの同時実行
-- リアルタイム出力表示 (ANSI カラー対応)
+- macOS/Linux では本物の PTY 実行: プログラムが端末を検出し、色・進捗バー・
+  対話プロンプトが実シェル同様に動作 (`TERM=xterm-256color`、ビューポート連動リサイズ)
+- ライブ 1 行進捗バー (キャリッジリターンの再描画をその場でレンダリング)
+- セッションごとの stdin 入力バー (トグルボタンまたは Cmd+I): プロンプト応答や
+  REPL 入力 — PTY がエコーを自然に処理、Windows (pipe) はアプリがローカルエコー
+- リアルタイム出力表示 (ANSI カラー対応; OSC/DCS 制御シーケンスは除去)
 - セッションの再実行、停止、削除、ワークスペースから非表示
 - 終了セッションのステータスバッジ (成功 / 失敗時の終了コード / 実行時間)
 - ウィンドウが非アクティブな状態で実行完了したときのデスクトップ通知
@@ -220,6 +225,19 @@ open /Applications/RunConfigManager.app
 - **Linux**: `~/.config/run_config_manager/configs.json`
 - **macOS**: `~/Library/Application Support/run_config_manager/configs.json`
 - **Windows**: `%APPDATA%\run_config_manager\configs.json`
+
+## 既知の制限
+
+- **フルスクリーン TUI アプリは対象外**: 端末はスクリーングリッドではなく
+  行スクロールバックのレンダラーのため、`vim`、`htop`、`less` などの
+  alt-screen プログラムは表示が崩れます (アプリ自体は正常 — Stop で復旧)。
+  `input()`、`read`、REPL などの行ベースの対話プロンプトは動作します。
+- **Windows は pipe で実行** (ConPTY は今後対応予定): 色/進捗はツールの非 tty
+  出力対応に依存し、stdin 入力はローカルエコーで動作します。`-NonInteractive`
+  を外したため、予期しない PowerShell プロンプトが待機 (ハングのように見える)
+  することがあります — Stop で終了してください。
+- macOS/Linux では `sh -l` + 本物の tty のため、シェルプロファイルのバナーが
+  セッション出力に現れることがあります。
 
 ## 終了処理
 
