@@ -8,5 +8,5 @@ pub use configuration::{
 };
 pub use pane::{LayoutId, Pane, WorkspaceTab};
 pub use session::{
-    DEFAULT_MAX_OUTPUT_LINES, RunSession, SearchMatch, SearchState, SessionStatusKind,
+    DEFAULT_MAX_OUTPUT_LINES, OutputEvent, RunSession, SearchMatch, SearchState, SessionStatusKind,
 };

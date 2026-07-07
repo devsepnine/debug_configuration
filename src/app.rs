@@ -2491,21 +2491,24 @@ impl RunConfigManager {
         Task::none()
     }
 
-    fn handle_output_received(&mut self, session_id: Uuid, output: &str) -> Task<Message> {
+    fn handle_output_received(
+        &mut self,
+        session_id: Uuid,
+        events: &[crate::models::OutputEvent],
+    ) -> Task<Message> {
         if let Some(session) = self.session_by_id_mut(session_id) {
-            // `output`은 단일 줄이 아니라 executor가 묶어 보낸 멀티라인 배치일 수 있다
-            // (process_output_loop의 출력 coalescing — UI 메시지 폭주 방지). `lines()`로
-            // 분할해 줄 단위로 누적한다(add_output_line이 내부에서 '\n' 재분할). 배치는
-            // 항상 trailing '\n'으로 끝나며 `lines()`가 이를 무시하므로 빈 줄은 생기지 않는다.
-            for line in output.lines() {
-                session.add_output_line(line);
+            // executor가 묶어 보낸 이벤트 배치 (process_output_loop의 coalescing —
+            // UI 메시지 폭주 방지). Line=추가, Replace=마지막 라인 교체(라이브 진행바).
+            for event in events {
+                session.apply_output_event(event);
             }
 
             if session.auto_scroll {
                 session.scroll_progress = 1.0;
             }
 
-            // 출력이 바뀌었으니 검색 매치 캐시 갱신 (검색바 열려 있을 때만).
+            // 출력이 바뀌었으니 검색 매치 캐시 갱신 — 배치당 1회 (이벤트당 금지: 라이브
+            // 진행바는 초당 수십 배치라 O(버퍼) 스캔이 곱해진다). search 닫힘 시 no-op.
             if session.search.is_some() {
                 session.refresh_search_matches();
             }

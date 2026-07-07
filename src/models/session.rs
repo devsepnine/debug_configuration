@@ -4,6 +4,21 @@ use std::sync::{Arc, atomic::AtomicBool};
 use std::time::{Duration, SystemTime};
 use uuid::Uuid;
 
+/// 실행 스트림이 앱으로 전달하는 출력 이벤트 하나.
+///
+/// `Replace`는 직전에 추가된 라인을 통째로 교체한다 — PTY 환경에서 진행바가
+/// `\r`로 같은 줄을 되감아 재그리는 것을 라이브로 렌더하기 위한 시맨틱.
+/// (pipes 경로는 `Line`만 방출한다.)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OutputEvent {
+    /// 새 라인 추가 (확정된 라인, 또는 새로 열린 라이브 라인)
+    Line(String),
+    /// 가장 최근에 추가된 라인의 내용 교체 (라이브 진행바 갱신)
+    // TODO(v0.5.0 슬라이스3): PTY LineAssembler가 생성자 — 그 전까지 임시 allow.
+    #[allow(dead_code)]
+    Replace(String),
+}
+
 /// 세션의 현재 상태 (배지 표시용).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionStatusKind {
@@ -279,33 +294,9 @@ impl RunSession {
     /// # Arguments
     /// * `line` - 추가할 출력 라인 (\n이 포함된 경우 여러 줄로 분리됨)
     pub fn add_output_line(&mut self, line: &str) {
-        use crate::ansi::parse_ansi_text;
-
         // \n으로 분리하여 각 줄을 별도로 추가
         for single_line in line.split('\n') {
-            // CR 덮어쓰기 시맨틱: 진행바(cargo/npm/pip)는 "10%\r50%\r100%"처럼 같은 줄을
-            // \r로 되감아 다시 그린다. 터미널처럼 커서를 옮길 수 없으므로 마지막 \r 이후
-            // 내용(=최종 상태)만 남긴다 — 그대로 두면 모든 중간 상태가 한 줄에 이어붙어
-            // 로그가 오염된다. (\r 앞에 오는 \x1b[K 등 지우기 시퀀스는 ANSI 파서가 소비한다)
-            // 끝의 bare \r은 "아직 아무것도 덮어쓰지 않음"이므로 먼저 제거한다 —
-            // 안 그러면 "42%\r"가 빈 줄로 붕괴해 마지막 상태를 잃는다.
-            let single_line = single_line.trim_end_matches('\r');
-            let single_line = single_line.rsplit('\r').next().unwrap_or(single_line);
-            // 초대형 단일 줄은 char 경계에서 잘라 저장(바이트 예산·폭 계산 폭증 방지).
-            let truncated;
-            let stored: &str = if single_line.len() > MAX_STORED_LINE_BYTES {
-                let mut end = MAX_STORED_LINE_BYTES;
-                while end > 0 && !single_line.is_char_boundary(end) {
-                    end -= 1;
-                }
-                truncated = format!("{}{TRUNCATED_MARKER}", &single_line[..end]);
-                &truncated
-            } else {
-                single_line
-            };
-
-            // ANSI 색상 코드를 파싱하여 텍스트 세그먼트로 변환
-            let segments = parse_ansi_text(stored);
+            let segments = Self::normalize_line(single_line);
             let bytes = segments_bytes(&segments);
 
             // 고유 ID와 함께 새 라인 추가
@@ -313,24 +304,77 @@ impl RunSession {
             self.next_line_id += 1;
             self.output_lines.push_back((line_id, segments));
             self.total_bytes += bytes;
-
-            // 줄 수와 바이트 예산을 모두 만족할 때까지 앞에서 제거(FIFO, O(1) per pop).
-            // 방금 추가한 줄 하나만 남을 때까지는 비우지 않는다(최소 1줄 유지).
-            // worst-case: 단일 줄이 예산을 넘으면 total_bytes가 MAX_OUTPUT_BYTES + 마지막 줄
-            // 크기(≤ MAX_STORED_LINE_BYTES + 마커)까지 일시 초과한다 — 버퍼를 완전히 비우는 것보다
-            // 1줄 유지가 낫다는 의도적 트레이드오프이며, 메모리는 여전히 상수로 묶인다.
-            while self.output_lines.len() > self.max_output_lines
-                || (self.total_bytes > MAX_OUTPUT_BYTES && self.output_lines.len() > 1)
-            {
-                if let Some((_, evicted)) = self.output_lines.pop_front() {
-                    self.total_bytes = self.total_bytes.saturating_sub(segments_bytes(&evicted));
-                } else {
-                    break;
-                }
-            }
+            self.evict_over_budget();
         }
         // 콘텐츠가 바뀌었으니 wrap 캐시 무효화 키를 올린다.
         self.content_version = self.content_version.wrapping_add(1);
+    }
+
+    /// 실행 스트림 이벤트 1건 적용 (`Line`=추가, `Replace`=마지막 라인 교체).
+    pub fn apply_output_event(&mut self, event: &OutputEvent) {
+        match event {
+            OutputEvent::Line(text) => self.add_output_line(text),
+            OutputEvent::Replace(text) => self.replace_last_line(text),
+        }
+    }
+
+    /// 가장 최근에 추가된 라인의 내용을 교체한다 (라이브 진행바 갱신).
+    /// line_id를 **재사용**해 keyed 렌더/wrap 캐시의 증분 판정("마지막 줄만 변경")이
+    /// 성립하게 한다. 버퍼가 비어 있으면 추가로 폴백한다 (방어적).
+    pub fn replace_last_line(&mut self, line: &str) {
+        let Some((line_id, old_segments)) = self.output_lines.pop_back() else {
+            self.add_output_line(line);
+            return;
+        };
+        self.total_bytes = self
+            .total_bytes
+            .saturating_sub(segments_bytes(&old_segments));
+        let segments = Self::normalize_line(line);
+        self.total_bytes += segments_bytes(&segments);
+        self.output_lines.push_back((line_id, segments));
+        self.evict_over_budget();
+        self.content_version = self.content_version.wrapping_add(1);
+    }
+
+    /// 단일 라인 정규화 공통 경로: CR 붕괴 → 크기 제한 → ANSI 파싱.
+    /// add/replace 양쪽이 공유해 방어(특히 `\r` collapse)가 대칭이 되게 한다.
+    fn normalize_line(single_line: &str) -> Vec<TextSegment> {
+        use crate::ansi::parse_ansi_text;
+
+        // CR 덮어쓰기 시맨틱: 진행바(cargo/npm/pip)는 "10%\r50%\r100%"처럼 같은 줄을
+        // \r로 되감아 다시 그린다. 마지막 \r 이후 내용(=최종 상태)만 남긴다 — 전체 라인
+        // 교체 근사(문자단위 col0 덮어쓰기 아님). LineAssembler가 \r를 소비하는 PTY
+        // 경로에서도 방어선으로 유지한다. 끝의 bare \r은 "아직 아무것도 덮어쓰지 않음"
+        // 이므로 먼저 제거한다 ("42%\r"가 빈 줄로 붕괴하는 것 방지).
+        let single_line = single_line.trim_end_matches('\r');
+        let single_line = single_line.rsplit('\r').next().unwrap_or(single_line);
+        // 초대형 단일 줄은 char 경계에서 잘라 저장(바이트 예산·폭 계산 폭증 방지).
+        let truncated;
+        let stored: &str = if single_line.len() > MAX_STORED_LINE_BYTES {
+            let mut end = MAX_STORED_LINE_BYTES;
+            while end > 0 && !single_line.is_char_boundary(end) {
+                end -= 1;
+            }
+            truncated = format!("{}{TRUNCATED_MARKER}", &single_line[..end]);
+            &truncated
+        } else {
+            single_line
+        };
+        parse_ansi_text(stored)
+    }
+
+    /// 줄 수/바이트 예산 초과분을 앞에서 제거(FIFO, O(1) per pop).
+    /// 마지막 1줄은 유지 — worst-case 초과 폭은 MAX_OUTPUT_BYTES + 줄 상한(의도적 트레이드오프).
+    fn evict_over_budget(&mut self) {
+        while self.output_lines.len() > self.max_output_lines
+            || (self.total_bytes > MAX_OUTPUT_BYTES && self.output_lines.len() > 1)
+        {
+            if let Some((_, evicted)) = self.output_lines.pop_front() {
+                self.total_bytes = self.total_bytes.saturating_sub(segments_bytes(&evicted));
+            } else {
+                break;
+            }
+        }
     }
 
     /// 출력 버퍼 초기화
@@ -637,6 +681,56 @@ mod tests {
             .iter()
             .map(|seg| seg.text.as_str())
             .collect()
+    }
+
+    #[test]
+    fn replace_last_line_swaps_content_keeping_line_id() {
+        let mut session = RunSession::new("x".to_string());
+        session.add_output_line("building 10%");
+        let (id_before, _) = session.output_lines[0].clone();
+        let bytes_before = session.total_bytes;
+        let version_before = session.content_version;
+
+        session.replace_last_line("building 100% done");
+
+        assert_eq!(session.output_lines.len(), 1);
+        let (id_after, _) = &session.output_lines[0];
+        assert_eq!(
+            *id_after, id_before,
+            "line_id must be reused (keyed render)"
+        );
+        assert_eq!(line_text_at(&session, 0), "building 100% done");
+        assert_ne!(session.total_bytes, bytes_before);
+        assert!(session.content_version > version_before);
+    }
+
+    #[test]
+    fn replace_last_line_on_empty_appends() {
+        let mut session = RunSession::new("x".to_string());
+        session.replace_last_line("hello");
+        assert_eq!(session.output_lines.len(), 1);
+        assert_eq!(line_text_at(&session, 0), "hello");
+    }
+
+    #[test]
+    fn replace_last_line_applies_cr_collapse_defense() {
+        // 방어 대칭: Replace 텍스트에 \r가 섞여 와도 add와 동일하게 붕괴한다.
+        let mut session = RunSession::new("x".to_string());
+        session.add_output_line("start");
+        session.replace_last_line("10%\r99%\r");
+        assert_eq!(line_text_at(&session, 0), "99%");
+    }
+
+    #[test]
+    fn apply_output_event_routes_line_and_replace() {
+        use super::OutputEvent;
+        let mut session = RunSession::new("x".to_string());
+        session.apply_output_event(&OutputEvent::Line(String::from("a")));
+        session.apply_output_event(&OutputEvent::Line(String::from("b")));
+        session.apply_output_event(&OutputEvent::Replace(String::from("B")));
+        assert_eq!(session.output_lines.len(), 2);
+        assert_eq!(line_text_at(&session, 0), "a");
+        assert_eq!(line_text_at(&session, 1), "B");
     }
 
     #[test]

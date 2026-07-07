@@ -356,7 +356,10 @@ async fn send_command_info(
     let _ = writeln!(command_info, "Command: {command_str}");
     command_info.push_str("═══════════════════════════════════════════════════════\n");
     let _ = output
-        .send(Message::OutputReceived(session_id, command_info))
+        .send(Message::OutputReceived(
+            session_id,
+            lines_to_events(&command_info),
+        ))
         .await;
 }
 
@@ -595,6 +598,15 @@ fn accumulate_line(
     }
 }
 
+/// 배치 문자열(줄마다 trailing '\n')을 `Line` 이벤트 벡터로 변환.
+/// pipes 경로는 Replace를 만들지 않는다 — PTY 경로의 LineAssembler가 담당.
+fn lines_to_events(payload: &str) -> Vec<crate::models::OutputEvent> {
+    payload
+        .lines()
+        .map(|line| crate::models::OutputEvent::Line(line.to_string()))
+        .collect()
+}
+
 /// 누적된 배치를 한 개의 `OutputReceived` 메시지로 전송하고 버퍼를 비운다. 비어 있으면 no-op.
 async fn flush_batch(
     output: &mut iced::futures::channel::mpsc::Sender<Message>,
@@ -610,7 +622,10 @@ async fn flush_batch(
     let payload = std::mem::take(batch);
     *batch_lines = 0;
     let _ = output
-        .send(Message::OutputReceived(session_id, payload))
+        .send(Message::OutputReceived(
+            session_id,
+            lines_to_events(&payload),
+        ))
         .await;
 }
 
@@ -1233,12 +1248,20 @@ mod tests {
             messages.push(msg);
         }
 
-        // 내용/순서 보존: 모든 OutputReceived 페이로드를 이어 붙이면 원본과 동일해야 한다
+        // 내용/순서 보존: 모든 OutputReceived 이벤트(Line)를 이어 붙이면 원본과 동일해야 한다
         // (EOF 시 잔여 부분 배치 flush가 누락 없이 마지막 줄들까지 보내는지도 검증).
         let mut reconstructed = String::new();
         for msg in &messages {
-            if let Message::OutputReceived(_, payload) = msg {
-                reconstructed.push_str(payload);
+            if let Message::OutputReceived(_, events) = msg {
+                for event in events {
+                    match event {
+                        crate::models::OutputEvent::Line(text)
+                        | crate::models::OutputEvent::Replace(text) => {
+                            reconstructed.push_str(text);
+                            reconstructed.push('\n');
+                        }
+                    }
+                }
             }
         }
         let expected: String = (0..200).map(|i| format!("line{i}\n")).collect();
@@ -1307,8 +1330,16 @@ mod tests {
             drop(tx);
             let mut out = String::new();
             while let Some(msg) = rx.next().await {
-                if let Message::OutputReceived(_, s) = msg {
-                    out.push_str(&s);
+                if let Message::OutputReceived(_, events) = msg {
+                    for event in events {
+                        match event {
+                            crate::models::OutputEvent::Line(text)
+                            | crate::models::OutputEvent::Replace(text) => {
+                                out.push_str(&text);
+                                out.push('\n');
+                            }
+                        }
+                    }
                 }
             }
             out

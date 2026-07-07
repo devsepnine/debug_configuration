@@ -232,8 +232,8 @@ pub enum Message {
     // 실행 세션 메시지
     /// 프로세스 시작됨 (세션 ID, PID) - Drop cleanup을 위한 PID 추적
     ProcessStarted(Uuid, u32),
-    /// 프로세스 출력 수신 (세션 ID, 출력 텍스트)
-    OutputReceived(Uuid, String),
+    /// 프로세스 출력 수신 (세션 ID, 출력 이벤트 배치 — Line=추가, Replace=마지막 라인 교체)
+    OutputReceived(Uuid, Vec<crate::models::OutputEvent>),
     /// 프로세스 실행 완료 (세션 ID, 종료 코드 또는 에러 메시지)
     RunCompleted(Uuid, Result<i32, String>),
 
