@@ -878,10 +878,13 @@ pub struct ConfirmUpdateModalView<'a> {
     pub current: &'a str,
     /// 설치할 새 버전 (v 접두사 없는 형태).
     pub latest: &'a str,
+    /// 실행 중 세션 수. 0이 아니면 Update 버튼을 비활성화하고 사유를 표시한다.
+    pub running_sessions: usize,
 }
 
 /// 인앱 업데이트 확인 모달. 설치가 성공하면 앱이 곧바로 재시작되므로 확인을 받는다.
-/// 다른 확인 모달과 동일한 오버레이 패턴이며 Update / Cancel / X / Esc 로만 닫힌다.
+/// 실행 중 세션이 있으면 Update가 비활성화되고 사유가 표시된다 (재시작이 프로세스를
+/// 죽이므로). 다른 확인 모달과 동일한 오버레이 패턴이며 Cancel / X / Esc 로 닫는다.
 pub fn view_confirm_update_modal<'a>(props: ConfirmUpdateModalView<'a>) -> Element<'a, Message> {
     let header = row![
         text("Update Available").size(15),
@@ -891,7 +894,8 @@ pub fn view_confirm_update_modal<'a>(props: ConfirmUpdateModalView<'a>) -> Eleme
     .align_y(Alignment::Center)
     .width(Length::Fill);
 
-    let body = column![
+    let blocked = props.running_sessions > 0;
+    let mut body = column![
         text(format!(
             "Update from v{} to v{}?",
             props.current, props.latest
@@ -902,6 +906,16 @@ pub fn view_confirm_update_modal<'a>(props: ConfirmUpdateModalView<'a>) -> Eleme
             .color(Color::from_rgba8(255, 255, 255, 0.55)),
     ]
     .spacing(6);
+    if blocked {
+        body = body.push(
+            text(format!(
+                "{} running session(s) — stop them to enable Update.",
+                props.running_sessions
+            ))
+            .size(12)
+            .color(Color::from_rgba8(250, 179, 135, 1.0)), // 경고(Peach) 톤
+        );
+    }
 
     let content = column![
         header,
@@ -911,11 +925,12 @@ pub fn view_confirm_update_modal<'a>(props: ConfirmUpdateModalView<'a>) -> Eleme
         modal_footer(
             Message::CancelInstallUpdate,
             "Update",
-            Some(Message::ConfirmInstallUpdate),
+            // 실행 중 세션이 있으면 비활성화 (None → on_press_maybe가 disabled 처리).
+            (!blocked).then_some(Message::ConfirmInstallUpdate),
         ),
     ];
 
-    modal_dialog(content.into(), 420.0, 210.0)
+    modal_dialog(content.into(), 420.0, 230.0)
 }
 
 /// 구성 내보내기 모달 뷰 모델 (app의 staging 선택 상태를 참조로 전달).

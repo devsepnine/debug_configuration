@@ -4782,6 +4782,9 @@ impl RunConfigManager {
             let props = ConfirmUpdateModalView {
                 current: crate::services::CURRENT_VERSION,
                 latest: &modal.latest,
+                // 열림 이후의 세션 변화도 반영되도록 매 프레임 현재 상태로 계산한다
+                // (열림 시점 스냅샷은 세션을 멈춰도 버튼이 계속 죽어 있게 된다).
+                running_sessions: self.sessions.iter().filter(|s| s.is_running).count(),
             };
             layers = layers.push(view_confirm_update_modal(props));
         }

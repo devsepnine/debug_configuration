@@ -16,13 +16,15 @@ pub struct ConfirmUpdateModalState {
     /// 실제 설치는 확정 시점의 `update_available`을 다시 읽으므로 항상 최신이다.
     /// 현재는 체크가 시작 시 1회뿐이라 열려 있는 동안 값이 바뀔 수 없지만,
     /// 주기적 재확인을 도입하면 표시 문구가 한 박자 늦을 수 있음을 전제한다.
+    /// (실행 중 세션 경고/버튼 비활성은 뷰가 매 프레임 라이브로 계산 — 상태에 없음.)
     pub latest: String,
 }
 
 impl RunConfigManager {
     /// 상태바 업데이트 버튼 → 확인 모달 열기.
-    /// 인앱 설치 불가/실패면 릴리스 페이지로 즉시 폴백하고, 실행 중 세션이 있으면
-    /// 모달을 띄우기 전에 조기 거부한다 (확인까지 받고 나서 거부하는 것보다 낫다).
+    /// 인앱 설치 불가/실패면 릴리스 페이지로 즉시 폴백한다. 실행 중 세션이 있어도
+    /// 모달은 열되 Update를 비활성화하고 사유를 표시한다 — 조용한 상태바 거부는
+    /// "버튼을 눌러도 반응이 없다"로 읽혔다(사용자 실측 피드백).
     pub(super) fn handle_request_install_update(&mut self) -> Task<Message> {
         if self.is_updating {
             return Task::none();
@@ -35,10 +37,6 @@ impl RunConfigManager {
             let url = update.url.clone();
             return self.handle_open_url(&url);
         }
-        if self.sessions.iter().any(|session| session.is_running) {
-            self.status_message = String::from("Stop running sessions before updating");
-            return Task::none();
-        }
         let latest = update.latest.clone();
         // 한 번에 하나의 모달만 (계약과 근거는 close_all_modals 참고).
         self.close_all_modals();
@@ -47,8 +45,15 @@ impl RunConfigManager {
     }
 
     /// 모달의 Update 확정 → 실제 설치 시작 (기존 설치 경로 재사용).
+    /// 열림 이후 세션이 시작됐을 수도 있으므로 여기서도 재검사한다 — 그 사이 생긴
+    /// 세션이 있으면 시작하지 않고 모달을 닫으며 사유를 남긴다 (설치 경로의
+    /// `handle_install_update`에도 동일 가드가 있어 삼중 방어).
     pub(super) fn handle_confirm_install_update(&mut self) -> Task<Message> {
         if self.confirm_update_modal.take().is_none() {
+            return Task::none();
+        }
+        if self.sessions.iter().any(|session| session.is_running) {
+            self.status_message = String::from("Stop running sessions before updating");
             return Task::none();
         }
         self.handle_install_update()
@@ -119,11 +124,25 @@ mod tests {
     }
 
     #[test]
-    fn request_refuses_while_sessions_running() {
+    fn request_opens_modal_even_while_sessions_running() {
+        // 실행 중에도 모달은 열린다 — 조용한 상태바 거부는 "반응 없음"으로 읽혔다.
+        // (Update 버튼 비활성/사유 표시는 뷰가 라이브 세션 수로 처리한다.)
         let mut app = manager_with_update(true);
         app.sessions.push(RunSession::new("x".to_string())); // is_running=true로 생성
         let _ = app.handle_request_install_update();
+        assert!(app.confirm_update_modal.is_some());
+        assert!(!app.is_updating);
+    }
+
+    #[test]
+    fn confirm_refuses_if_session_started_while_modal_open() {
+        // 모달이 열린 사이 세션이 시작된 경우 — 확정해도 설치를 시작하지 않는다.
+        let mut app = manager_with_update(true);
+        let _ = app.handle_request_install_update();
+        app.sessions.push(RunSession::new("x".to_string()));
+        let _ = app.handle_confirm_install_update();
         assert!(app.confirm_update_modal.is_none());
+        assert!(!app.is_updating);
         assert!(app.status_message.contains("Stop running sessions"));
     }
 
