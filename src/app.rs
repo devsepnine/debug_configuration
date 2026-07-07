@@ -749,7 +749,13 @@ impl RunConfigManager {
             | Message::ToggleSessionSearchFilter(_)
             | Message::ToggleSessionSearchRegex(_)
             | Message::OpenSearchInActivePane
-            | Message::CloseActiveSearch
+            | Message::CloseActiveBar
+            | Message::OpenSessionStdin(_)
+            | Message::CloseSessionStdin(_)
+            | Message::SessionStdinChanged(_, _)
+            | Message::SessionStdinSubmitted(_)
+            | Message::SessionStdinWriteCompleted(_, _, _)
+            | Message::OpenStdinInActivePane
             | Message::SearchNextInActivePane
             | Message::SearchPrevInActivePane
             | Message::ClearSessionOutput(_)
@@ -969,8 +975,20 @@ impl RunConfigManager {
                 Some(session_id) => self.handle_open_session_search(session_id),
                 None => Task::none(),
             },
-            Message::CloseActiveSearch => match self.search_nav_target() {
-                Some(session_id) => self.handle_close_session_search(session_id),
+            Message::CloseActiveBar => self.handle_close_active_bar(),
+            Message::OpenSessionStdin(session_id) => self.handle_open_session_stdin(session_id),
+            Message::CloseSessionStdin(session_id) => self.handle_close_session_stdin(session_id),
+            Message::SessionStdinChanged(session_id, value) => {
+                self.handle_session_stdin_changed(session_id, value)
+            }
+            Message::SessionStdinSubmitted(session_id) => {
+                self.handle_session_stdin_submitted(session_id)
+            }
+            Message::SessionStdinWriteCompleted(session_id, line, result) => {
+                self.handle_session_stdin_write_completed(session_id, line, result)
+            }
+            Message::OpenStdinInActivePane => match self.stdin_open_target() {
+                Some(session_id) => self.handle_open_session_stdin(session_id),
                 None => Task::none(),
             },
             Message::SearchNextInActivePane => match self.search_nav_target() {
@@ -2774,6 +2792,103 @@ impl RunConfigManager {
         Task::none()
     }
 
+    /// stdin 입력바 열기 (+입력에 포커스). 이미 열려 있으면 re-focus만.
+    fn handle_open_session_stdin(&mut self, session_id: Uuid) -> Task<Message> {
+        let Some(session) = self.session_by_id_mut(session_id) else {
+            return Task::none();
+        };
+        if session.stdin_input.is_none() {
+            session.stdin_input = Some(String::new());
+        }
+        iced::widget::operation::focus(crate::views::shared::session_stdin_input_id(session_id))
+    }
+
+    fn handle_close_session_stdin(&mut self, session_id: Uuid) -> Task<Message> {
+        if let Some(session) = self.session_by_id_mut(session_id) {
+            session.stdin_input = None;
+        }
+        Task::none()
+    }
+
+    fn handle_session_stdin_changed(&mut self, session_id: Uuid, value: String) -> Task<Message> {
+        if let Some(session) = self.session_by_id_mut(session_id)
+            && session.stdin_input.is_some()
+        {
+            session.stdin_input = Some(value);
+        }
+        Task::none()
+    }
+
+    /// stdin 제출: 드래프트를 낙관적으로 비우고 전송 Task를 띄운다.
+    /// 원문은 완료 메시지에 실어 보낸다 — 하드 실패 시 복원, pipe 성공 시 로컬 에코.
+    fn handle_session_stdin_submitted(&mut self, session_id: Uuid) -> Task<Message> {
+        let Some(session) = self.session_by_id_mut(session_id) else {
+            return Task::none();
+        };
+        if !session.is_running {
+            return Task::none();
+        }
+        let Some(draft) = session.stdin_input.as_mut() else {
+            return Task::none();
+        };
+        let line = std::mem::take(draft);
+        let sent = line.clone();
+        Task::perform(
+            crate::services::write_session_stdin(session_id, line),
+            move |result| Message::SessionStdinWriteCompleted(session_id, sent.clone(), result),
+        )
+    }
+
+    /// stdin 쓰기 결과 처리.
+    /// - `Ok(true)`: pipe 경로 성공 — 에코가 없으므로 세션 로그에 로컬 에코.
+    /// - `Ok(false)`: PTY 성공 — 라인 디시플린 에코가 출력으로 돌아오므로 아무것도 안 함.
+    /// - `Timeout`: 조기 신호일 뿐(쓰기는 백그라운드에서 완료됨) — 복원 금지(복원 후
+    ///   재제출 = 중복 입력), 상태 메시지만.
+    /// - `Broken`: 하드 실패 — 사용자가 그 사이 새로 타이핑하지 않았다면 드래프트 복원.
+    fn handle_session_stdin_write_completed(
+        &mut self,
+        session_id: Uuid,
+        line: String,
+        result: Result<bool, crate::models::StdinWriteError>,
+    ) -> Task<Message> {
+        use crate::models::StdinWriteError;
+        match result {
+            Ok(needs_local_echo) => {
+                if needs_local_echo && let Some(session) = self.session_by_id_mut(session_id) {
+                    session.add_output_line(&line);
+                    if session.search.is_some() {
+                        session.refresh_search_matches();
+                    }
+                }
+            }
+            Err(StdinWriteError::Timeout) => {
+                self.status_message =
+                    String::from("Input pending — the process is not reading stdin yet");
+            }
+            Err(StdinWriteError::Broken(error)) => {
+                self.status_message = format!("Input failed: {error}");
+                if let Some(session) = self.session_by_id_mut(session_id)
+                    && session.stdin_input.as_deref() == Some("")
+                {
+                    session.stdin_input = Some(line);
+                }
+            }
+        }
+        Task::none()
+    }
+
+    /// Esc: 활성 바 하나만 닫는다. 우선순위 = 포커스 pane stdin → 포커스 pane 검색 →
+    /// 임의 stdin-open 세션 → 임의 search-open 세션 (LIFO 근사 — 나중에 연 표면 먼저).
+    fn handle_close_active_bar(&mut self) -> Task<Message> {
+        if let Some(session_id) = self.stdin_nav_target() {
+            return self.handle_close_session_stdin(session_id);
+        }
+        if let Some(session_id) = self.search_nav_target() {
+            return self.handle_close_session_search(session_id);
+        }
+        Task::none()
+    }
+
     /// 오버플로 메뉴(⋯) 토글. pane이 좁을 때 compact의 `⋯` 버튼이 보낸다.
     /// 한 번에 하나의 메뉴만 열리도록, 대상 세션을 토글하고 나머지는 모두 닫는다.
     fn handle_toggle_session_controls_menu(&mut self, session_id: Uuid) -> Task<Message> {
@@ -2812,6 +2927,7 @@ impl RunConfigManager {
             | Message::StopSession(id)
             | Message::ToggleAutoScroll(id)
             | Message::OpenSessionSearch(id)
+            | Message::OpenSessionStdin(id)
             | Message::ClearSessionOutput(id)
             | Message::ExportSessionOutput(id) => *id,
             Message::TogglePaneMaximize(pane_id) => {
@@ -3006,6 +3122,7 @@ impl RunConfigManager {
                     's' => Some(Message::SaveConfigurations),
                     'r' => Some(Message::RunShortcut),
                     'w' => Some(Message::CloseFocusedPane),
+                    'i' => Some(Message::OpenStdinInActivePane),
                     ',' => Some(Message::OpenSettingsModal),
                     _ => None,
                 }
@@ -3059,6 +3176,52 @@ impl RunConfigManager {
         self.sessions
             .iter()
             .any(|s| s.id == session_id && s.search.is_some())
+    }
+
+    /// Cmd+I가 stdin 바를 "열" 세션 — 포커스 pane 최우선(search_open_target 미러).
+    /// Sessions 뷰가 아니면 None (Configuration 뷰에서 발화 방지).
+    fn stdin_open_target(&self) -> Option<Uuid> {
+        if !matches!(self.current_view, ViewMode::Sessions) {
+            return None;
+        }
+        let tab = self.workspace_tabs.get(self.selected_tab_index)?;
+        if let Some(focused) = tab.focused_session() {
+            return Some(focused);
+        }
+        self.first_session_with_stdin(tab).or_else(|| {
+            tab.layout_tree
+                .collect_leaves()
+                .into_iter()
+                .find_map(|(_, pane)| pane.session_id)
+        })
+    }
+
+    /// Esc가 닫기 대상으로 삼을 stdin 세션 — 포커스 pane이 stdin 열림이면 그것,
+    /// 아니면 stdin이 열린 다른 pane (search_nav_target 미러).
+    fn stdin_nav_target(&self) -> Option<Uuid> {
+        let tab = self.workspace_tabs.get(self.selected_tab_index)?;
+        if let Some(focused) = tab.focused_session()
+            && self.session_has_stdin_open(focused)
+        {
+            return Some(focused);
+        }
+        self.first_session_with_stdin(tab)
+    }
+
+    /// 활성 탭의 leaf 순서로 stdin 바가 열린 첫 세션.
+    fn first_session_with_stdin(&self, tab: &WorkspaceTab) -> Option<Uuid> {
+        tab.layout_tree
+            .collect_leaves()
+            .into_iter()
+            .filter_map(|(_, pane)| pane.session_id)
+            .find(|&id| self.session_has_stdin_open(id))
+    }
+
+    /// 해당 세션에 stdin 입력바가 열려 있는지.
+    fn session_has_stdin_open(&self, session_id: Uuid) -> bool {
+        self.sessions
+            .iter()
+            .any(|s| s.id == session_id && s.stdin_input.is_some())
     }
 
     /// Pane 클릭 → 그 pane의 세션을 활성 탭의 포커스로 기록.
@@ -4613,35 +4776,47 @@ impl RunConfigManager {
         };
         // ESC = 검색 닫기. 실제로 검색바가 열려 있을 때만 활성화해 다른 ESC 용도와
         // 충돌하지 않게 한다 (검색이 없으면 ESC를 가로채지 않음).
-        let search_close_subscription =
-            if sessions_active && self.sessions.iter().any(|s| s.search.is_some()) {
-                event::listen_with(|event, _status, _id| match event {
-                    Event::Keyboard(keyboard::Event::KeyPressed {
-                        key: keyboard::Key::Named(keyboard::key::Named::Escape),
-                        ..
-                    }) => Some(Message::CloseActiveSearch),
-                    _ => None,
-                })
-            } else {
-                Subscription::none()
-            };
+        // Esc = 활성 바(stdin 우선 → 검색) 하나 닫기. 단일 구독·단일 메시지로 두고
+        // 우선순위는 핸들러(handle_close_active_bar)가 정한다 — 바 종류별 Esc 구독을
+        // 병렬로 두면 한 번의 Esc에 둘 다 닫히는 이중 발화가 생긴다.
+        // (의도적으로 status 게이트 없음 — 포커스된 input 안에서도 Esc가 동작해야 한다)
+        let bar_close_subscription = if sessions_active
+            && self
+                .sessions
+                .iter()
+                .any(|s| s.search.is_some() || s.stdin_input.is_some())
+        {
+            event::listen_with(|event, _status, _id| match event {
+                Event::Keyboard(keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Named(keyboard::key::Named::Escape),
+                    ..
+                }) => Some(Message::CloseActiveBar),
+                _ => None,
+            })
+        } else {
+            Subscription::none()
+        };
         // 검색바가 열려 있을 때 Enter = 다음 매치, Shift+Enter = 이전 매치. text_input의
         // on_submit은 modifiers를 몰라 Shift를 구분하지 못하므로 여기서 처리하고 on_submit은
         // 제거했다. 대상은 active pane의 "검색이 열린" 세션. tab 이름 편집 중에는 Enter가
         // 이름 제출과 겹치지 않도록 비활성화한다.
         // 대상 세션을 캡처하지 않는다(listen_with는 fn 포인터만 받음 — 위 search_open/close와
-        // 동일하게 핸들러가 active pane에서 해석). tab 이름 편집 중에는 Enter가 이름 제출과
-        // 겹치지 않도록 비활성화한다.
+        // 동일하게 핸들러가 active pane에서 해석).
+        // Status::Ignored 게이트: stdin 입력은 on_submit이 있어 Enter를 **capture**하고,
+        // 검색 입력은 on_submit이 없어 Ignored로 흐른다 — 양쪽 바가 동시에 열려 있어도
+        // stdin 타이핑 중 Enter가 검색 nav로 이중 발화하지 않는다.
         let search_nav_active = sessions_active
             && self.tab_ui.editing_tab_name.is_none()
             && self.sessions.iter().any(|s| s.search.is_some());
         let search_nav_subscription = if search_nav_active {
-            event::listen_with(|event, _status, _id| match event {
+            event::listen_with(|event, status, _id| match event {
                 Event::Keyboard(keyboard::Event::KeyPressed {
                     key: keyboard::Key::Named(keyboard::key::Named::Enter),
                     modifiers,
                     ..
-                }) => Some(Self::search_nav_message(modifiers.shift())),
+                }) if matches!(status, event::Status::Ignored) => {
+                    Some(Self::search_nav_message(modifiers.shift()))
+                }
                 _ => None,
             })
         } else {
@@ -4690,7 +4865,7 @@ impl RunConfigManager {
             tab_name_edit_subscription,
             window_focus_subscription,
             search_open_subscription,
-            search_close_subscription,
+            bar_close_subscription,
             search_nav_subscription,
             nav_shortcut_subscription,
             session_timer_subscription,
@@ -5091,12 +5266,171 @@ mod tests {
             cmd_shortcut(",", Modifiers::COMMAND),
             Some(Message::OpenSettingsModal)
         ));
+        assert!(matches!(
+            cmd_shortcut("i", Modifiers::COMMAND),
+            Some(Message::OpenStdinInActivePane)
+        ));
         // Shift/Alt 조합과 수식키 없는 입력은 무시 (기존 정책과 동일).
-        for ch in ["s", "r", "w", ","] {
+        for ch in ["s", "r", "w", ",", "i"] {
             assert!(cmd_shortcut(ch, Modifiers::COMMAND | Modifiers::SHIFT).is_none());
             assert!(cmd_shortcut(ch, Modifiers::COMMAND | Modifiers::ALT).is_none());
             assert!(cmd_shortcut(ch, Modifiers::empty()).is_none());
         }
+    }
+
+    // ---- stdin 입력바 ----
+
+    #[test]
+    fn stdin_open_close_and_draft_lifecycle() {
+        let (mut app, ids) = manager_with_open_panes(&["a"]);
+        let sid = ids[0];
+
+        let _ = app.handle_open_session_stdin(sid);
+        assert_eq!(
+            app.session_by_id_mut(sid).unwrap().stdin_input.as_deref(),
+            Some("")
+        );
+        let _ = app.handle_session_stdin_changed(sid, String::from("hello"));
+        assert_eq!(
+            app.session_by_id_mut(sid).unwrap().stdin_input.as_deref(),
+            Some("hello")
+        );
+        // 재열기(이미 열림)는 드래프트를 보존한다 (re-focus만).
+        let _ = app.handle_open_session_stdin(sid);
+        assert_eq!(
+            app.session_by_id_mut(sid).unwrap().stdin_input.as_deref(),
+            Some("hello")
+        );
+        let _ = app.handle_close_session_stdin(sid);
+        assert!(app.session_by_id_mut(sid).unwrap().stdin_input.is_none());
+    }
+
+    #[test]
+    fn stdin_draft_survives_rerun() {
+        // rerun은 세션 객체를 재사용하며 stdin_input을 건드리지 않는다 (회귀 방지).
+        let (mut app, ids) = manager_with_open_panes(&["a"]);
+        let sid = ids[0];
+        let _ = app.handle_open_session_stdin(sid);
+        let _ = app.handle_session_stdin_changed(sid, String::from("typed"));
+
+        let _ = app.handle_rerun_session(sid);
+
+        // rerun이 세션 id를 스왑하므로 새 id로 조회한다.
+        let session = app
+            .sessions
+            .iter()
+            .find(|s| s.config_name == "a")
+            .expect("session survives rerun");
+        assert_eq!(session.stdin_input.as_deref(), Some("typed"));
+    }
+
+    #[test]
+    fn stdin_submit_takes_draft_only_while_running() {
+        let (mut app, ids) = manager_with_open_panes(&["a"]);
+        let sid = ids[0];
+        let _ = app.handle_open_session_stdin(sid);
+        let _ = app.handle_session_stdin_changed(sid, String::from("hi"));
+
+        // 종료된 세션 → 제출 no-op(드래프트 유지).
+        app.session_by_id_mut(sid).unwrap().is_running = false;
+        let _ = app.handle_session_stdin_submitted(sid);
+        assert_eq!(
+            app.session_by_id_mut(sid).unwrap().stdin_input.as_deref(),
+            Some("hi")
+        );
+
+        // 실행 중 → 제출이 드래프트를 낙관적으로 비운다 (전송 Task는 테스트에서 미폴링).
+        app.session_by_id_mut(sid).unwrap().is_running = true;
+        let _ = app.handle_session_stdin_submitted(sid);
+        assert_eq!(
+            app.session_by_id_mut(sid).unwrap().stdin_input.as_deref(),
+            Some("")
+        );
+    }
+
+    #[test]
+    fn stdin_write_completed_restore_and_echo_rules() {
+        use crate::models::StdinWriteError;
+        let (mut app, ids) = manager_with_open_panes(&["a"]);
+        let sid = ids[0];
+        let _ = app.handle_open_session_stdin(sid);
+
+        // Broken + 드래프트 미변경("") → 원문 복원.
+        let _ = app.handle_session_stdin_write_completed(
+            sid,
+            String::from("lost"),
+            Err(StdinWriteError::Broken(String::from("EPIPE"))),
+        );
+        assert_eq!(
+            app.session_by_id_mut(sid).unwrap().stdin_input.as_deref(),
+            Some("lost")
+        );
+
+        // Broken + 그 사이 새로 타이핑 → 덮어쓰지 않는다.
+        let _ = app.handle_session_stdin_changed(sid, String::from("newer"));
+        let _ = app.handle_session_stdin_write_completed(
+            sid,
+            String::from("old"),
+            Err(StdinWriteError::Broken(String::from("EPIPE"))),
+        );
+        assert_eq!(
+            app.session_by_id_mut(sid).unwrap().stdin_input.as_deref(),
+            Some("newer")
+        );
+
+        // Timeout → 복원 금지 (백그라운드에서 결국 쓰이므로 재제출=중복).
+        let _ = app.handle_session_stdin_changed(sid, String::new());
+        let _ = app.handle_session_stdin_write_completed(
+            sid,
+            String::from("pending"),
+            Err(StdinWriteError::Timeout),
+        );
+        assert_eq!(
+            app.session_by_id_mut(sid).unwrap().stdin_input.as_deref(),
+            Some("")
+        );
+        assert!(app.status_message.contains("Input pending"));
+
+        // Ok(true) = pipe 성공 → 로컬 에코 한 줄.
+        let before = app.session_by_id_mut(sid).unwrap().output_lines.len();
+        let _ = app.handle_session_stdin_write_completed(sid, String::from("echoed"), Ok(true));
+        let session = app.session_by_id_mut(sid).unwrap();
+        assert_eq!(session.output_lines.len(), before + 1);
+        // Ok(false) = PTY 성공 → 에코 없음 (전송이 담당).
+        let before = session.output_lines.len();
+        let _ = app.handle_session_stdin_write_completed(sid, String::from("quiet"), Ok(false));
+        assert_eq!(
+            app.session_by_id_mut(sid).unwrap().output_lines.len(),
+            before
+        );
+    }
+
+    #[test]
+    fn close_active_bar_prefers_stdin_then_search() {
+        let (mut app, ids) = manager_with_open_panes(&["a"]);
+        let sid = ids[0];
+        app.current_view = ViewMode::Sessions;
+        let _ = app.handle_open_session_search(sid);
+        let _ = app.handle_open_session_stdin(sid);
+
+        // 1차 Esc: stdin만 닫힘 (검색 유지).
+        let _ = app.handle_close_active_bar();
+        let session = app.session_by_id_mut(sid).unwrap();
+        assert!(session.stdin_input.is_none());
+        assert!(session.search.is_some());
+
+        // 2차 Esc: 검색 닫힘.
+        let _ = app.handle_close_active_bar();
+        assert!(app.session_by_id_mut(sid).unwrap().search.is_none());
+    }
+
+    #[test]
+    fn stdin_open_target_requires_sessions_view() {
+        let (mut app, ids) = manager_with_open_panes(&["a"]);
+        app.current_view = ViewMode::Configuration;
+        assert_eq!(app.stdin_open_target(), None, "Configuration 뷰에선 무시");
+        app.current_view = ViewMode::Sessions;
+        assert_eq!(app.stdin_open_target(), Some(ids[0]));
     }
 
     #[test]

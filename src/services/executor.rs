@@ -96,8 +96,6 @@ fn force_kill_process_tree(pid: u32) {
 
 /// 세션 stdin으로 쓸 수 있는 핸들. PTY는 blocking `Write`(spawn_blocking에서 사용),
 /// Windows pipe는 tokio `ChildStdin`(AsyncWrite) — 통합 blocking 타입이 불가능해 분기.
-// TODO(v0.5.0 슬라이스4): write_session_stdin이 소비 — 그 전까지 필드 미사용 allow.
-#[allow(dead_code)]
 enum SessionWriter {
     /// PTY master writer — 라인 디시플린이 에코를 담당한다 (앱 에코 금지).
     Pty(Arc<Mutex<Box<dyn std::io::Write + Send>>>),
@@ -111,8 +109,6 @@ struct SessionIo {
     /// PTY master (resize용). pipe 세션은 None.
     master: Option<Box<dyn portable_pty::MasterPty + Send>>,
     /// stdin writer. unix pipe 폴백(출력 전용)은 None.
-    // TODO(v0.5.0 슬라이스4): write_session_stdin이 소비 — 그 전까지 임시 allow.
-    #[allow(dead_code)]
     writer: Option<SessionWriter>,
 }
 
@@ -146,6 +142,91 @@ pub fn resize_session_pty(session_id: Uuid, cols: u16, rows: u16) {
             pixel_height: 0,
         });
     }
+}
+
+/// stdin 쓰기 제한 시간. 초과는 하드 실패가 아니라 "자식이 아직 안 읽음"의 조기
+/// 신호다 — 쓰기 자체는 백그라운드에서 계속돼 결국 완료된다(per-session mutex가
+/// 순서를 보존하므로 재제출 없이 그대로 두면 중복도 없다).
+const STDIN_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// 세션 stdin에 한 줄을 쓴다 (`\n` 자동 부가).
+///
+/// 에코 규칙("에코는 전송의 책임"): PTY는 라인 디시플린이 에코를 만들어 출력 스트림에
+/// 나타나므로 앱이 다시 표시하면 중복이다. Windows pipe는 에코가 없으므로 반환값
+/// `Ok(true)`(로컬 에코 필요)로 호출 측이 세션 로그에 직접 표시한다.
+///
+/// unix pipe 폴백(writer 없음)·미등록 세션은 `Broken`으로 즉시 실패한다.
+pub async fn write_session_stdin(
+    session_id: Uuid,
+    line: String,
+) -> Result<bool, crate::models::StdinWriteError> {
+    use crate::models::StdinWriteError;
+
+    // 레지스트리 락은 조회에만 사용하고 Arc를 복제해 나온다 — 느린 세션 하나가
+    // 레지스트리(다른 세션의 조회/등록)를 막지 않게 한다.
+    let writer = {
+        let map = SESSION_IO
+            .lock()
+            .map_err(|_| StdinWriteError::Broken(String::from("session io registry poisoned")))?;
+        match map.get(&session_id).and_then(|io| io.writer.as_ref()) {
+            Some(SessionWriter::Pty(w)) => WriterHandle::Pty(Arc::clone(w)),
+            #[cfg(windows)]
+            Some(SessionWriter::Pipe(w)) => WriterHandle::Pipe(Arc::clone(w)),
+            None => {
+                return Err(StdinWriteError::Broken(String::from(
+                    "process input is not available for this session",
+                )));
+            }
+        }
+    };
+
+    let mut payload = line;
+    payload.push('\n');
+
+    match writer {
+        WriterHandle::Pty(w) => {
+            let write = tokio::task::spawn_blocking(move || {
+                use std::io::Write;
+                let mut writer = w
+                    .lock()
+                    .map_err(|_| String::from("stdin writer poisoned"))?;
+                writer
+                    .write_all(payload.as_bytes())
+                    .and_then(|()| writer.flush())
+                    .map_err(|e| e.to_string())
+            });
+            match tokio::time::timeout(STDIN_WRITE_TIMEOUT, write).await {
+                Ok(joined) => joined
+                    .map_err(|e| StdinWriteError::Broken(format!("stdin task failed: {e}")))?
+                    .map_err(StdinWriteError::Broken)
+                    .map(|()| false), // PTY 에코 — 로컬 에코 불필요
+                Err(_) => Err(StdinWriteError::Timeout),
+            }
+        }
+        #[cfg(windows)]
+        WriterHandle::Pipe(w) => {
+            use tokio::io::AsyncWriteExt;
+            let write = async {
+                let mut writer = w.lock().await;
+                writer
+                    .write_all(payload.as_bytes())
+                    .await
+                    .map_err(|e| e.to_string())?;
+                writer.flush().await.map_err(|e| e.to_string())
+            };
+            match tokio::time::timeout(STDIN_WRITE_TIMEOUT, write).await {
+                Ok(result) => result.map_err(StdinWriteError::Broken).map(|()| true), // pipe — 로컬 에코 필요
+                Err(_) => Err(StdinWriteError::Timeout),
+            }
+        }
+    }
+}
+
+/// `write_session_stdin` 내부 전용 — 레지스트리 락 밖으로 복제해 나온 writer 핸들.
+enum WriterHandle {
+    Pty(Arc<Mutex<Box<dyn std::io::Write + Send>>>),
+    #[cfg(windows)]
+    Pipe(Arc<tokio::sync::Mutex<tokio::process::ChildStdin>>),
 }
 
 /// 경로에 공백이 포함되어 있으면 따옴표로 감싸기

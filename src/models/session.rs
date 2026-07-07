@@ -17,6 +17,17 @@ pub enum OutputEvent {
     Replace(String),
 }
 
+/// stdin 쓰기 실패 사유. `Timeout`은 "자식이 아직 읽지 않음"의 조기 신호일 뿐
+/// 쓰기 자체는 백그라운드에서 결국 완료된다(드래프트 복원 금지 — 복원 후 재제출은
+/// 중복 입력이 된다). `Broken`은 파이프/PTY가 닫힌 하드 실패(복원 대상).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StdinWriteError {
+    /// 쓰기가 제한 시간 안에 끝나지 않음 (자식이 stdin을 읽지 않는 중 — 데이터는 유지됨)
+    Timeout,
+    /// 쓰기 채널이 닫힘/실패 (EPIPE/EIO 등)
+    Broken(String),
+}
+
 /// 세션의 현재 상태 (배지 표시용).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionStatusKind {
@@ -163,6 +174,9 @@ pub struct RunSession {
     /// `SessionScrollChanged` 핸들러에서 `None`으로 클리어한다.
     /// (app→terminal 역방향 스크롤 명령 경로 — 비율 기반으론 매치로 점프가 안 됐다)
     pub scroll_target: Option<usize>,
+    /// stdin 입력바 드래프트. `Some`이면 바가 열려 있음 (`search`와 동일 컨벤션).
+    /// 프로세스 종료/rerun에도 생존한다 — 타이핑 중이던 내용을 잃지 않기 위함.
+    pub stdin_input: Option<String>,
     /// 컨트롤 오버플로 메뉴(⋯) 열림 여부. pane이 좁아 전체 컨트롤 버튼이 들어가지
     /// 않을 때 `⋯` 버튼으로 펼치는 세로 액션 메뉴의 토글 상태(터미널 위에 표시).
     pub controls_menu_open: bool,
@@ -213,6 +227,7 @@ impl RunSession {
             process_pid: None,
             search: None,
             scroll_target: None,
+            stdin_input: None,
             controls_menu_open: false,
             max_output_lines: DEFAULT_MAX_OUTPUT_LINES,
         }

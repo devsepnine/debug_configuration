@@ -319,12 +319,27 @@ pub enum Message {
     ToggleSessionSearchRegex(Uuid),
     /// 활성 pane의 세션에 검색바 열기 (Ctrl+F — 대상 세션은 핸들러가 해석)
     OpenSearchInActivePane,
-    /// 활성 검색바 닫기 (ESC — 대상 세션은 핸들러가 해석)
-    CloseActiveSearch,
+    /// 활성 바(stdin 우선, 다음 검색) 하나 닫기 (ESC — 대상은 핸들러가 우선순위로 해석)
+    CloseActiveBar,
     /// 활성 pane 검색의 다음 매치로 이동 (Enter — 대상 세션은 핸들러가 해석)
     SearchNextInActivePane,
     /// 활성 pane 검색의 이전 매치로 이동 (Shift+Enter — 대상 세션은 핸들러가 해석)
     SearchPrevInActivePane,
+
+    // 세션 stdin 입력 (PTY/pipe stdin으로 한 줄 전송; search 클러스터와 동일 컨벤션)
+    /// stdin 입력바 열기 (`session_id`)
+    OpenSessionStdin(Uuid),
+    /// stdin 입력바 닫기 (`session_id`)
+    CloseSessionStdin(Uuid),
+    /// stdin 드래프트 변경 (`session_id`, 입력 값)
+    SessionStdinChanged(Uuid, String),
+    /// stdin 드래프트 제출 — 프로세스 stdin으로 전송 (`session_id`)
+    SessionStdinSubmitted(Uuid),
+    /// stdin 쓰기 완료 (`session_id`, 제출 원문(실패 복원·pipe 로컬 에코용),
+    /// 성공 시 로컬 에코 필요 여부 / 실패 사유)
+    SessionStdinWriteCompleted(Uuid, String, Result<bool, crate::models::StdinWriteError>),
+    /// 활성 pane 세션에 stdin 바 열기 (Cmd+I — 대상은 핸들러가 해석, Sessions 뷰 전용)
+    OpenStdinInActivePane,
     /// 세션 출력 버퍼 비우기 (`session_id`) — 실행 중인 프로세스는 유지, 화면 로그만 클리어
     ClearSessionOutput(Uuid),
     /// 세션 출력을 파일로 내보내기 (`session_id`)

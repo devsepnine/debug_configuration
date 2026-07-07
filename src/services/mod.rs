@@ -5,7 +5,7 @@ mod update_check;
 
 pub use executor::{
     kill_all_running_processes, prewarm_shell_detection, register_running_pid,
-    run_configuration_stream, unregister_running_pid,
+    run_configuration_stream, unregister_running_pid, write_session_stdin,
 };
 pub use self_update::{RelaunchPlan, cleanup_stale_update_artifacts, download_and_apply};
 pub use storage::{
