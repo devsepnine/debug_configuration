@@ -8,14 +8,12 @@ use uuid::Uuid;
 ///
 /// `Replace`는 직전에 추가된 라인을 통째로 교체한다 — PTY 환경에서 진행바가
 /// `\r`로 같은 줄을 되감아 재그리는 것을 라이브로 렌더하기 위한 시맨틱.
-/// (pipes 경로는 `Line`만 방출한다.)
+/// PTY 경로(unix PTY / Windows ConPTY)가 방출하고, pipe 폴백은 `Line`만 방출한다.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OutputEvent {
     /// 새 라인 추가 (확정된 라인, 또는 새로 열린 라이브 라인)
     Line(String),
-    /// 가장 최근에 추가된 라인의 내용 교체 (라이브 진행바 갱신).
-    /// PTY(unix) 경로에서만 생성된다 — Windows(pipe)는 Line만 방출.
-    #[cfg_attr(windows, allow(dead_code))]
+    /// 가장 최근에 추가된 라인의 내용 교체 (라이브 진행바 갱신)
     Replace(String),
 }
 

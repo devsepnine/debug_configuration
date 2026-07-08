@@ -97,11 +97,11 @@ fn force_kill_process_tree(pid: u32) {
 /// 세션 stdin으로 쓸 수 있는 핸들. PTY는 blocking `Write`(spawn_blocking에서 사용),
 /// Windows pipe는 tokio `ChildStdin`(AsyncWrite) — 통합 blocking 타입이 불가능해 분기.
 enum SessionWriter {
-    /// PTY master writer — 라인 디시플린이 에코를 담당한다 (앱 에코 금지).
-    /// Windows에서는 PTY 경로가 없어 미구성 (cfg 대신 allow — 타입/매치 팔은 공유).
-    #[cfg_attr(windows, allow(dead_code))]
+    /// PTY master writer (unix PTY / Windows ConPTY) — 터미널이 에코를 담당한다
+    /// (앱 에코 금지).
     Pty(Arc<Mutex<Box<dyn std::io::Write + Send>>>),
-    /// Windows pipe stdin — 에코가 없으므로 제출 시 앱이 로컬 에코한다.
+    /// Windows pipe stdin (<1809 ConPTY 부재 폴백) — 에코가 없으므로 제출 시
+    /// 앱이 로컬 에코한다.
     #[cfg(windows)]
     Pipe(Arc<tokio::sync::Mutex<tokio::process::ChildStdin>>),
 }
@@ -124,9 +124,15 @@ fn register_session_io(session_id: Uuid, io: SessionIo) {
 }
 
 fn unregister_session_io(session_id: Uuid) {
-    if let Ok(mut map) = SESSION_IO.lock() {
-        map.remove(&session_id);
-    }
+    // 엔트리를 꺼낸 뒤 **락 밖에서** drop한다: Windows에서 master drop은
+    // ClosePseudoConsole이고, 이는 미소비 출력이 남아 있으면 드레인될 때까지
+    // 블록할 수 있다 — 전역 레지스트리 락을 문 채 블록하면 다른 모든 세션의
+    // resize/stdin/등록이 함께 멈춘다. (unix에선 drop 시점이 ~ns 뒤로 갈 뿐.)
+    let io = SESSION_IO
+        .lock()
+        .ok()
+        .and_then(|mut map| map.remove(&session_id));
+    drop(io);
 }
 
 /// Stop 버튼의 즉시 신호 경로: 스트림의 협조적 취소(50ms poll → SIGTERM → 2s → SIGKILL)를
@@ -290,7 +296,27 @@ impl Drop for CompletionGuard {
         // 세션 I/O 핸들(PTY master/stdin writer)은 스트림 수명과 함께 무조건 정리한다
         // (armed 여부 무관 — 정상 종료·취소·패닉 전 경로). master drop이 PTY를 닫아
         // 아직 살아 있는 reader 스레드도 EOF로 풀려난다.
+        #[cfg(not(windows))]
         unregister_session_io(self.session_id);
+        // Windows: master drop = ClosePseudoConsole은 잔여 출력이 드레인될 때까지
+        // 블록할 수 있다. 이 Drop은 tokio 워커에서 돌므로(취소/패닉 경로), 엔트리를
+        // 여기서 꺼내되 실제 drop은 블로킹 풀로 분리 투하한다 — 느린/wedge된 conhost가
+        // 고정 워커를 점유하지 못하게. 런타임 밖이면(이론상) 인라인 drop 폴백.
+        #[cfg(windows)]
+        {
+            let session_id = self.session_id;
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                let io = SESSION_IO
+                    .lock()
+                    .ok()
+                    .and_then(|mut map| map.remove(&session_id));
+                if io.is_some() {
+                    handle.spawn_blocking(move || drop(io));
+                }
+            } else {
+                unregister_session_io(session_id);
+            }
+        }
         if self.armed {
             let _ = self.output.try_send(Message::RunCompleted(
                 self.session_id,
@@ -310,8 +336,8 @@ pub fn run_configuration_stream(
     stream::channel(
         100,
         move |mut output: iced::futures::channel::mpsc::Sender<Message>| async move {
-            // pipe 전용 플랫폼(Windows)에서는 초기 뷰포트를 쓸 곳이 없다 (PTY 전용).
-            #[cfg(not(unix))]
+            // PTY가 없는 기타 플랫폼에서는 초기 뷰포트를 쓸 곳이 없다.
+            #[cfg(not(any(unix, windows)))]
             let _ = initial_viewport;
             // 종료 보장 가드: 정상 경로의 끝에서 disarm한다.
             let mut completion = CompletionGuard::new(output.clone(), session_id);
@@ -327,10 +353,11 @@ pub fn run_configuration_stream(
             )
             .await;
 
-            // unix 기본 경로: PTY — isatty=true로 색·진행바·프롬프트가 살아난다.
-            // openpty 실패(fd 고갈 등 희귀)만 pipe로 폴백하고, spawn 실패는 명령 문제라
-            // 폴백 없이 그대로 보고한다. Windows는 pipe 경로 고정(ConPTY는 후속).
-            #[cfg(unix)]
+            // 기본 경로: PTY(unix)/ConPTY(Windows 10 1809+) — 진짜 터미널로 색·진행바·
+            // 프롬프트가 살아난다. PtyUnavailable(unix: openpty 실패, windows: ConPTY
+            // 부재/openpty 실패)만 pipe로 폴백하고, spawn 실패는 명령 문제라 폴백 없이
+            // 그대로 보고한다.
+            #[cfg(any(unix, windows))]
             {
                 // 초기 크기: 마지막 관측 뷰포트(rerun/재사용 pane) 또는 기본 120×40.
                 // 신규 pane은 첫 프레임의 SessionViewportResized가 실측값으로 보정한다.
@@ -347,15 +374,24 @@ pub fn run_configuration_stream(
                         return;
                     }
                     Err(PtySpawnError::PtyUnavailable(e)) => {
-                        // 출력 전용 pipe 폴백 — stdin/라이브 진행바 없음(문서화된 한계).
+                        // pipe 폴백. 문구가 플랫폼별로 다른 이유: unix 폴백은 stdin을
+                        // 배선하지 않지만(출력 전용), windows 폴백은 stdin pipe + 로컬
+                        // 에코가 배선된다 — unix 문구를 공용하면 windows에서 거짓이 된다.
+                        #[cfg(unix)]
+                        let banner = format!(
+                            "[pty unavailable ({e}); falling back to pipes — \
+                             stdin input is disabled for this run]"
+                        );
+                        #[cfg(windows)]
+                        let banner = format!(
+                            "[conpty unavailable ({e}); falling back to pipes — \
+                             no colors/progress bars, stdin input echoes locally]"
+                        );
                         use iced::futures::SinkExt;
                         let _ = output
                             .send(Message::OutputReceived(
                                 session_id,
-                                vec![OutputEvent::Line(format!(
-                                    "[pty unavailable ({e}); falling back to pipes — \
-                                     stdin input is disabled for this run]"
-                                ))],
+                                vec![OutputEvent::Line(banner)],
                             ))
                             .await;
                     }
@@ -534,7 +570,30 @@ fn create_process_command(
     cmd
 }
 
-// ---- PTY 스폰 (unix 기본 경로) --------------------------------------------------
+// ---- PTY 스폰 (unix PTY / Windows ConPTY 기본 경로) -----------------------------
+
+/// ConPTY 지원 여부 (Windows 10 1809+). portable-pty의 openpty는 미지원 OS에서
+/// Err가 아니라 **lazy_static 초기화 panic**을 일으키므로(psuedocon.rs load_conpty의
+/// expect), openpty 호출 전에 반드시 이걸로 선확인한다. kernel32는 모든 Windows
+/// 타깃에 기본 링크되고 두 심볼은 ABI 불변이라 의존성 추가 없이 수기 FFI로 조회한다.
+#[cfg(windows)]
+fn conpty_available() -> bool {
+    static AVAILABLE: LazyLock<bool> = LazyLock::new(|| {
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetModuleHandleA(name: *const u8) -> *mut core::ffi::c_void;
+            fn GetProcAddress(
+                module: *mut core::ffi::c_void,
+                name: *const u8,
+            ) -> *mut core::ffi::c_void;
+        }
+        unsafe {
+            let k32 = GetModuleHandleA(c"kernel32.dll".as_ptr().cast());
+            !k32.is_null() && !GetProcAddress(k32, c"CreatePseudoConsole".as_ptr().cast()).is_null()
+        }
+    });
+    *AVAILABLE
+}
 
 /// PTY에서 돌릴 명령을 구성한다. pipe 경로와 동일한 셸 래핑(sh -l -c) + 환경변수
 /// 직접 주입 불변식에, 진짜 터미널임을 알리는 TERM을 더한다.
@@ -557,14 +616,48 @@ fn create_pty_command(
     cmd
 }
 
+/// ConPTY에서 돌릴 명령을 구성한다 — pipe 경로(create_process_command)와 동일한
+/// PowerShell 래핑(pwsh/powershell 캐시 탐지 + UTF-8 프리앰블 + legacy 체이닝 재작성).
+/// TERM은 설정하지 않는다: Windows 콘솔 앱은 kernel32 콘솔 모드로 판별하고, ConPTY
+/// 호스트가 VT 에뮬레이터다. CREATE_NO_WINDOW도 불필요 — pseudoconsole 스폰은 창을
+/// 만들지 않는다.
+#[cfg(windows)]
+fn create_pty_command(
+    config: &RunConfiguration,
+    command_str: &str,
+    extra_env: &[(String, String)],
+) -> portable_pty::CommandBuilder {
+    let exe = windows_powershell_exe();
+    let adapted = if exe == "pwsh" {
+        command_str.to_string()
+    } else {
+        rewrite_chaining_for_legacy_powershell(command_str)
+    };
+    let mut cmd = portable_pty::CommandBuilder::new(exe);
+    cmd.args([
+        "-NoProfile",
+        "-Command",
+        &format!("[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; {adapted}"),
+    ]);
+    cmd.cwd(&config.working_directory);
+    for (key, value) in &config.environment_variables {
+        cmd.env(key, value);
+    }
+    for (key, value) in extra_env {
+        cmd.env(key, value);
+    }
+    cmd
+}
+
 /// PTY 스폰 결과 — 스트림 태스크가 소비할 채널들과 kill용 pid.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 struct PtyProcess {
     pid: Option<u32>,
     chunks_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
     exit_rx: tokio::sync::oneshot::Receiver<Result<i32, String>>,
-    // 프로덕션은 스레드를 join하지 않는다(자체 회수) — 회수 회귀 테스트 전용 핸들.
-    #[cfg_attr(not(test), allow(dead_code))]
+    // 프로덕션은 스레드를 join하지 않는다(자체 회수/EOF 귀결) — 회수 회귀 테스트 전용
+    // 핸들. windows 팔은 conpty 통합 테스트(S4)가 읽기 전까지 test 빌드에서도 미사용.
+    #[cfg_attr(any(not(test), windows), allow(dead_code))]
     reader_thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -624,18 +717,49 @@ fn pty_reader_thread(fd: std::os::fd::OwnedFd, tx: tokio::sync::mpsc::Sender<Vec
     }
 }
 
+/// ConPTY reader 스레드: blocking read → bounded 채널. unix 트윈과 달리 poll이 없다 —
+/// try_clone_reader는 raw HANDLE을 노출하지 않는 `Box<dyn Read>`라 대기 이탈 수단이
+/// 없고, EOF는 자식 종료가 아니라 **ClosePseudoConsole(master drop) 이후에만** 온다.
+///
+/// 핵심 불변식 — **drain-discard**: 수신측이 사라지면(`blocking_send` Err) 전달을
+/// 단방향으로 끄고 EOF까지 계속 읽어 버린다. ClosePseudoConsole은 미소비 출력이
+/// 남아 있으면 드롭 스레드를 블록하는데, 이 드레인이 그 블록을 보증 해제한다.
+/// 수신측 소멸 후에만 버리므로 관측자가 없어 순서 역전도 없다.
+/// 종료: Ok(0) 또는 Err(BrokenPipe 등) — Windows 익명 파이프는 EOF를 어느 쪽으로도
+/// 표현할 수 있어 Interrupted 외 모든 Err를 EOF 등가로 취급한다.
+#[cfg(windows)]
+fn pty_reader_thread(
+    mut reader: Box<dyn std::io::Read + Send>,
+    tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+) {
+    let mut buf = [0u8; 8192];
+    let mut forwarding = true;
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                if forwarding && tx.blocking_send(buf[..n].to_vec()).is_err() {
+                    forwarding = false;
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+}
+
 /// PTY를 열고 명령을 스폰한다. 성공 시 세션 I/O(마스터·writer)를 레지스트리에 등록하고
 /// reader 스레드·waiter(blocking wait 소유)를 기동한다.
 ///
-/// 에러 구분: `openpty` 실패는 `Err(PtyUnavailable)`로 돌려 pipe 폴백을 허용하고,
-/// spawn 실패는 명령 문제이므로 폴백 없이 사용자에게 그대로 보고한다.
-#[cfg(unix)]
+/// 에러 구분: `openpty` 실패/ConPTY 부재는 `Err(PtyUnavailable)`로 돌려 pipe 폴백을
+/// 허용하고, spawn 실패는 명령 문제이므로 폴백 없이 사용자에게 그대로 보고한다.
+#[cfg(any(unix, windows))]
 enum PtySpawnError {
     PtyUnavailable(String),
     Spawn(String),
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn spawn_in_pty(
     config: &RunConfiguration,
     command_str: &str,
@@ -644,6 +768,15 @@ fn spawn_in_pty(
     viewport: (u16, u16),
 ) -> Result<PtyProcess, PtySpawnError> {
     use portable_pty::{PtySize, native_pty_system};
+
+    // ConPTY 부재(<1809)면 openpty가 Err가 아니라 panic이다 — 반드시 여기서 걸러
+    // pipe 폴백으로 보낸다.
+    #[cfg(windows)]
+    if !conpty_available() {
+        return Err(PtySpawnError::PtyUnavailable(String::from(
+            "ConPTY not supported (Windows 10 1809+ required)",
+        )));
+    }
 
     let pair = native_pty_system()
         .openpty(PtySize {
@@ -659,15 +792,18 @@ fn spawn_in_pty(
         .slave
         .spawn_command(cmd)
         .map_err(|e| PtySpawnError::Spawn(format!("Failed to spawn process: {e}")))?;
-    // slave를 부모에서 즉시 닫아야 자식 종료 시 master reader가 EOF를 받는다.
+    // unix: slave fd를 부모에서 즉시 닫아야 자식 종료 시 master reader가 EOF를 받는다.
+    // windows: master와 같은 Arc<Inner>의 참조 하나를 줄일 뿐(무해) — 이후 레지스트리의
+    // master가 Inner의 유일 소유자가 되어, unregister가 단일 teardown 트리거가 된다.
     drop(pair.slave);
 
     let pid = child.process_id();
 
-    // 리더용 fd는 try_clone_reader(Box<dyn Read> — raw fd 접근 불가) 대신 직접 dup한다:
-    // pty_reader_thread가 poll하려면 raw fd가 필요하다. F_DUPFD_CLOEXEC로 복제해
-    // 이후 스폰되는 다른 세션 자식에게 새지 않게 한다(try_clone_reader 내부와 동일 방식).
-    let reader_fd = {
+    // 리더 소스 — unix: poll이 필요해 raw fd를 직접 dup(F_DUPFD_CLOEXEC — 타 세션
+    // 자식에 누출 방지, try_clone_reader 내부와 동일 방식). windows: raw HANDLE
+    // 접근이 불가하므로 try_clone_reader(DuplicateHandle — Inner 수명과 독립)를 쓴다.
+    #[cfg(unix)]
+    let reader_src = {
         use std::os::fd::{FromRawFd, OwnedFd};
 
         let raw = pair
@@ -683,6 +819,12 @@ fn spawn_in_pty(
         }
         unsafe { OwnedFd::from_raw_fd(dup) }
     };
+    #[cfg(windows)]
+    let reader_src = pair
+        .master
+        .try_clone_reader()
+        .map_err(|e| PtySpawnError::Spawn(format!("Failed to clone pty reader: {e}")))?;
+
     let writer = pair
         .master
         .take_writer()
@@ -700,7 +842,7 @@ fn spawn_in_pty(
     let (chunks_tx, chunks_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
     let reader_thread = std::thread::Builder::new()
         .name(format!("pty-read-{session_id}"))
-        .spawn(move || pty_reader_thread(reader_fd, chunks_tx))
+        .spawn(move || pty_reader_thread(reader_src, chunks_tx))
         .ok();
 
     // waiter가 child를 소유하고 blocking wait로 reap한다 (좀비 방지, 스트림 패닉과 무관).
@@ -768,7 +910,9 @@ async fn send_command_info(
 }
 
 /// PTY 세션 파이프라인: ProcessStarted → 조립 루프 → (취소 시 종료 처리) → RunCompleted.
-#[cfg(unix)]
+/// 플랫폼 차이는 동명 트윈(pty_output_loop/terminate_and_reap_pty) 안에 있고
+/// 이 파이프라인 자체는 공유된다.
+#[cfg(any(unix, windows))]
 async fn handle_pty_process(
     output: &mut iced::futures::channel::mpsc::Sender<Message>,
     session_id: Uuid,
@@ -806,7 +950,7 @@ async fn handle_pty_process(
 }
 
 /// PTY 조립 루프의 종료 사유.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 enum PtyLoopEnd {
     /// 취소. `exit_taken`은 취소 시점에 exit 팔이 **이미 소비한** 종료 상태 —
     /// tokio oneshot은 완료 후 재폴링하면 panic하므로("called after complete"),
@@ -908,14 +1052,146 @@ async fn pty_output_loop(
     }
 }
 
+/// ConPTY 종료 상태기계 상수 — exit 후 "마지막 청크로부터"의 quiet 유예. conhost의
+/// 최종 flush(<50ms 통상)와 CI VM 지터를 덮되 체감 지연은 없앤다. 청크가 올 때마다
+/// 갱신되는 quiet 타이머라 계속 말하는 손자 스트림은 끊지 않는다.
+#[cfg(windows)]
+const CONPTY_EXIT_QUIET_GRACE: Duration = Duration::from_millis(300);
+/// teardown(ClosePseudoConsole) 착수 후 EOF 하드 실링 — conhost가 비정상 wedge돼도
+/// 세션이 is_running에 고착되지 않게 Completed로 강제 귀결한다. 트립 시 리더/블로킹풀
+/// 스레드는 EOF가 실제로 올 때까지 남는다(유계 누수, 문서화된 트레이드오프).
+#[cfg(windows)]
+const CONPTY_EOF_FAILSAFE: Duration = Duration::from_secs(5);
+
+/// ConPTY 출력 조립 루프 — unix 트윈과 같은 배관(cancel/flush/청크/exit)에 **종료
+/// 상태기계**가 추가된다. ConPTY는 자식이 exit해도 EOF를 주지 않는다(EOF는 오직
+/// ClosePseudoConsole 이후). unix처럼 "exit 후 EOF까지 드레인"만 하면 EOF←master
+/// drop←루프 종료←EOF의 순환 대기가 되므로: exit 기록 → 마지막 청크 기준 quiet-grace
+/// (300ms, 청크마다 갱신 — 수다스런 손자는 안 끊김) → **블로킹 풀에서** unregister
+/// (ClosePseudoConsole; 루프는 계속 소비해 정상 배관으로 꼬리를 드레인 — 루프 태스크
+/// 인라인 unregister는 [Close 블록 ↔ 리더 blocking_send ↔ 수신 없는 루프] 3자 교착)
+/// → 리더 EOF → 기존 EOF 분기로 Completed. failsafe(5s, teardown 착수 시점 무장)는
+/// wedge된 conhost에서도 세션 고착을 방지한다.
+///
+/// 상태 전이(가드가 핵심): teardown 팔 `teardown_at.is_some() && !teardown_started`
+/// (없으면 과거 시각으로 매 반복 spawn_blocking 스핀), failsafe는 teardown 착수
+/// 시점에만 무장(exit 시점 기준이면 5s 넘게 말하는 손자를 조기 절단), biased 순서
+/// cancel→flush→청크→exit→teardown→failsafe (동시 준비 시 청크가 grace를 먼저 갱신;
+/// failsafe는 청크가 흐르는 동안 굶는데 그게 정확한 의미 — 진행 중엔 실링 불필요).
+#[cfg(windows)]
+async fn pty_output_loop(
+    output: &mut iced::futures::channel::mpsc::Sender<Message>,
+    session_id: Uuid,
+    chunks_rx: &mut tokio::sync::mpsc::Receiver<Vec<u8>>,
+    exit_rx: &mut tokio::sync::oneshot::Receiver<Result<i32, String>>,
+    cancel_flag: &Arc<AtomicBool>,
+) -> PtyLoopEnd {
+    let mut assembler = LineAssembler::new();
+    let mut batch = EventBatch::default();
+    let mut flush_at: Option<Instant> = None;
+    let mut exit_status: Option<Result<i32, String>> = None;
+    let mut teardown_at: Option<Instant> = None;
+    let mut teardown_started = false;
+    let mut failsafe_at: Option<Instant> = None;
+
+    loop {
+        tokio::select! {
+            biased;
+
+            () = wait_for_cancel(cancel_flag) => {
+                // Stop은 즉시성이 우선: 버퍼된 청크는 버린다 (unix 트윈과 동일).
+                assembler.emit_partial(&mut batch);
+                flush_event_batch(output, session_id, &mut batch).await;
+                return PtyLoopEnd::Cancelled {
+                    exit_taken: exit_status.take(),
+                };
+            }
+
+            () = wait_flush_deadline(flush_at), if !batch.is_empty() || assembler.has_pending() => {
+                assembler.emit_partial(&mut batch);
+                flush_event_batch(output, session_id, &mut batch).await;
+                flush_at = None;
+            }
+
+            chunk = chunks_rx.recv() => {
+                match chunk {
+                    Some(bytes) => {
+                        let was_empty = batch.is_empty() && !assembler.has_pending();
+                        assembler.push_bytes(&bytes, &mut batch);
+                        if was_empty && (!batch.is_empty() || assembler.has_pending()) {
+                            flush_at = Some(Instant::now() + OUTPUT_FLUSH_INTERVAL);
+                        }
+                        // quiet 타이머 갱신: exit 후에도 출력이 흐르는 동안은 살려 둔다.
+                        if exit_status.is_some() && !teardown_started {
+                            teardown_at = Some(Instant::now() + CONPTY_EXIT_QUIET_GRACE);
+                        }
+                    }
+                    // EOF: ClosePseudoConsole 이후에만 도달한다 (teardown 정상 귀결
+                    // 또는 conhost 사망).
+                    None => {
+                        assembler.finalize(&mut batch);
+                        flush_event_batch(output, session_id, &mut batch).await;
+                        if let Some(status) = exit_status.take() {
+                            return PtyLoopEnd::Completed(status);
+                        }
+                        // exit 전 EOF(conhost 비정상 사망): 종료 또는 취소 대기.
+                        tokio::select! {
+                            biased;
+                            () = wait_for_cancel(cancel_flag) => {
+                                return PtyLoopEnd::Cancelled { exit_taken: None };
+                            }
+                            status = &mut *exit_rx => {
+                                return PtyLoopEnd::Completed(status.unwrap_or_else(|_| {
+                                    Err(String::from("Process exit status unavailable"))
+                                }));
+                            }
+                        }
+                    }
+                }
+            }
+
+            status = &mut *exit_rx, if exit_status.is_none() => {
+                exit_status = Some(status.unwrap_or_else(|_| {
+                    Err(String::from("Process exit status unavailable"))
+                }));
+                // 종료 상태기계 무장: 마지막 청크로부터 quiet-grace 후 teardown.
+                teardown_at = Some(Instant::now() + CONPTY_EXIT_QUIET_GRACE);
+            }
+
+            () = wait_flush_deadline(teardown_at), if teardown_at.is_some() && !teardown_started => {
+                teardown_started = true;
+                teardown_at = None;
+                failsafe_at = Some(Instant::now() + CONPTY_EOF_FAILSAFE);
+                // ClosePseudoConsole은 미소비 출력이 드레인될 때까지 블록할 수 있어
+                // 블로킹 풀로 보낸다 — 이 루프는 계속 소비하며 EOF로 자연 귀결된다.
+                tokio::task::spawn_blocking(move || unregister_session_io(session_id));
+            }
+
+            () = wait_flush_deadline(failsafe_at), if failsafe_at.is_some() => {
+                assembler.finalize(&mut batch);
+                flush_event_batch(output, session_id, &mut batch).await;
+                return PtyLoopEnd::Completed(exit_status.take().unwrap_or_else(|| {
+                    Err(String::from("Process exit status unavailable"))
+                }));
+            }
+        }
+
+        // 크기 임계는 메모리 가드로만 — 페이싱은 16ms 마감이 담당 (unix 트윈 주석 참조).
+        if batch.len() >= PTY_FLUSH_MAX_EVENTS || batch.bytes >= PTY_FLUSH_MAX_BYTES {
+            flush_event_batch(output, session_id, &mut batch).await;
+            flush_at = None;
+        }
+    }
+}
+
 /// PTY 배치 메모리 가드 (pipe 경로의 64/16KiB와 별개 — 위 주석 참조).
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 const PTY_FLUSH_MAX_EVENTS: usize = 8192;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 const PTY_FLUSH_MAX_BYTES: usize = 256 * 1024;
 
 /// 이벤트 배치를 한 개의 `OutputReceived`로 전송. 비어 있으면 no-op.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 async fn flush_event_batch(
     output: &mut iced::futures::channel::mpsc::Sender<Message>,
     session_id: Uuid,
@@ -963,6 +1239,26 @@ async fn terminate_and_reap_pty(
             signal_process_group(pid, libc::SIGKILL);
         }
         let _ = (&mut *exit_rx).await;
+    }
+}
+
+/// ConPTY 자식 종료: taskkill /T /F(트리 — 크레이트의 WinChild::kill은 직계만이라
+/// 부적합) → waiter reap 대기. TerminateProcess는 대상이 거부할 수 없어 waiter 완료가
+/// 사실상 보장되지만, taskkill 실패 엣지(권한 등)에서 Stop이 스트림을 못 매달게 5s로
+/// 바운드한다. exit_taken이 Some이면 oneshot이 이미 소비됐으므로 await를 건너뛴다
+/// (재폴링은 panic). PTY teardown(ClosePseudoConsole)은 이후 CompletionGuard의
+/// unregister가 담당 — conhost는 우리 자식이라 taskkill /T에 걸리지 않는다.
+#[cfg(windows)]
+async fn terminate_and_reap_pty(
+    pid: Option<u32>,
+    exit_rx: &mut tokio::sync::oneshot::Receiver<Result<i32, String>>,
+    exit_taken: Option<Result<i32, String>>,
+) {
+    if let Some(pid) = pid {
+        force_kill_process_tree(pid);
+    }
+    if exit_taken.is_none() {
+        let _ = tokio::time::timeout(Duration::from_secs(5), &mut *exit_rx).await;
     }
 }
 
@@ -1229,17 +1525,12 @@ fn lines_to_events(payload: &str) -> Vec<OutputEvent> {
 /// flush 대기 중인 출력 이벤트 배치. 같은 논리 라인에 대한 연속 `Replace`는 직전
 /// 이벤트에 제자리 병합된다 — Replace는 항상 "직전에 방출된 라인"을 겨냥하므로 배치
 /// 안에서는 마지막 상태만 의미가 있다 ([Line a, Replace a', Replace a''] → [Line a'']).
-// EventBatch/LineAssembler는 PTY(unix) 경로에서만 구성된다. Windows에서 타입 자체를
-// cfg로 걷어내면 유닛 테스트도 함께 게이트해야 하므로, dead_code allow로 갈음한다
-// (windows CI는 check라 경고로만 보이지만, 게이트가 조여져도 깨지지 않게 선제 적용).
 #[derive(Default)]
-#[cfg_attr(windows, allow(dead_code))]
 struct EventBatch {
     events: Vec<OutputEvent>,
     bytes: usize,
 }
 
-#[cfg_attr(windows, allow(dead_code))]
 impl EventBatch {
     fn push(&mut self, event: OutputEvent) {
         if let OutputEvent::Replace(new_text) = &event
@@ -1281,7 +1572,6 @@ impl EventBatch {
 /// - 방출 텍스트에 `\r`은 절대 포함되지 않는다 (session측 collapse는 방어선)
 /// - UTF-8 경계: flush 방출은 유효 prefix까지만 표시하고 잔여 바이트는 보류
 ///   (멀티바이트 문자가 청크에 걸릴 때 U+FFFD 깜빡임 방지); 라인 확정 시엔 lossy 전체
-#[cfg_attr(windows, allow(dead_code))]
 struct LineAssembler {
     /// 현재 미완 논리 라인의 바이트 (\r 미포함).
     partial: Vec<u8>,
@@ -1293,7 +1583,6 @@ struct LineAssembler {
     dirty: bool,
 }
 
-#[cfg_attr(windows, allow(dead_code))]
 impl LineAssembler {
     fn new() -> Self {
         Self {
