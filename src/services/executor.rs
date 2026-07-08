@@ -68,7 +68,7 @@ fn signal_process_group(pid: u32, signal: i32) {
 }
 
 /// PID로 프로세스 트리를 강제 종료 (비동기 컨텍스트 밖에서도 호출 가능).
-fn force_kill_process_tree(pid: u32) {
+pub fn force_kill_process_tree(pid: u32) {
     #[cfg(unix)]
     {
         // 그룹 리더 전제(process_group(0)/setsid) 하에 그룹 전체 SIGKILL — 가드 포함.
@@ -166,11 +166,13 @@ pub fn resize_session_pty(session_id: Uuid, cols: u16, rows: u16) {
 /// 순서를 보존하므로 재제출 없이 그대로 두면 중복도 없다).
 const STDIN_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// 세션 stdin에 한 줄을 쓴다 (`\n` 자동 부가).
+/// 세션 stdin에 한 줄을 쓴다 (줄 종결자 자동 부가 — 전송별: unix PTY `\n`,
+/// Windows ConPTY `\r`, 폴백 pipe `\n`).
 ///
-/// 에코 규칙("에코는 전송의 책임"): PTY는 라인 디시플린이 에코를 만들어 출력 스트림에
-/// 나타나므로 앱이 다시 표시하면 중복이다. Windows pipe는 에코가 없으므로 반환값
-/// `Ok(true)`(로컬 에코 필요)로 호출 측이 세션 로그에 직접 표시한다.
+/// 에코 규칙("에코는 전송의 책임"): PTY(unix)/ConPTY(Windows)는 터미널이 에코를
+/// 만들어 출력 스트림에 나타나므로 앱이 다시 표시하면 중복이다. Windows <1809의
+/// 폴백 pipe만 에코가 없어 반환값 `Ok(true)`(로컬 에코 필요)로 호출 측이 세션
+/// 로그에 직접 표시한다.
 ///
 /// unix pipe 폴백(writer 없음)·미등록 세션은 `Broken`으로 즉시 실패한다.
 pub async fn write_session_stdin(
@@ -197,11 +199,21 @@ pub async fn write_session_stdin(
         }
     };
 
+    // 줄 종결자는 전송별로 다르다 — writer가 판별된 뒤 각 arm에서 붙인다.
+    // ConPTY(WIN32_INPUT_MODE): Enter는 CR 한 개. '\n' 단독은 cooked 콘솔 앱
+    // (ReadConsole 라인 모드)에 제출되지 않고, '\r\n'은 CR+LF 두 키 입력으로
+    // 번역될 수 있어(raw 리더에 빈 Enter 중복) 단일 '\r'을 쓴다 — 터미널
+    // 에뮬레이터의 Enter와 동일. unix PTY는 기존대로 '\n'.
+    #[cfg(windows)]
+    const PTY_STDIN_EOL: char = '\r';
+    #[cfg(not(windows))]
+    const PTY_STDIN_EOL: char = '\n';
+
     let mut payload = line;
-    payload.push('\n');
 
     match writer {
         WriterHandle::Pty(w) => {
+            payload.push(PTY_STDIN_EOL);
             let write = tokio::task::spawn_blocking(move || {
                 use std::io::Write;
                 let mut writer = w
@@ -223,6 +235,7 @@ pub async fn write_session_stdin(
         #[cfg(windows)]
         WriterHandle::Pipe(w) => {
             use tokio::io::AsyncWriteExt;
+            payload.push('\n'); // pipe stdin(<1809 폴백)은 기존대로 LF
             let write = async {
                 let mut writer = w.lock().await;
                 writer
@@ -232,7 +245,7 @@ pub async fn write_session_stdin(
                 writer.flush().await.map_err(|e| e.to_string())
             };
             match tokio::time::timeout(STDIN_WRITE_TIMEOUT, write).await {
-                Ok(result) => result.map_err(StdinWriteError::Broken).map(|()| true), // pipe — 로컬 에코 필요
+                Ok(result) => result.map_err(StdinWriteError::Broken).map(|()| true), // 폴백 pipe — 로컬 에코 필요
                 Err(_) => Err(StdinWriteError::Timeout),
             }
         }

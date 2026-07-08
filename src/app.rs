@@ -5,9 +5,9 @@ use crate::models::{
     SessionStatusKind, WorkspaceTab,
 };
 use crate::services::{
-    AppSettings, UpdateOutcome, check_latest_release, export_text, load_or_migrate_store,
-    load_settings, register_running_pid, run_configuration_stream, save_settings, save_to_store,
-    terminate_session_process, unregister_running_pid,
+    AppSettings, UpdateOutcome, check_latest_release, export_text, force_kill_process_tree,
+    load_or_migrate_store, load_settings, register_running_pid, run_configuration_stream,
+    save_settings, save_to_store, terminate_session_process, unregister_running_pid,
 };
 use crate::utils::{DIALOG_CANCELLED, ICON_DELETE, ICON_PLAY, ICON_REFRESH, ICON_STOP};
 use crate::views::shared::icon_tooltip;
@@ -2862,7 +2862,8 @@ impl RunConfigManager {
     }
 
     /// stdin 제출: 드래프트를 낙관적으로 비우고 전송 Task를 띄운다.
-    /// 원문은 완료 메시지에 실어 보낸다 — 하드 실패 시 복원, pipe 성공 시 로컬 에코.
+    /// 원문은 완료 메시지에 실어 보낸다 — 하드 실패 시 복원, 폴백 pipe(<1809) 성공
+    /// 시 로컬 에코.
     fn handle_session_stdin_submitted(&mut self, session_id: Uuid) -> Task<Message> {
         let Some(session) = self.session_by_id_mut(session_id) else {
             return Task::none();
@@ -2882,8 +2883,9 @@ impl RunConfigManager {
     }
 
     /// stdin 쓰기 결과 처리.
-    /// - `Ok(true)`: pipe 경로 성공 — 에코가 없으므로 세션 로그에 로컬 에코.
-    /// - `Ok(false)`: PTY 성공 — 라인 디시플린 에코가 출력으로 돌아오므로 아무것도 안 함.
+    /// - `Ok(true)`: 폴백 pipe(Windows <1809) 성공 — 에코가 없으므로 세션 로그에 로컬 에코.
+    /// - `Ok(false)`: PTY(unix)/ConPTY(Windows) 성공 — 터미널 에코가 출력으로 돌아오므로
+    ///   아무것도 안 함.
     /// - `Timeout`: 조기 신호일 뿐(쓰기는 백그라운드에서 완료됨) — 복원 금지(복원 후
     ///   재제출 = 중복 입력), 상태 메시지만.
     /// - `Broken`: 하드 실패 — 사용자가 그 사이 새로 타이핑하지 않았다면 드래프트 복원.
@@ -5055,30 +5057,14 @@ impl Drop for RunConfigManager {
         // terminate_and_reap가 담당하고, 여기서는 종료 시 자식 누수 방지가 목적이다.
         for session in &running_sessions {
             if let Some(pid) = session.process_pid {
-                #[cfg(unix)]
-                unsafe {
-                    // Unix: 프로세스 그룹 전체에 SIGKILL
-                    libc::killpg(pid as i32, libc::SIGKILL);
-                    eprintln!(
-                        "[Shutdown] Sent SIGKILL to PID {} ({})",
-                        pid, session.config_name
-                    );
-                }
-
-                #[cfg(windows)]
-                {
-                    // Windows: /T /F로 프로세스 트리 강제 종료
-                    use std::os::windows::process::CommandExt;
-                    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-                    let _ = std::process::Command::new("taskkill")
-                        .args(["/PID", &pid.to_string(), "/T", "/F"])
-                        .creation_flags(CREATE_NO_WINDOW)
-                        .output();
-                    eprintln!(
-                        "[Shutdown] Force killed PID {} ({})",
-                        pid, session.config_name
-                    );
-                }
+                // executor의 공용 트리 킬로 위임 — 과거 인라인 killpg는 자기그룹
+                // 사살 가드(signal_process_group의 getpgid 검사)가 없어, pid==pgid
+                // 전제가 깨지면 종료 시 앱을 띄운 터미널 그룹까지 죽일 수 있었다.
+                force_kill_process_tree(pid);
+                eprintln!(
+                    "[Shutdown] Force killed PID {} ({})",
+                    pid, session.config_name
+                );
             }
         }
 
@@ -5501,12 +5487,12 @@ mod tests {
         );
         assert!(app.status_message.contains("Input pending"));
 
-        // Ok(true) = pipe 성공 → 로컬 에코 한 줄.
+        // Ok(true) = 폴백 pipe(Windows <1809) 성공 → 로컬 에코 한 줄.
         let before = app.session_by_id_mut(sid).unwrap().output_lines.len();
         let _ = app.handle_session_stdin_write_completed(sid, String::from("echoed"), Ok(true));
         let session = app.session_by_id_mut(sid).unwrap();
         assert_eq!(session.output_lines.len(), before + 1);
-        // Ok(false) = PTY 성공 → 에코 없음 (전송이 담당).
+        // Ok(false) = PTY/ConPTY 성공 → 에코 없음 (전송이 담당).
         let before = session.output_lines.len();
         let _ = app.handle_session_stdin_write_completed(sid, String::from("quiet"), Ok(false));
         assert_eq!(

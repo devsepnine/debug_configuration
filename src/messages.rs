@@ -337,8 +337,8 @@ pub enum Message {
     SessionStdinChanged(Uuid, String),
     /// stdin 드래프트 제출 — 프로세스 stdin으로 전송 (`session_id`)
     SessionStdinSubmitted(Uuid),
-    /// stdin 쓰기 완료 (`session_id`, 제출 원문(실패 복원·pipe 로컬 에코용),
-    /// 성공 시 로컬 에코 필요 여부 / 실패 사유)
+    /// stdin 쓰기 완료 (`session_id`, 제출 원문(실패 복원·폴백 pipe 로컬 에코용),
+    /// 성공 시 로컬 에코 필요 여부(PTY/ConPTY=false, <1809 폴백 pipe=true) / 실패 사유)
     SessionStdinWriteCompleted(Uuid, String, Result<bool, crate::models::StdinWriteError>),
     /// 활성 pane 세션에 stdin 바 열기 (Cmd+I — 대상은 핸들러가 해석, Sessions 뷰 전용)
     OpenStdinInActivePane,
