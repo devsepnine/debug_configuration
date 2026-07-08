@@ -46,11 +46,12 @@ Rust와 iced GUI 프레임워크로 개발되었으며, 여러 프로그램 실�
 
 ### 실행 세션 관리
 - 다중 세션 동시 실행
-- macOS/Linux에서 진짜 PTY 실행: 프로그램이 터미널을 감지해 색상·진행바·
-  대화형 프롬프트가 실제 셸처럼 동작 (`TERM=xterm-256color`, 뷰포트 연동 resize)
-- 라이브 한 줄 진행바 (캐리지 리턴 재그리기를 제자리에서 렌더)
+- 모든 플랫폼에서 진짜 터미널 실행: macOS/Linux는 PTY, Windows 10 1809+는
+  ConPTY — 프로그램이 실제 콘솔을 감지해 색상·진행바·대화형 프롬프트가 실제
+  셸처럼 동작 (뷰포트 연동 resize; unix는 `TERM=xterm-256color`)
+- 라이브 한 줄 진행바 (캐리지 리턴 재그리기를 제자리에서 렌더; 백스페이스 소거)
 - 세션별 stdin 입력바 (토글 버튼 또는 Cmd+I): 프롬프트 응답·REPL 입력 —
-  PTY가 에코를 자연 처리, Windows(pipe)는 앱이 로컬 에코
+  터미널이 에코를 자연 처리, 구형 Windows pipe 폴백(1809 미만)만 앱이 로컬 에코
 - 실시간 출력 표시 (ANSI 색상 지원; OSC/DCS 제어 시퀀스는 걸러냄)
 - 세션 재실행, 중지, 제거, 워크스페이스에서 숨김
 - 완료된 세션의 상태 배지 (성공 / 실패 종료 코드 / 실행 시간)
@@ -231,11 +232,15 @@ open /Applications/RunConfigManager.app
 - **풀스크린 TUI 앱은 비지원**: 터미널이 스크린 그리드가 아니라 라인 스크롤백
   렌더러라 `vim`, `htop`, `less` 같은 alt-screen 프로그램은 화면이 깨집니다
   (앱은 정상 동작 — Stop으로 복구). `input()`, `read`, REPL 같은 라인 기반
-  대화형 프롬프트는 동작합니다.
-- **Windows는 pipe로 실행** (ConPTY는 후속 예정): 색상/진행바는 도구의 비-tty
-  출력 지원에 따르고, stdin 입력은 로컬 에코로 동작합니다. `-NonInteractive`
-  제거로 예기치 않은 PowerShell 프롬프트가 대기(행처럼 보임)할 수 있습니다 —
-  Stop으로 종료하세요.
+  대화형 프롬프트는 동작합니다. 탭 문자는 리터럴로 표시됩니다(컬럼 확장 없음).
+- **Windows 특이사항**: ConPTY는 이미 렌더링된 VT 스트림을 전달하고 앱은 이를
+  라인 스크롤백으로 표시합니다 — 커서 위주 편집은 라인 단위로 근사됩니다
+  (백스페이스 소거, 캐리지 리턴 라인 재작성). Stop은 `taskkill /T /F` 하드
+  종료라 종료 코드가 보통 1로 보고됩니다(드물게 259/STILL_ACTIVE 관측 가능).
+  자식 종료 후 ~300ms간 침묵한 손자 프로세스의 이후 출력은 잘립니다(unix는
+  실제 EOF까지 유지). ConPTY가 없는 Windows 10 1809 미만은 pipe로 폴백 —
+  색상/진행바 없음, 로컬 에코, 세션에 배너 표시. 예기치 않은 PowerShell
+  프롬프트 대기(행처럼 보임 — Stop으로 종료) 노트는 이 폴백에만 해당합니다.
 - macOS/Linux에서 `sh -l` + 진짜 tty 조합이라 셸 프로파일의 배너가 세션 출력에
   나타날 수 있습니다.
 
@@ -243,9 +248,9 @@ open /Applications/RunConfigManager.app
 
 애플리케이션 종료 시 실행 중인 모든 프로세스를 자동으로 정리합니다:
 1. Ctrl+C 또는 창 닫기 시 Drop trait 실행
-2. 모든 세션에 SIGTERM (또는 Windows에서 taskkill) 전송
-3. 2초 대기 (Graceful shutdown 기회 제공)
-4. 남아있는 프로세스 강제 종료 (SIGKILL 또는 taskkill /F)
+2. Unix: 세션별 프로세스 그룹에 SIGTERM → 2초 유예 → 잔여 SIGKILL
+3. Windows: 즉시 `taskkill /T /F` — ConPTY에는 graceful 신호 경로가 없어
+   트리를 강제 종료
 
 ## 라이선스
 
