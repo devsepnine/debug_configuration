@@ -2544,6 +2544,15 @@ impl RunConfigManager {
         events: &[crate::models::OutputEvent],
     ) -> Task<Message> {
         if let Some(session) = self.session_by_id_mut(session_id) {
+            // Stop 요청 후 채널에 이미 쌓여 있던 잔여 배치는 폐기한다 — Stop의 의미
+            // (즉시 중단)와 일치하고, 생산자도 cancel 시 버퍼 청크를 버린다(대칭).
+            // 이게 없으면 출력 폭주 중 Stop이 수 초 늦어 보인다: 정지 표시를 만드는
+            // RunCompleted가 큐에 쌓인 대형 배치들 **뒤에서** 도착하기 때문. 폐기로
+            // 큐가 즉시 비면 생산자의 blocked send도 풀려 cancel 감지도 빨라진다.
+            // rerun은 세션 id 스왑 + cancel_flag 새 Arc 교체라 새 실행과 무관하다.
+            if session.cancel_flag.load(Ordering::Relaxed) {
+                return Task::none();
+            }
             // executor가 묶어 보낸 이벤트 배치 (process_output_loop의 coalescing —
             // UI 메시지 폭주 방지). Line=추가, Replace=마지막 라인 교체(라이브 진행바).
             for event in events {
@@ -5354,6 +5363,45 @@ mod tests {
             .find(|s| s.config_name == "a")
             .expect("session survives rerun");
         assert_eq!(session.stdin_input.as_deref(), Some("typed"));
+    }
+
+    #[test]
+    fn stop_discards_output_queued_behind_cancel() {
+        // Stop(cancel) 후 채널에 남아 있던 출력 배치는 폐기되어야 한다 — 아니면 폭주 중
+        // Stop 시 RunCompleted가 대형 배치들 뒤로 밀려 정지가 수 초 늦어 보인다.
+        use crate::models::OutputEvent;
+        let (mut app, ids) = manager_with_open_panes(&["a"]);
+        let sid = ids[0];
+        app.session_by_id_mut(sid).unwrap().is_running = true;
+
+        let _ = app.handle_output_received(sid, &[OutputEvent::Line(String::from("before"))]);
+        let before = app.session_by_id_mut(sid).unwrap().output_lines.len();
+        assert!(before > 0, "테스트 전제: cancel 전 출력은 적용");
+
+        let _ = app.handle_stop_session(sid);
+        let _ = app.handle_output_received(sid, &[OutputEvent::Line(String::from("late"))]);
+        assert_eq!(
+            app.session_by_id_mut(sid).unwrap().output_lines.len(),
+            before,
+            "cancel 후 도착한 배치는 폐기"
+        );
+
+        // rerun은 cancel_flag를 새 Arc로 교체하므로 새 실행의 출력은 다시 적용된다.
+        let _ = app.handle_rerun_session(sid);
+        let new_sid = app
+            .sessions
+            .iter()
+            .find(|s| s.config_name == "a")
+            .expect("session survives rerun")
+            .id;
+        let _ = app.handle_output_received(new_sid, &[OutputEvent::Line(String::from("fresh"))]);
+        assert!(
+            !app.session_by_id_mut(new_sid)
+                .unwrap()
+                .output_lines
+                .is_empty(),
+            "rerun 후 새 실행 출력은 적용"
+        );
     }
 
     #[test]
