@@ -790,8 +790,8 @@ async fn handle_pty_process(
     )
     .await
     {
-        PtyLoopEnd::Cancelled => {
-            terminate_and_reap_pty(pty.pid, &mut pty.exit_rx).await;
+        PtyLoopEnd::Cancelled { exit_taken } => {
+            terminate_and_reap_pty(pty.pid, &mut pty.exit_rx, exit_taken).await;
             send_run_result(
                 output,
                 session_id,
@@ -808,7 +808,13 @@ async fn handle_pty_process(
 /// PTY 조립 루프의 종료 사유.
 #[cfg(unix)]
 enum PtyLoopEnd {
-    Cancelled,
+    /// 취소. `exit_taken`은 취소 시점에 exit 팔이 **이미 소비한** 종료 상태 —
+    /// tokio oneshot은 완료 후 재폴링하면 panic하므로("called after complete"),
+    /// 소비 여부를 운반해 terminate_and_reap_pty가 재await를 건너뛰게 한다.
+    /// (자식은 exit했는데 손자가 pty를 쥐고 있어 드레인 중 Stop이 오는 시나리오.)
+    Cancelled {
+        exit_taken: Option<Result<i32, String>>,
+    },
     Completed(Result<i32, String>),
 }
 
@@ -839,7 +845,9 @@ async fn pty_output_loop(
                 // 같은 종류의 트레이드오프(창이 조금 더 클 뿐).
                 assembler.emit_partial(&mut batch);
                 flush_event_batch(output, session_id, &mut batch).await;
-                return PtyLoopEnd::Cancelled;
+                return PtyLoopEnd::Cancelled {
+                    exit_taken: exit_status.take(),
+                };
             }
 
             () = wait_flush_deadline(flush_at), if !batch.is_empty() || assembler.has_pending() => {
@@ -867,7 +875,10 @@ async fn pty_output_loop(
                         // EOF인데 자식이 아직 안 끝남(드묾): 종료 또는 취소 대기.
                         tokio::select! {
                             biased;
-                            () = wait_for_cancel(cancel_flag) => return PtyLoopEnd::Cancelled,
+                            () = wait_for_cancel(cancel_flag) => {
+                                // 이 분기는 exit_status가 None일 때만 도달 (EOF 후 대기 중).
+                                return PtyLoopEnd::Cancelled { exit_taken: None };
+                            }
                             status = &mut *exit_rx => {
                                 return PtyLoopEnd::Completed(status.unwrap_or_else(|_| {
                                     Err(String::from("Process exit status unavailable"))
@@ -927,9 +938,22 @@ async fn flush_event_batch(
 async fn terminate_and_reap_pty(
     pid: Option<u32>,
     exit_rx: &mut tokio::sync::oneshot::Receiver<Result<i32, String>>,
+    exit_taken: Option<Result<i32, String>>,
 ) {
+    // 그룹 시그널은 exit_taken과 **무관하게 항상** 보낸다 — 자식이 이미 exit했어도
+    // pty를 쥔 손자가 그룹에 남아 있을 수 있다(이 시나리오가 exit_taken의 존재 이유).
+    // 시그널을 게이트하면 Stop이 손자를 고아로 남긴다.
     if let Some(pid) = pid {
         signal_process_group(pid, libc::SIGTERM);
+    }
+    // exit_rx await만 게이트한다: 루프의 exit 팔이 이미 소비한 oneshot을 재폴링하면
+    // panic("called after complete")이다. 자식은 reap됐으므로 대기할 것이 없고,
+    // 손자는 wait 핸들이 없어 관측 불가 — SIGKILL 에스컬레이션만 즉시 걸어둔다.
+    if exit_taken.is_some() {
+        if let Some(pid) = pid {
+            signal_process_group(pid, libc::SIGKILL);
+        }
+        return;
     }
     if tokio::time::timeout(Duration::from_secs(2), &mut *exit_rx)
         .await
@@ -1281,8 +1305,10 @@ impl LineAssembler {
     }
 
     /// flush tick에서 미방출 변경이 있는지 (select 분기 가드용).
+    /// 라이브 라인이 BS로 빈 문자열까지 지워진 경우(shipped_open + partial 비움)도
+    /// `Replace("")`를 방출해야 하므로 pending이다 — 아니면 지워진 내용이 고스트로 남는다.
     fn has_pending(&self) -> bool {
-        self.dirty && !self.partial.is_empty()
+        self.dirty && (!self.partial.is_empty() || self.shipped_open)
     }
 
     fn push_bytes(&mut self, chunk: &[u8], batch: &mut EventBatch) {
@@ -1305,6 +1331,24 @@ impl LineAssembler {
                 b'\r' => {
                     self.pending_cr = true;
                 }
+                // BS: 마지막 스칼라 하나를 지운다 (readline 에코·rubout `\x08 \x08`·ConPTY
+                // 라인에딧이 다용). pending_cr 중엔 no-op — 커서가 이미 col0이라는 근사를
+                // 유지해 다음 텍스트 바이트의 되감기가 그대로 적용되게 한다. 확정된 라인
+                // 경계는 넘지 않는다(partial 비면 무시).
+                b'\x08' => {
+                    if !self.pending_cr && !self.partial.is_empty() {
+                        // UTF-8 경계 인지 pop: 연속 바이트(0x80..=0xBF)를 지나 리드까지.
+                        while let Some(b) = self.partial.pop() {
+                            if !(0x80..=0xBF).contains(&b) {
+                                break;
+                            }
+                        }
+                        self.dirty = true;
+                    }
+                }
+                // bare BEL: 시각적 표현이 없다 — 스왈로 (OSC 종료용 BEL은 ansi.rs가 소비하나,
+                // 텍스트 스트림 한가운데의 벨은 여기까지 온다).
+                b'\x07' => {}
                 _ => {
                     if self.pending_cr {
                         // 되감기 실행: 전체 라인 교체 근사.
@@ -1337,6 +1381,16 @@ impl LineAssembler {
         if !self.has_pending() {
             return;
         }
+        // BS로 빈 문자열까지 지워진 라이브 라인: Replace("")로 화면에서도 지운다.
+        // (아래 valid_len==0 조기 return은 "비지 않았지만 불완전 UTF-8 prefix뿐"인
+        // 보류 케이스 전용이라 이 케이스를 처리하지 못한다.)
+        if self.partial.is_empty() {
+            if self.shipped_open {
+                batch.push(OutputEvent::Replace(String::new()));
+                self.dirty = false;
+            }
+            return;
+        }
         // 청크에 걸린 멀티바이트 문자는 보류 — 유효 prefix만 표시.
         let valid_len = match std::str::from_utf8(&self.partial) {
             Ok(_) => self.partial.len(),
@@ -1361,6 +1415,13 @@ impl LineAssembler {
     /// EOF: 잔여 미완 라인을 최종 확정한다.
     fn finalize(&mut self, batch: &mut EventBatch) {
         if self.partial.is_empty() {
+            // emit_partial과 대칭: 라이브 라인이 BS로 지워진 채 EOF를 맞으면
+            // Replace("")로 확정해야 고스트가 남지 않는다.
+            if self.shipped_open && self.dirty {
+                batch.push(OutputEvent::Replace(String::new()));
+                self.shipped_open = false;
+                self.dirty = false;
+            }
             return;
         }
         let text = String::from_utf8_lossy(&self.partial).into_owned();
@@ -1876,6 +1937,63 @@ mod tests {
     }
 
     #[test]
+    fn assembler_backspace_pops_last_char() {
+        assert_eq!(assemble(&[b"abc\x08d\n"], false), vec![line("abd")]);
+    }
+
+    #[test]
+    fn assembler_backspace_is_utf8_boundary_aware() {
+        // 멀티바이트 스칼라는 통째로 하나가 지워져야 한다 (바이트 하나가 아니라).
+        let mut input = "가나".as_bytes().to_vec();
+        input.extend_from_slice(b"\x08\n");
+        assert_eq!(assemble(&[&input], false), vec![line("가")]);
+    }
+
+    #[test]
+    fn assembler_rubout_sequence_erases() {
+        // readline 지우기 관용구: BS + 공백 + BS → 문자 소거.
+        assert_eq!(assemble(&[b"x\x08 \x08\n"], false), vec![line("")]);
+    }
+
+    #[test]
+    fn assembler_backspace_at_line_start_is_ignored() {
+        // 확정된 라인 경계는 넘지 않는다.
+        assert_eq!(
+            assemble(&[b"a\n\x08b\n"], false),
+            vec![line("a"), line("b")]
+        );
+    }
+
+    #[test]
+    fn assembler_backspace_after_cr_is_noop() {
+        // pending_cr 중 BS는 no-op — 다음 텍스트 바이트의 전체 라인 되감기가 유지된다.
+        assert_eq!(assemble(&[b"ab\r\x08c\n"], false), vec![line("c")]);
+    }
+
+    #[test]
+    fn assembler_backspace_erasing_shipped_line_ships_empty_replace() {
+        // 라이브로 방출된 라인이 BS로 전부 지워지면 Replace("")가 나가야 화면에서도
+        // 지워진다 (flush 경로와 EOF(finalize) 경로 모두).
+        let events = assemble(&[b"abc", b"\x08\x08\x08"], true);
+        assert_eq!(events, vec![line("abc"), replace("")]);
+
+        // finalize 경로: flush 없이 지워진 채 EOF. 같은 배치라 Replace("")가 직전
+        // Line("ab")에 제자리 병합되어 Line("")로 확정된다 (EventBatch 병합 규칙).
+        let mut assembler = LineAssembler::new();
+        let mut batch = EventBatch::default();
+        assembler.push_bytes(b"ab", &mut batch);
+        assembler.emit_partial(&mut batch); // Line("ab") 방출 — 라이브 열림
+        assembler.push_bytes(b"\x08\x08", &mut batch);
+        assembler.finalize(&mut batch);
+        assert_eq!(batch.take(), vec![line("")]);
+    }
+
+    #[test]
+    fn assembler_bare_bel_is_swallowed() {
+        assert_eq!(assemble(&[b"do\x07ne\n"], false), vec![line("done")]);
+    }
+
+    #[test]
     fn assembler_live_line_opens_then_replaces() {
         // flush tick마다: 첫 방출은 Line(라이브 열림), 이후 갱신은 Replace,
         // 개행 확정도 Replace(같은 논리 라인), 다음 텍스트는 새 Line.
@@ -1998,7 +2116,7 @@ mod tests {
             )
             .await
             .expect("loop timed out");
-            assert!(matches!(end, PtyLoopEnd::Cancelled));
+            assert!(matches!(end, PtyLoopEnd::Cancelled { exit_taken: None }));
 
             drop(tx);
             let mut messages = Vec::new();
@@ -2093,6 +2211,50 @@ mod tests {
                 events.contains(&OutputEvent::Line(String::from("grandchild-tail"))),
                 "exit 후 도착한 출력도 보존: {events:?}"
             );
+        }
+
+        /// 회귀 방지: exit 팔이 oneshot을 소비한 뒤 Stop → 과거엔 terminate_and_reap_pty가
+        /// 소비된 exit_rx를 재폴링해 panic("called after complete")했다 (CompletionGuard가
+        /// "Run interrupted unexpectedly"로 은폐). Cancelled{exit_taken}이 재await를 건너뛴다.
+        #[tokio::test]
+        async fn cancel_after_exit_does_not_repoll_consumed_oneshot() {
+            let (mut tx, _rx) = iced::futures::channel::mpsc::channel::<Message>(100);
+            let cancel = Arc::new(AtomicBool::new(false));
+            let (_chunks_tx, mut chunks_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+            let (exit_tx, mut exit_rx) = tokio::sync::oneshot::channel::<Result<i32, String>>();
+
+            exit_tx.send(Ok(7)).unwrap();
+            // 루프가 exit 팔을 소비하도록 한 턴 준 뒤(손자가 pty를 쥔 드레인 상태) Stop.
+            let cancel_setter = cancel.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                cancel_setter.store(true, std::sync::atomic::Ordering::SeqCst);
+            });
+
+            let end = tokio::time::timeout(
+                Duration::from_secs(5),
+                pty_output_loop(
+                    &mut tx,
+                    Uuid::new_v4(),
+                    &mut chunks_rx,
+                    &mut exit_rx,
+                    &cancel,
+                ),
+            )
+            .await
+            .expect("loop timed out");
+            let PtyLoopEnd::Cancelled { exit_taken } = end else {
+                panic!("expected Cancelled, got Completed");
+            };
+            assert_eq!(exit_taken, Some(Ok(7)), "exit 팔이 소비한 상태 운반");
+
+            // 핵심 단언: 소비된 oneshot과 함께 호출해도 panic 없이 완료 (pid None → 무신호).
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                terminate_and_reap_pty(None, &mut exit_rx, exit_taken),
+            )
+            .await
+            .expect("reap must not hang");
         }
     }
 
