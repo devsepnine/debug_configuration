@@ -52,11 +52,15 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
-  # Windows 경로(pipe stdin/로컬 에코 등 cfg(windows) 분기)가 릴리스 빌드 전에
-  # 컴파일 검증되도록 한다 — ubuntu 잡만으로는 cfg(windows) 코드가 전혀 열리지 않는다.
+  # Windows 경로(ConPTY 전송·stdin·폴백 pipe 등 cfg(windows) 분기)가 릴리스 빌드 전에
+  # 검증되도록 한다 — ubuntu 잡만으로는 cfg(windows) 코드가 전혀 열리지 않는다.
+  # windows-latest(Server 2022)는 ConPTY를 지원하므로 conpty_integration이 실제로 돈다.
+  # 테스트는 PTY/조립기 관련 모듈로 스코프한다(전 스위트는 windows에서 실행 이력이
+  # 없어 미지수 — fix-as-found로 후속 확대).
   windows-check:
-    name: Check (Windows)
+    name: Check and Test (Windows)
     runs-on: windows-latest
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -71,3 +75,6 @@ jobs:
 
       - name: Check
         run: cargo check --locked --all-targets
+
+      - name: Test (pty/assembler scope)
+        run: cargo test --locked -- pty_loop conpty_integration assembler ansi

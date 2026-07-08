@@ -668,9 +668,8 @@ struct PtyProcess {
     pid: Option<u32>,
     chunks_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
     exit_rx: tokio::sync::oneshot::Receiver<Result<i32, String>>,
-    // 프로덕션은 스레드를 join하지 않는다(자체 회수/EOF 귀결) — 회수 회귀 테스트 전용
-    // 핸들. windows 팔은 conpty 통합 테스트(S4)가 읽기 전까지 test 빌드에서도 미사용.
-    #[cfg_attr(any(not(test), windows), allow(dead_code))]
+    // 프로덕션은 스레드를 join하지 않는다(자체 회수/EOF 귀결) — 회수 회귀 테스트 전용 핸들.
+    #[cfg_attr(not(test), allow(dead_code))]
     reader_thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -2372,8 +2371,11 @@ mod tests {
     }
 
     // ---- pty_output_loop 직접 구동 (합성 채널 — 실프로세스 불필요) ----
+    // windows에서는 동명 트윈(종료 상태기계 포함)을 상대로 같은 시맨틱을 검증한다:
+    // EOF 시 exit_status.take()→Completed, exit-전-EOF의 내부 select 대기가 트윈에도
+    // 보존되어야 이 테스트들이 통과한다.
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     mod pty_loop {
         use super::*;
         use iced::futures::StreamExt;
@@ -2731,6 +2733,329 @@ mod tests {
             assert!(
                 reclaimed,
                 "reader thread must self-reclaim within poll interval after receiver drop"
+            );
+        }
+    }
+
+    // ---- ConPTY 통합 (windows 실프로세스; ConPTY 부재 환경은 self-skip) ----
+    // windows-latest 러너(Server 2022)는 ConPTY를 지원하므로 CI에서 실제로 돈다.
+    // ConPTY 프라이밍이 커서/클리어 시퀀스와 80컬럼 하드랩을 섞으므로 단언은 전부
+    // 짧은 마커의 contains 기반, 모든 await는 10s timeout으로 감싼다(행 = 잡 6h 방지).
+
+    #[cfg(windows)]
+    mod conpty_integration {
+        use super::*;
+
+        const T: Duration = Duration::from_secs(10);
+
+        fn test_config() -> RunConfiguration {
+            RunConfiguration {
+                working_directory: std::env::temp_dir().to_string_lossy().into_owned(),
+                ..RunConfiguration::default()
+            }
+        }
+
+        /// ConPTY 스폰 → EOF까지 수집 → (합쳐진 출력, exit 결과). 수집을 위해 exit 후
+        /// 명시적으로 unregister(=ClosePseudoConsole)한다 — 프로덕션에선 루프의 종료
+        /// 상태기계가 하는 일을 테스트가 대신 구동한다.
+        async fn run_conpty(command: &str) -> Option<(String, Result<i32, String>)> {
+            let config = test_config();
+            let session_id = Uuid::new_v4();
+            let pty = match spawn_in_pty(&config, command, &[], session_id, (80, 24)) {
+                Ok(p) => p,
+                Err(PtySpawnError::PtyUnavailable(e)) => {
+                    eprintln!("[skip] conpty unavailable: {e}");
+                    return None;
+                }
+                Err(PtySpawnError::Spawn(e)) => panic!("spawn failed: {e}"),
+            };
+            let mut chunks_rx = pty.chunks_rx;
+            let mut exit_rx = pty.exit_rx;
+
+            // 자식 exit까지: 출력을 소비하면서 대기 (ConPTY는 exit로 EOF가 안 온다).
+            let mut collected = Vec::new();
+            let status = tokio::time::timeout(T, async {
+                loop {
+                    tokio::select! {
+                        chunk = chunks_rx.recv() => {
+                            if let Some(bytes) = chunk { collected.extend_from_slice(&bytes); }
+                        }
+                        status = &mut exit_rx => {
+                            return status.unwrap_or(Err(String::from("no status")));
+                        }
+                    }
+                }
+            })
+            .await
+            .expect("child did not exit in time");
+
+            // teardown: master drop → ClosePseudoConsole → 리더 EOF.
+            unregister_session_io(session_id);
+            tokio::time::timeout(T, async {
+                while let Some(bytes) = chunks_rx.recv().await {
+                    collected.extend_from_slice(&bytes);
+                }
+            })
+            .await
+            .expect("reader did not reach EOF after unregister");
+
+            Some((String::from_utf8_lossy(&collected).into_owned(), status))
+        }
+
+        #[tokio::test]
+        async fn conpty_child_sees_a_console_with_pty_size() {
+            // IsOutputRedirected=False = ConPTY-vs-pipe 판별자; WindowWidth=80은
+            // openpty 뷰포트가 자식에게 도달했음을 증명한다.
+            let Some((out, status)) = run_conpty(
+                "if ([Console]::IsOutputRedirected) { 'redirected' } \
+                 else { 'ok-console w=' + [Console]::WindowWidth }",
+            )
+            .await
+            else {
+                return;
+            };
+            assert!(
+                out.contains("ok-console"),
+                "child must see a console: {out:?}"
+            );
+            assert!(out.contains("w=80"), "pty size must reach child: {out:?}");
+            assert!(
+                !out.contains("redirected"),
+                "must not be pipe-redirected: {out:?}"
+            );
+            assert_eq!(status, Ok(0));
+        }
+
+        #[tokio::test]
+        async fn conpty_passes_sgr_color_through() {
+            let Some((out, _)) = run_conpty("Write-Host -ForegroundColor Green 'SGR-MARK'").await
+            else {
+                return;
+            };
+            assert!(out.contains("SGR-MARK"), "text must pass through: {out:?}");
+            assert!(
+                out.contains('\u{1b}'),
+                "conpty output must carry VT sequences (SGR): {out:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn conpty_stdin_cr_submits_and_echoes() {
+            // \r 제출 증명: Read-Host가 라인을 받고, conhost 에코가 출력에 나타난다.
+            let config = test_config();
+            let session_id = Uuid::new_v4();
+            let pty = match spawn_in_pty(
+                &config,
+                "$x = Read-Host; Write-Output ('got:' + $x)",
+                &[],
+                session_id,
+                (80, 24),
+            ) {
+                Ok(p) => p,
+                Err(PtySpawnError::PtyUnavailable(e)) => {
+                    eprintln!("[skip] conpty unavailable: {e}");
+                    return;
+                }
+                Err(PtySpawnError::Spawn(e)) => panic!("spawn failed: {e}"),
+            };
+            {
+                let map = SESSION_IO.lock().unwrap();
+                let io = map.get(&session_id).expect("registered");
+                match io.writer.as_ref().expect("conpty writer") {
+                    SessionWriter::Pty(w) => {
+                        use std::io::Write;
+                        let mut w = w.lock().unwrap();
+                        w.write_all(b"hello\r").unwrap();
+                        w.flush().unwrap();
+                    }
+                    SessionWriter::Pipe(_) => unreachable!("conpty session uses Pty writer"),
+                }
+            }
+            let mut chunks_rx = pty.chunks_rx;
+            let mut exit_rx = pty.exit_rx;
+            let mut collected = Vec::new();
+            let status = tokio::time::timeout(T, async {
+                loop {
+                    tokio::select! {
+                        chunk = chunks_rx.recv() => {
+                            if let Some(bytes) = chunk { collected.extend_from_slice(&bytes); }
+                        }
+                        status = &mut exit_rx => {
+                            return status.unwrap_or(Err(String::from("no status")));
+                        }
+                    }
+                }
+            })
+            .await
+            .expect("child did not exit after stdin write — \\r did not submit?");
+            unregister_session_io(session_id);
+            tokio::time::timeout(T, async {
+                while let Some(bytes) = chunks_rx.recv().await {
+                    collected.extend_from_slice(&bytes);
+                }
+            })
+            .await
+            .expect("reader did not reach EOF");
+            let out = String::from_utf8_lossy(&collected).into_owned();
+            assert_eq!(status, Ok(0));
+            assert!(
+                out.contains("got:hello"),
+                "child must receive stdin: {out:?}"
+            );
+            assert!(
+                out.matches("hello").count() >= 2,
+                "conhost echo + child print expected: {out:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn conpty_cjk_stdin_roundtrip() {
+            // WIN32_INPUT_MODE 하에서 raw UTF-8 텍스트가 그대로 통과하는지 — 최대
+            // 미검증 가정의 상시 회귀 게이트. 실패하면 win32-input-mode 키 인코딩이
+            // 필요하다는 판정이다.
+            let config = test_config();
+            let session_id = Uuid::new_v4();
+            let pty = match spawn_in_pty(
+                &config,
+                "$x = Read-Host; Write-Output ('cjk:' + $x)",
+                &[],
+                session_id,
+                (80, 24),
+            ) {
+                Ok(p) => p,
+                Err(PtySpawnError::PtyUnavailable(e)) => {
+                    eprintln!("[skip] conpty unavailable: {e}");
+                    return;
+                }
+                Err(PtySpawnError::Spawn(e)) => panic!("spawn failed: {e}"),
+            };
+            {
+                let map = SESSION_IO.lock().unwrap();
+                let io = map.get(&session_id).expect("registered");
+                match io.writer.as_ref().expect("conpty writer") {
+                    SessionWriter::Pty(w) => {
+                        use std::io::Write;
+                        let mut w = w.lock().unwrap();
+                        w.write_all("한글\r".as_bytes()).unwrap();
+                        w.flush().unwrap();
+                    }
+                    SessionWriter::Pipe(_) => unreachable!(),
+                }
+            }
+            let mut chunks_rx = pty.chunks_rx;
+            let mut exit_rx = pty.exit_rx;
+            let mut collected = Vec::new();
+            let status = tokio::time::timeout(T, async {
+                loop {
+                    tokio::select! {
+                        chunk = chunks_rx.recv() => {
+                            if let Some(bytes) = chunk { collected.extend_from_slice(&bytes); }
+                        }
+                        status = &mut exit_rx => {
+                            return status.unwrap_or(Err(String::from("no status")));
+                        }
+                    }
+                }
+            })
+            .await
+            .expect("child did not exit — CJK stdin did not submit?");
+            unregister_session_io(session_id);
+            tokio::time::timeout(T, async {
+                while let Some(bytes) = chunks_rx.recv().await {
+                    collected.extend_from_slice(&bytes);
+                }
+            })
+            .await
+            .expect("reader did not reach EOF");
+            let out = String::from_utf8_lossy(&collected).into_owned();
+            assert_eq!(status, Ok(0));
+            assert!(
+                out.contains("cjk:한글"),
+                "raw UTF-8 must pass through conpty input: {out:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn conpty_cr_progress_collapses_in_assembler() {
+            // conhost가 라인 내 \r를 보존하는지의 카나리아 — CHA(ESC[G) 재인코딩으로
+            // 바뀌면 여기서 잡힌다 (그 경우 CHA→되감기 매핑이 후속 과제).
+            let Some((raw, status)) = run_conpty("Write-Host \"a`rb`rc\"").await else {
+                return;
+            };
+            assert_eq!(status, Ok(0));
+            let mut session = crate::models::RunSession::new(String::from("t"));
+            let mut assembler = LineAssembler::new();
+            let mut batch = EventBatch::default();
+            assembler.push_bytes(raw.as_bytes(), &mut batch);
+            assembler.finalize(&mut batch);
+            for event in batch.take() {
+                session.apply_output_event(&event);
+            }
+            let lines: Vec<String> = session
+                .output_lines
+                .iter()
+                .map(|(_, segs)| {
+                    segs.iter()
+                        .map(|s| s.text.as_str())
+                        .collect::<String>()
+                        .trim_end()
+                        .to_string()
+                })
+                .collect();
+            assert!(
+                lines.iter().any(|l| l == "c"),
+                "final CR state must be 'c': {lines:?}"
+            );
+            assert!(
+                !lines.iter().any(|l| l.contains("abc")),
+                "CR must not concatenate (CHA re-encoding suspected): {lines:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn conpty_reader_eofs_after_unregister() {
+            // 종료 상태기계의 하중 지지점 회귀: unregister(=ClosePseudoConsole)만이
+            // EOF를 만들고, 그 EOF로 리더 스레드가 회수된다.
+            let config = test_config();
+            let session_id = Uuid::new_v4();
+            let pty = match spawn_in_pty(&config, "Write-Output done", &[], session_id, (80, 24)) {
+                Ok(p) => p,
+                Err(PtySpawnError::PtyUnavailable(e)) => {
+                    eprintln!("[skip] conpty unavailable: {e}");
+                    return;
+                }
+                Err(PtySpawnError::Spawn(e)) => panic!("spawn failed: {e}"),
+            };
+            let mut chunks_rx = pty.chunks_rx;
+            let mut exit_rx = pty.exit_rx;
+            let status = tokio::time::timeout(T, async {
+                loop {
+                    tokio::select! {
+                        chunk = chunks_rx.recv() => { let _ = chunk; }
+                        status = &mut exit_rx => {
+                            return status.unwrap_or(Err(String::from("no status")));
+                        }
+                    }
+                }
+            })
+            .await
+            .expect("child did not exit");
+            assert_eq!(status, Ok(0));
+
+            unregister_session_io(session_id);
+            let eof =
+                tokio::time::timeout(T, async { while chunks_rx.recv().await.is_some() {} }).await;
+            assert!(eof.is_ok(), "EOF must arrive after ClosePseudoConsole");
+
+            let handle = pty.reader_thread.expect("reader thread must spawn");
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = handle.join();
+                let _ = done_tx.send(());
+            });
+            assert!(
+                done_rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+                "reader thread must exit at EOF"
             );
         }
     }
