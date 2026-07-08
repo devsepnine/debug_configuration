@@ -1697,9 +1697,10 @@ impl LineAssembler {
                         self.dirty = true;
                     }
                 }
-                // bare BEL: 시각적 표현이 없다 — 스왈로 (OSC 종료용 BEL은 ansi.rs가 소비하나,
-                // 텍스트 스트림 한가운데의 벨은 여기까지 온다).
-                b'\x07' => {}
+                // 주의: BEL(\x07)은 여기서 제거하면 안 된다 — OSC/DCS의 종결자라서
+                // 바이트 단계에서 걷어내면 ansi.rs의 OSC 파서가 "미종결 → 라인 끝까지
+                // 소비" 규칙으로 뒤따르는 실제 텍스트까지 삼킨다 (ConPTY 타이틀 OSC로
+                // CI에서 실증). bare BEL의 비표시는 문맥을 아는 ansi.rs가 담당한다.
                 _ => {
                     if self.pending_cr {
                         // 되감기 실행: 전체 라인 교체 근사.
@@ -2340,8 +2341,11 @@ mod tests {
     }
 
     #[test]
-    fn assembler_bare_bel_is_swallowed() {
-        assert_eq!(assemble(&[b"do\x07ne\n"], false), vec![line("done")]);
+    fn assembler_preserves_bel_for_the_ansi_layer() {
+        // BEL은 OSC/DCS의 종결자다 — 조립 단계에서 제거하면 ansi.rs의 OSC 파서가
+        // 종결을 놓쳐 라인 끝까지 삼킨다 (ConPTY 타이틀 OSC 회귀). 그대로 통과시키고
+        // 비표시는 ansi.rs가 담당한다.
+        assert_eq!(assemble(&[b"do\x07ne\n"], false), vec![line("do\u{7}ne")]);
     }
 
     #[test]

@@ -272,6 +272,9 @@ pub fn parse_ansi_text(text: &str) -> Vec<TextSegment> {
                 }
                 None => {}
             }
+        } else if ch == '\x07' {
+            // bare BEL: 시각적 표현이 없다 — 폐기. (OSC/DCS 종결자 BEL은 위의 해당
+            // arm이 시퀀스 소비 중에 처리하므로 여기 오는 것은 순수 벨뿐이다.)
         } else {
             current_text.push(ch);
         }
@@ -454,6 +457,15 @@ mod tests {
             segments[2].background.is_some(),
             "이후 텍스트는 SGR 상태 복원"
         );
+    }
+
+    #[test]
+    fn bare_bel_is_dropped_but_osc_terminator_still_works() {
+        // bare BEL은 비표시 폐기.
+        assert_eq!(joined("do\x07ne"), "done");
+        // 회귀(ConPTY 타이틀 OSC): BEL이 조립 단계를 그대로 통과해 와야 OSC가 여기서
+        // 정확히 종결되고 뒤 텍스트가 살아남는다.
+        assert_eq!(joined("\x1b]0;C:\\pwsh.EXE\x07c"), "c");
     }
 
     #[test]
