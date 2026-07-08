@@ -2401,6 +2401,19 @@ mod tests {
     }
 
     #[test]
+    fn assembler_prompt_echo_then_output_matches_real_terminal() {
+        // Windows 실기 덤프 그대로: input('name') 프롬프트(라이브) → conhost 에코
+        // "hello\r\n" → print 출력 "hello\r\n". 기대 렌더는 실제 터미널과 동일한
+        // ["namehello", "hello"] — 에코는 열린 프롬프트 라인에 이어붙고(Replace),
+        // print는 새 라인이다.
+        let events = assemble(&[b"name", b"hello\r\nhello\r\n"], true);
+        assert_eq!(
+            events,
+            vec![line("name"), replace("namehello"), line("hello")]
+        );
+    }
+
+    #[test]
     fn assembler_live_line_opens_then_replaces() {
         // flush tick마다: 첫 방출은 Line(라이브 열림), 이후 갱신은 Replace,
         // 개행 확정도 Replace(같은 논리 라인), 다음 텍스트는 새 Line.
