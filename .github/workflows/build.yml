@@ -77,4 +77,7 @@ jobs:
         run: cargo check --locked --all-targets
 
       - name: Test (pty/assembler scope)
-        run: cargo test --locked -- pty_loop conpty_integration assembler ansi
+        timeout-minutes: 10
+        # --nocapture: libtest 캡처는 스폰 스레드에 상속되어 행 진단(워치독/스테이지)
+        # 출력을 삼킨다 — 실시간 스트리밍으로 마지막 스테이지가 로그에 남게 한다.
+        run: cargo test --locked -- --nocapture pty_loop conpty_integration assembler ansi

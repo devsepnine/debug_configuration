@@ -2823,6 +2823,7 @@ mod tests {
         /// 스테이지를 찍고 프로세스를 끝내 CI가 빠르고 귀속 가능한 실패를 내게 한다.
         /// publish 게이트 잡이라 상시 유지한다.
         struct HangWatchdog {
+            test: &'static str,
             stage: Arc<Mutex<String>>,
             disarmed: Arc<AtomicBool>,
         }
@@ -2836,14 +2837,24 @@ mod tests {
                     std::thread::sleep(Duration::from_secs(90));
                     if !d.load(std::sync::atomic::Ordering::Relaxed) {
                         let last = s.lock().map(|g| g.clone()).unwrap_or_default();
+                        // 주의: libtest 캡처는 스폰된 스레드에도 상속된다 — 이 출력은
+                        // CI에서 --nocapture일 때만 보인다. abort()는 CRT exit 경로를
+                        // 우회하는 즉사라 어떤 wedge 상태에서도 프로세스를 확실히 끝낸다.
                         eprintln!("[watchdog] {test} wedged at stage: {last}");
-                        std::process::exit(101);
+                        std::process::abort();
                     }
                 });
-                Self { stage, disarmed }
+                Self {
+                    test,
+                    stage,
+                    disarmed,
+                }
             }
 
             fn mark(&self, s: &str) {
+                // --nocapture 실행에서 실시간 스트리밍되도록 즉시 찍는다 — 행이 나도
+                // 마지막 스테이지가 로그에 남는 것이 핵심 진단 신호다.
+                eprintln!("[stage] {}: {s}", self.test);
                 if let Ok(mut g) = self.stage.lock() {
                     s.clone_into(&mut g);
                 }
