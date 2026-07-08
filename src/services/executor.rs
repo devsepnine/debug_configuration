@@ -3200,11 +3200,11 @@ mod tests {
                 .collect();
             assert!(
                 lines.iter().any(|l| l == "c"),
-                "final CR state must be 'c': {lines:?}"
+                "final CR state must be 'c': {lines:?}\nraw: {raw:?}"
             );
             assert!(
                 !lines.iter().any(|l| l.contains("abc")),
-                "CR must not concatenate (CHA re-encoding suspected): {lines:?}"
+                "CR must not concatenate (CHA re-encoding suspected): {lines:?}\nraw: {raw:?}"
             );
         }
 
