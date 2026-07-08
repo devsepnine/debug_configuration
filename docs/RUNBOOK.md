@@ -121,6 +121,24 @@ tasklist | findstr run_config_manager
 
 ## 일반적인 문제 및 해결 방법
 
+### 0. Windows 터미널 출력 진단 (`RCM_PTY_DUMP`)
+
+**용도**: Windows ConPTY 세션의 출력이 이상하게 렌더될 때, conhost가 실제로
+내보내는 원시 바이트를 확인합니다.
+
+```powershell
+$env:RCM_PTY_DUMP = "1"
+.\run_config_manager.exe   # 또는 cargo run --release
+# 세션 실행 후:
+Get-Content $env:TEMP\rcm-pty-dump-*.txt
+```
+
+**주의**:
+- 세션 프로세스의 **모든 출력이 평문으로** `%TEMP%`에 저장됩니다 — 비밀값을
+  다루는 세션에는 켜지 마세요. 확인 후 파일을 삭제하세요.
+- 파일 크기 상한이 없으므로 장시간/대량 출력 세션에서는 사용하지 마세요.
+- 진단 전용 플래그로, 평상시에는 설정하지 않습니다.
+
 ### 1. 앱이 시작되지 않음
 
 **증상**: 실행 파일을 더블클릭해도 아무 일도 일어나지 않음

@@ -119,6 +119,12 @@ struct SessionIo {
     /// 라이브 리사이즈 전용; windows는 라이브 리사이즈 자체를 전파하지 않는다).
     #[cfg_attr(windows, allow(dead_code))]
     last_pty_size: Option<(u16, u16)>,
+    /// ConPTY INHERIT_CURSOR 핸드셰이크(DSR 응답) 완료 여부. 사용자 stdin 쓰기는
+    /// 이게 서기 전엔 잠시 대기한다 — 핸드셰이크 전의 대량 write가 stdin 파이프
+    /// (유한 버퍼)를 채운 채 writer mutex를 쥐면, 리더의 DSR 응답이 같은 mutex에
+    /// 막히고 자식은 응답 전엔 stdin을 안 읽어 3자 교착이 된다.
+    #[cfg(windows)]
+    dsr_ready: Arc<std::sync::atomic::AtomicBool>,
 }
 
 static SESSION_IO: LazyLock<Mutex<HashMap<Uuid, SessionIo>>> =
@@ -210,11 +216,22 @@ pub async fn write_session_stdin(
 
     // 레지스트리 락은 조회에만 사용하고 Arc를 복제해 나온다 — 느린 세션 하나가
     // 레지스트리(다른 세션의 조회/등록)를 막지 않게 한다.
+    #[cfg(windows)]
+    let dsr_ready;
     let writer = {
         let map = SESSION_IO
             .lock()
             .map_err(|_| StdinWriteError::Broken(String::from("session io registry poisoned")))?;
-        match map.get(&session_id).and_then(|io| io.writer.as_ref()) {
+        let Some(io) = map.get(&session_id) else {
+            return Err(StdinWriteError::Broken(String::from(
+                "process input is not available for this session",
+            )));
+        };
+        #[cfg(windows)]
+        {
+            dsr_ready = Arc::clone(&io.dsr_ready);
+        }
+        match io.writer.as_ref() {
             Some(SessionWriter::Pty(w)) => WriterHandle::Pty(Arc::clone(w)),
             #[cfg(windows)]
             Some(SessionWriter::Pipe(w)) => WriterHandle::Pipe(Arc::clone(w)),
@@ -225,6 +242,18 @@ pub async fn write_session_stdin(
             }
         }
     };
+
+    // windows: DSR 핸드셰이크가 끝나기 전의 사용자 write는 잠시 대기한다(fail-open
+    // ~500ms). 핸드셰이크 전의 대량 write가 유한 stdin 파이프를 채운 채 writer
+    // mutex를 쥐면, 리더의 DSR 응답이 같은 mutex에 막히고 자식은 응답 전엔 stdin을
+    // 읽지 않아 세션 전체가 교착한다. ready 이후 리더는 이 mutex를 다시 잡지 않는다.
+    #[cfg(windows)]
+    for _ in 0..100 {
+        if dsr_ready.load(std::sync::atomic::Ordering::Acquire) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
 
     // 줄 종결자는 전송별로 다르다 — writer가 판별된 뒤 각 arm에서 붙인다.
     // ConPTY(WIN32_INPUT_MODE): Enter는 CR 한 개. '\n' 단독은 cooked 콘솔 앱
@@ -783,6 +812,7 @@ fn pty_reader_thread(
     mut reader: Box<dyn std::io::Read + Send>,
     tx: tokio::sync::mpsc::Sender<Vec<u8>>,
     dsr_writer: Arc<Mutex<Box<dyn std::io::Write + Send>>>,
+    dsr_ready: Arc<std::sync::atomic::AtomicBool>,
 ) {
     const DSR_REQUEST: &[u8] = b"\x1b[6n";
 
@@ -822,11 +852,26 @@ fn pty_reader_thread(
                     let mut window = std::mem::take(&mut dsr_tail);
                     window.extend_from_slice(&buf[..n]);
                     if window.windows(DSR_REQUEST.len()).any(|w| w == DSR_REQUEST) {
-                        if let Ok(mut w) = dsr_writer.lock() {
-                            let _ = w.write_all(b"\x1b[1;1R").and_then(|()| w.flush());
+                        // 성공했을 때만 answered — 실패를 성공으로 오기록하면 재시도
+                        // 기회를 영영 잃고 자식이 콘솔 초기화에서 멈춘다.
+                        match dsr_writer.lock() {
+                            Ok(mut w) => {
+                                dsr_answered =
+                                    w.write_all(b"\x1b[1;1R").and_then(|()| w.flush()).is_ok();
+                                if dsr_answered {
+                                    dsr_ready.store(true, std::sync::atomic::Ordering::Release);
+                                } else {
+                                    eprintln!(
+                                        "[pty] DSR reply write failed; child console init may hang"
+                                    );
+                                }
+                            }
+                            Err(_) => eprintln!(
+                                "[pty] DSR writer mutex poisoned; child console init may hang"
+                            ),
                         }
-                        dsr_answered = true;
-                    } else {
+                    }
+                    if !dsr_answered {
                         let keep = window.len().min(DSR_REQUEST.len() - 1);
                         dsr_tail = window[window.len() - keep..].to_vec();
                     }
@@ -927,6 +972,8 @@ fn spawn_in_pty(
     // stdin writer를 공유한다 (응답 없이는 자식이 콘솔 초기화에서 영원히 대기).
     #[cfg(windows)]
     let dsr_writer = Arc::clone(&writer);
+    #[cfg(windows)]
+    let dsr_ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     // ProcessStarted 발송 전에 등록 — 첫 프레임의 resize가 핸들을 찾을 수 있게.
     register_session_io(
@@ -935,6 +982,8 @@ fn spawn_in_pty(
             master: Some(pair.master),
             writer: Some(SessionWriter::Pty(writer)),
             last_pty_size: Some(viewport),
+            #[cfg(windows)]
+            dsr_ready: Arc::clone(&dsr_ready),
         },
     );
 
@@ -947,7 +996,7 @@ fn spawn_in_pty(
     #[cfg(windows)]
     let reader_thread = std::thread::Builder::new()
         .name(format!("pty-read-{session_id}"))
-        .spawn(move || pty_reader_thread(reader_src, chunks_tx, dsr_writer))
+        .spawn(move || pty_reader_thread(reader_src, chunks_tx, dsr_writer, dsr_ready))
         .ok();
 
     // waiter가 child를 소유하고 blocking wait로 reap한다 (좀비 방지, 스트림 패닉과 무관).
@@ -1394,6 +1443,8 @@ async fn handle_spawned_process(
                     stdin,
                 )))),
                 last_pty_size: None,
+                // pipe 경로엔 DSR 핸드셰이크가 없다 — 즉시 쓰기 가능.
+                dsr_ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             },
         );
     }

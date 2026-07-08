@@ -244,7 +244,9 @@ Configuration files are automatically saved in the OS-specific settings director
   line (backspace erases, carriage return rewrites the line). Pane resizes are
   not propagated to a running session's console (ConPTY answers a live resize
   with a full-screen repaint that would duplicate output in scrollback); the
-  new size applies from the next run/rerun. Stop uses
+  new size applies from the next run/rerun. New sessions spawn at the most
+  recently observed pane size (120×40 before any pane has been measured) — if
+  that guess misses, the mismatch also persists until the next run/rerun. Stop uses
   `taskkill /T /F`: processes are killed hard, typically reporting exit code 1
   (a rare 259/STILL_ACTIVE can surface during teardown races). After the child
   exits, a grandchild that stays silent for ~300ms has any later output cut
