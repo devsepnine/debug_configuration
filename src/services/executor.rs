@@ -2817,6 +2817,46 @@ mod tests {
 
         const T: Duration = Duration::from_secs(10);
 
+        /// 행 진단 워치독. libtest는 멈춘 테스트를 선점하지 못해 잡 timeout(30m)까지
+        /// 끌려가고, 테스트 스레드의 출력은 캡처돼 사라진다 — 워치독은 **비테스트
+        /// 스레드**라 stderr가 그대로 보이므로, 90초(실시간) 내 해제가 안 되면 마지막
+        /// 스테이지를 찍고 프로세스를 끝내 CI가 빠르고 귀속 가능한 실패를 내게 한다.
+        /// publish 게이트 잡이라 상시 유지한다.
+        struct HangWatchdog {
+            stage: Arc<Mutex<String>>,
+            disarmed: Arc<AtomicBool>,
+        }
+
+        impl HangWatchdog {
+            fn arm(test: &'static str) -> Self {
+                let stage = Arc::new(Mutex::new(String::from("start")));
+                let disarmed = Arc::new(AtomicBool::new(false));
+                let (s, d) = (Arc::clone(&stage), Arc::clone(&disarmed));
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_secs(90));
+                    if !d.load(std::sync::atomic::Ordering::Relaxed) {
+                        let last = s.lock().map(|g| g.clone()).unwrap_or_default();
+                        eprintln!("[watchdog] {test} wedged at stage: {last}");
+                        std::process::exit(101);
+                    }
+                });
+                Self { stage, disarmed }
+            }
+
+            fn mark(&self, s: &str) {
+                if let Ok(mut g) = self.stage.lock() {
+                    s.clone_into(&mut g);
+                }
+            }
+        }
+
+        impl Drop for HangWatchdog {
+            fn drop(&mut self) {
+                self.disarmed
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+
         fn test_config() -> RunConfiguration {
             RunConfiguration {
                 working_directory: std::env::temp_dir().to_string_lossy().into_owned(),
@@ -2824,12 +2864,19 @@ mod tests {
             }
         }
 
-        /// ConPTY 스폰 → EOF까지 수집 → (합쳐진 출력, exit 결과). 수집을 위해 exit 후
-        /// 명시적으로 unregister(=ClosePseudoConsole)한다 — 프로덕션에선 루프의 종료
-        /// 상태기계가 하는 일을 테스트가 대신 구동한다.
-        async fn run_conpty(command: &str) -> Option<(String, Result<i32, String>)> {
+        /// ConPTY 스폰 → EOF까지 수집 → (합쳐진 출력, exit 결과).
+        ///
+        /// teardown은 프로덕션과 동형으로 구동한다: unregister(=ClosePseudoConsole,
+        /// 미소비 출력이 있으면 블록 가능)를 블로킹 풀로 보내고 **동시에** 드레인을
+        /// 계속한다 — 런타임 스레드에서 동기로 부르면 [Close 블록 ↔ 리더 ↔ 수신 없는
+        /// 테스트] 교착이 재현된다.
+        async fn run_conpty(
+            wd: &HangWatchdog,
+            command: &str,
+        ) -> Option<(String, Result<i32, String>)> {
             let config = test_config();
             let session_id = Uuid::new_v4();
+            wd.mark("spawn_in_pty (powershell probe + openpty + CreateProcess)");
             let pty = match spawn_in_pty(&config, command, &[], session_id, (80, 24)) {
                 Ok(p) => p,
                 Err(PtySpawnError::PtyUnavailable(e)) => {
@@ -2842,6 +2889,7 @@ mod tests {
             let mut exit_rx = pty.exit_rx;
 
             // 자식 exit까지: 출력을 소비하면서 대기 (ConPTY는 exit로 EOF가 안 온다).
+            wd.mark("awaiting child exit (consuming output)");
             let mut collected = Vec::new();
             let status = tokio::time::timeout(T, async {
                 loop {
@@ -2858,8 +2906,8 @@ mod tests {
             .await
             .expect("child did not exit in time");
 
-            // teardown: master drop → ClosePseudoConsole → 리더 EOF.
-            unregister_session_io(session_id);
+            wd.mark("teardown: unregister on blocking pool + drain to EOF");
+            let close = tokio::task::spawn_blocking(move || unregister_session_io(session_id));
             tokio::time::timeout(T, async {
                 while let Some(bytes) = chunks_rx.recv().await {
                     collected.extend_from_slice(&bytes);
@@ -2867,7 +2915,73 @@ mod tests {
             })
             .await
             .expect("reader did not reach EOF after unregister");
+            let _ = tokio::time::timeout(T, close).await;
 
+            wd.mark("done");
+            Some((String::from_utf8_lossy(&collected).into_owned(), status))
+        }
+
+        /// run_conpty + 스폰 직후 stdin으로 `input` 바이트를 기록 (레지스트리 writer 사용
+        /// — 슬라이스4 write 경로의 원형). 나머지 수집/teardown 동형.
+        async fn run_conpty_stdin(
+            wd: &HangWatchdog,
+            command: &str,
+            input: &[u8],
+        ) -> Option<(String, Result<i32, String>)> {
+            let config = test_config();
+            let session_id = Uuid::new_v4();
+            wd.mark("spawn_in_pty (powershell probe + openpty + CreateProcess)");
+            let pty = match spawn_in_pty(&config, command, &[], session_id, (80, 24)) {
+                Ok(p) => p,
+                Err(PtySpawnError::PtyUnavailable(e)) => {
+                    eprintln!("[skip] conpty unavailable: {e}");
+                    return None;
+                }
+                Err(PtySpawnError::Spawn(e)) => panic!("spawn failed: {e}"),
+            };
+            wd.mark("writing stdin bytes");
+            {
+                let map = SESSION_IO.lock().unwrap();
+                let io = map.get(&session_id).expect("registered");
+                match io.writer.as_ref().expect("conpty writer") {
+                    SessionWriter::Pty(w) => {
+                        use std::io::Write;
+                        let mut w = w.lock().unwrap();
+                        w.write_all(input).unwrap();
+                        w.flush().unwrap();
+                    }
+                    SessionWriter::Pipe(_) => unreachable!("conpty session uses Pty writer"),
+                }
+            }
+            let mut chunks_rx = pty.chunks_rx;
+            let mut exit_rx = pty.exit_rx;
+            wd.mark("awaiting child exit after stdin write");
+            let mut collected = Vec::new();
+            let status = tokio::time::timeout(T, async {
+                loop {
+                    tokio::select! {
+                        chunk = chunks_rx.recv() => {
+                            if let Some(bytes) = chunk { collected.extend_from_slice(&bytes); }
+                        }
+                        status = &mut exit_rx => {
+                            return status.unwrap_or(Err(String::from("no status")));
+                        }
+                    }
+                }
+            })
+            .await
+            .expect("child did not exit after stdin write — line terminator did not submit?");
+            wd.mark("teardown: unregister on blocking pool + drain to EOF");
+            let close = tokio::task::spawn_blocking(move || unregister_session_io(session_id));
+            tokio::time::timeout(T, async {
+                while let Some(bytes) = chunks_rx.recv().await {
+                    collected.extend_from_slice(&bytes);
+                }
+            })
+            .await
+            .expect("reader did not reach EOF after unregister");
+            let _ = tokio::time::timeout(T, close).await;
+            wd.mark("done");
             Some((String::from_utf8_lossy(&collected).into_owned(), status))
         }
 
@@ -2875,7 +2989,9 @@ mod tests {
         async fn conpty_child_sees_a_console_with_pty_size() {
             // IsOutputRedirected=False = ConPTY-vs-pipe 판별자; WindowWidth=80은
             // openpty 뷰포트가 자식에게 도달했음을 증명한다.
+            let wd = HangWatchdog::arm("conpty_child_sees_a_console_with_pty_size");
             let Some((out, status)) = run_conpty(
+                &wd,
                 "if ([Console]::IsOutputRedirected) { 'redirected' } \
                  else { 'ok-console w=' + [Console]::WindowWidth }",
             )
@@ -2897,7 +3013,9 @@ mod tests {
 
         #[tokio::test]
         async fn conpty_passes_sgr_color_through() {
-            let Some((out, _)) = run_conpty("Write-Host -ForegroundColor Green 'SGR-MARK'").await
+            let wd = HangWatchdog::arm("conpty_passes_sgr_color_through");
+            let Some((out, _)) =
+                run_conpty(&wd, "Write-Host -ForegroundColor Green 'SGR-MARK'").await
             else {
                 return;
             };
@@ -2911,61 +3029,16 @@ mod tests {
         #[tokio::test]
         async fn conpty_stdin_cr_submits_and_echoes() {
             // \r 제출 증명: Read-Host가 라인을 받고, conhost 에코가 출력에 나타난다.
-            let config = test_config();
-            let session_id = Uuid::new_v4();
-            let pty = match spawn_in_pty(
-                &config,
+            let wd = HangWatchdog::arm("conpty_stdin_cr_submits_and_echoes");
+            let Some((out, status)) = run_conpty_stdin(
+                &wd,
                 "$x = Read-Host; Write-Output ('got:' + $x)",
-                &[],
-                session_id,
-                (80, 24),
-            ) {
-                Ok(p) => p,
-                Err(PtySpawnError::PtyUnavailable(e)) => {
-                    eprintln!("[skip] conpty unavailable: {e}");
-                    return;
-                }
-                Err(PtySpawnError::Spawn(e)) => panic!("spawn failed: {e}"),
+                b"hello\r",
+            )
+            .await
+            else {
+                return;
             };
-            {
-                let map = SESSION_IO.lock().unwrap();
-                let io = map.get(&session_id).expect("registered");
-                match io.writer.as_ref().expect("conpty writer") {
-                    SessionWriter::Pty(w) => {
-                        use std::io::Write;
-                        let mut w = w.lock().unwrap();
-                        w.write_all(b"hello\r").unwrap();
-                        w.flush().unwrap();
-                    }
-                    SessionWriter::Pipe(_) => unreachable!("conpty session uses Pty writer"),
-                }
-            }
-            let mut chunks_rx = pty.chunks_rx;
-            let mut exit_rx = pty.exit_rx;
-            let mut collected = Vec::new();
-            let status = tokio::time::timeout(T, async {
-                loop {
-                    tokio::select! {
-                        chunk = chunks_rx.recv() => {
-                            if let Some(bytes) = chunk { collected.extend_from_slice(&bytes); }
-                        }
-                        status = &mut exit_rx => {
-                            return status.unwrap_or(Err(String::from("no status")));
-                        }
-                    }
-                }
-            })
-            .await
-            .expect("child did not exit after stdin write — \\r did not submit?");
-            unregister_session_io(session_id);
-            tokio::time::timeout(T, async {
-                while let Some(bytes) = chunks_rx.recv().await {
-                    collected.extend_from_slice(&bytes);
-                }
-            })
-            .await
-            .expect("reader did not reach EOF");
-            let out = String::from_utf8_lossy(&collected).into_owned();
             assert_eq!(status, Ok(0));
             assert!(
                 out.contains("got:hello"),
@@ -2982,61 +3055,16 @@ mod tests {
             // WIN32_INPUT_MODE 하에서 raw UTF-8 텍스트가 그대로 통과하는지 — 최대
             // 미검증 가정의 상시 회귀 게이트. 실패하면 win32-input-mode 키 인코딩이
             // 필요하다는 판정이다.
-            let config = test_config();
-            let session_id = Uuid::new_v4();
-            let pty = match spawn_in_pty(
-                &config,
+            let wd = HangWatchdog::arm("conpty_cjk_stdin_roundtrip");
+            let Some((out, status)) = run_conpty_stdin(
+                &wd,
                 "$x = Read-Host; Write-Output ('cjk:' + $x)",
-                &[],
-                session_id,
-                (80, 24),
-            ) {
-                Ok(p) => p,
-                Err(PtySpawnError::PtyUnavailable(e)) => {
-                    eprintln!("[skip] conpty unavailable: {e}");
-                    return;
-                }
-                Err(PtySpawnError::Spawn(e)) => panic!("spawn failed: {e}"),
+                "한글\r".as_bytes(),
+            )
+            .await
+            else {
+                return;
             };
-            {
-                let map = SESSION_IO.lock().unwrap();
-                let io = map.get(&session_id).expect("registered");
-                match io.writer.as_ref().expect("conpty writer") {
-                    SessionWriter::Pty(w) => {
-                        use std::io::Write;
-                        let mut w = w.lock().unwrap();
-                        w.write_all("한글\r".as_bytes()).unwrap();
-                        w.flush().unwrap();
-                    }
-                    SessionWriter::Pipe(_) => unreachable!(),
-                }
-            }
-            let mut chunks_rx = pty.chunks_rx;
-            let mut exit_rx = pty.exit_rx;
-            let mut collected = Vec::new();
-            let status = tokio::time::timeout(T, async {
-                loop {
-                    tokio::select! {
-                        chunk = chunks_rx.recv() => {
-                            if let Some(bytes) = chunk { collected.extend_from_slice(&bytes); }
-                        }
-                        status = &mut exit_rx => {
-                            return status.unwrap_or(Err(String::from("no status")));
-                        }
-                    }
-                }
-            })
-            .await
-            .expect("child did not exit — CJK stdin did not submit?");
-            unregister_session_io(session_id);
-            tokio::time::timeout(T, async {
-                while let Some(bytes) = chunks_rx.recv().await {
-                    collected.extend_from_slice(&bytes);
-                }
-            })
-            .await
-            .expect("reader did not reach EOF");
-            let out = String::from_utf8_lossy(&collected).into_owned();
             assert_eq!(status, Ok(0));
             assert!(
                 out.contains("cjk:한글"),
@@ -3050,8 +3078,9 @@ mod tests {
             // 바뀌면 여기서 잡힌다 (그 경우 CHA→되감기 매핑이 후속 과제).
             // [char]13 사용: 임베디드 이중따옴표+백틱은 ArgvQuote(OS)와 PowerShell
             // 토크나이저의 이중 인용 레이어를 겹쳐 지나는 가장 취약한 형태라 회피.
+            let wd = HangWatchdog::arm("conpty_cr_progress_collapses_in_assembler");
             let Some((raw, status)) =
-                run_conpty("Write-Host ('a' + [char]13 + 'b' + [char]13 + 'c')").await
+                run_conpty(&wd, "Write-Host ('a' + [char]13 + 'b' + [char]13 + 'c')").await
             else {
                 return;
             };
@@ -3089,8 +3118,10 @@ mod tests {
         async fn conpty_reader_eofs_after_unregister() {
             // 종료 상태기계의 하중 지지점 회귀: unregister(=ClosePseudoConsole)만이
             // EOF를 만들고, 그 EOF로 리더 스레드가 회수된다.
+            let wd = HangWatchdog::arm("conpty_reader_eofs_after_unregister");
             let config = test_config();
             let session_id = Uuid::new_v4();
+            wd.mark("spawn_in_pty (powershell probe + openpty + CreateProcess)");
             let pty = match spawn_in_pty(&config, "Write-Output done", &[], session_id, (80, 24)) {
                 Ok(p) => p,
                 Err(PtySpawnError::PtyUnavailable(e)) => {
@@ -3101,6 +3132,7 @@ mod tests {
             };
             let mut chunks_rx = pty.chunks_rx;
             let mut exit_rx = pty.exit_rx;
+            wd.mark("awaiting child exit");
             let status = tokio::time::timeout(T, async {
                 loop {
                     tokio::select! {
@@ -3115,10 +3147,13 @@ mod tests {
             .expect("child did not exit");
             assert_eq!(status, Ok(0));
 
-            unregister_session_io(session_id);
+            wd.mark("unregister on blocking pool + drain to EOF");
+            let close = tokio::task::spawn_blocking(move || unregister_session_io(session_id));
             let eof =
                 tokio::time::timeout(T, async { while chunks_rx.recv().await.is_some() {} }).await;
             assert!(eof.is_ok(), "EOF must arrive after ClosePseudoConsole");
+            let _ = tokio::time::timeout(T, close).await;
+            wd.mark("joining reader thread");
 
             let handle = pty.reader_thread.expect("reader thread must spawn");
             let (done_tx, done_rx) = std::sync::mpsc::channel();
