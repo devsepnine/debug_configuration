@@ -2692,3 +2692,75 @@ mod tests {
         assert_eq!(TerminalCanvas::wrapped_total(&[1, 3, 2, 1]), 7);
     }
 }
+
+#[cfg(test)]
+mod flood_bench {
+    use super::*;
+    use crate::models::{OutputEvent, RunSession};
+    use std::time::Instant;
+
+    /// 폭주 정지 지연 진단용 수치 측정 (통과/실패 없음 — --nocapture로 관찰).
+    #[test]
+    fn measure_flood_regime_costs() {
+        let mut session = RunSession::new("bench".to_string());
+        session.max_output_lines = 50_000;
+
+        // 캡 도달까지 4096-이벤트 배치 적용 (yes 폭주 시 청크당 이벤트 수 근사)
+        let batch: Vec<OutputEvent> = (0..4096)
+            .map(|_| OutputEvent::Line("y".to_string()))
+            .collect();
+        let mut t_fill = std::time::Duration::ZERO;
+        let mut batches = 0;
+        while session.output_lines.len() < 50_000 {
+            let t = Instant::now();
+            for e in &batch {
+                session.apply_output_event(e);
+            }
+            t_fill += t.elapsed();
+            batches += 1;
+        }
+        eprintln!(
+            "[bench] fill-to-cap: {batches} batches, avg {:?}/batch (pre-cap regime)",
+            t_fill / batches
+        );
+
+        // 캡 이후(eviction 동반) 배치 적용 비용
+        let mut t_cap = std::time::Duration::ZERO;
+        for _ in 0..20 {
+            let t = Instant::now();
+            for e in &batch {
+                session.apply_output_event(e);
+            }
+            t_cap += t.elapsed();
+        }
+        eprintln!(
+            "[bench] cap-regime apply: avg {:?}/4096-event batch",
+            t_cap / 20
+        );
+
+        // 프레임당 view 비용: prepare_lines (라인 Vec + highlights 구축)
+        let mut t_prep = std::time::Duration::ZERO;
+        for _ in 0..30 {
+            let t = Instant::now();
+            let (lines, highlights, _) = prepare_lines(&session);
+            std::hint::black_box((&lines, &highlights));
+            t_prep += t.elapsed();
+        }
+        eprintln!("[bench] prepare_lines at 50k: avg {:?}/frame", t_prep / 30);
+
+        // 검색 열림 시 배치당 refresh_search_matches 비용 (flood 중 검색 열면)
+        session.search = Some(crate::models::SearchState {
+            query: String::from("y"),
+            filter: false,
+            current: 0,
+            regex: false,
+            matches: Vec::new(),
+        });
+        let t = Instant::now();
+        session.refresh_search_matches();
+        eprintln!(
+            "[bench] refresh_search_matches at 50k (query 'y'): {:?}",
+            t.elapsed()
+        );
+    }
+}

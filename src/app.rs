@@ -7,7 +7,7 @@ use crate::models::{
 use crate::services::{
     AppSettings, UpdateOutcome, check_latest_release, export_text, load_or_migrate_store,
     load_settings, register_running_pid, run_configuration_stream, save_settings, save_to_store,
-    unregister_running_pid,
+    terminate_session_process, unregister_running_pid,
 };
 use crate::utils::{DIALOG_CANCELLED, ICON_DELETE, ICON_PLAY, ICON_REFRESH, ICON_STOP};
 use crate::views::shared::icon_tooltip;
@@ -2580,8 +2580,12 @@ impl RunConfigManager {
     ) -> Task<Message> {
         if let Some(session) = self.session_by_id_mut(session_id) {
             session.is_running = false;
-            session.finished_at = Some(SystemTime::now());
+            // Stop이 이미 확정한 종료 시각은 보존한다 (지속시간 뱃지가 Stop 클릭 기준).
+            if session.finished_at.is_none() {
+                session.finished_at = Some(SystemTime::now());
+            }
             // PID 추적 해제 + 세션에서도 제거 (Windows PID 재사용으로 인한 오인 kill 방지).
+            // Stop 경로는 이미 take+해제했으므로 여기선 None이라 no-op.
             if let Some(pid) = session.process_pid.take() {
                 unregister_running_pid(pid);
             }
@@ -3468,7 +3472,17 @@ impl RunConfigManager {
             && session.is_running
         {
             session.cancel_flag.store(true, Ordering::Relaxed);
-            self.status_message = String::from("Stopping session...");
+            // Stop은 파이프라인 왕복(취소 감지→SIGTERM→exit→RunCompleted)을 기다리지
+            // 않는다: 신호를 지금 직접 보내고 UI 상태도 즉시 확정한다 — 출력 폭주 중에도
+            // rerun과 같은 즉각성. 협조 경로는 그대로 뒤따라와 SIGKILL 에스컬레이션을
+            // 보장하고(중복 신호는 무해), 늦게 도착하는 RunCompleted가 exit code를 채운다.
+            if let Some(pid) = session.process_pid.take() {
+                terminate_session_process(pid);
+                unregister_running_pid(pid);
+            }
+            session.is_running = false;
+            session.finished_at = Some(SystemTime::now());
+            self.status_message = String::from("Session stopped");
         }
 
         Task::none()
@@ -5379,11 +5393,27 @@ mod tests {
         assert!(before > 0, "테스트 전제: cancel 전 출력은 적용");
 
         let _ = app.handle_stop_session(sid);
+        {
+            // Stop은 RunCompleted 왕복을 기다리지 않고 UI 상태를 즉시 확정한다.
+            let s = app.session_by_id_mut(sid).unwrap();
+            assert!(!s.is_running, "stop 즉시 is_running=false");
+            assert!(s.finished_at.is_some(), "stop 즉시 finished_at 확정");
+        }
         let _ = app.handle_output_received(sid, &[OutputEvent::Line(String::from("late"))]);
         assert_eq!(
             app.session_by_id_mut(sid).unwrap().output_lines.len(),
             before,
             "cancel 후 도착한 배치는 폐기"
+        );
+
+        // 늦게 도착한 RunCompleted는 exit code를 채우되 Stop의 종료 시각을 보존한다.
+        let stopped_at = app.session_by_id_mut(sid).unwrap().finished_at;
+        let _ = app.handle_run_completed(sid, Ok(143));
+        let s = app.session_by_id_mut(sid).unwrap();
+        assert_eq!(s.exit_code, Some(143));
+        assert_eq!(
+            s.finished_at, stopped_at,
+            "finished_at은 Stop 클릭 기준 유지"
         );
 
         // rerun은 cancel_flag를 새 Arc로 교체하므로 새 실행의 출력은 다시 적용된다.

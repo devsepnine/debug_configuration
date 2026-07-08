@@ -129,6 +129,17 @@ fn unregister_session_io(session_id: Uuid) {
     }
 }
 
+/// Stop 버튼의 즉시 신호 경로: 스트림의 협조적 취소(50ms poll → SIGTERM → 2s → SIGKILL)를
+/// 기다리지 않고 지금 종료 신호를 보낸다. 협조 경로는 그대로 뒤따라와 에스컬레이션을
+/// 보장한다(중복 신호는 ESRCH no-op). unix는 그룹 SIGTERM(우아한 종료 기회 유지),
+/// Windows는 기존 강제 트리 종료.
+pub fn terminate_session_process(pid: u32) {
+    #[cfg(unix)]
+    signal_process_group(pid, libc::SIGTERM);
+    #[cfg(windows)]
+    force_kill_process_tree(pid);
+}
+
 /// 세션 PTY의 화면 크기를 갱신한다. pipe 세션/미등록 세션은 no-op.
 pub fn resize_session_pty(session_id: Uuid, cols: u16, rows: u16) {
     if let Ok(map) = SESSION_IO.lock()
@@ -875,13 +886,22 @@ async fn pty_output_loop(
             }
         }
 
-        // 크기 임계 초과 시 즉시 flush (마감 대기 없이).
-        if batch.len() >= OUTPUT_FLUSH_MAX_LINES || batch.bytes >= OUTPUT_FLUSH_MAX_BYTES {
+        // 크기 임계는 **메모리 가드**로만 쓴다 — 페이싱은 16ms 마감이 담당한다.
+        // pipe 경로의 64줄/16KiB를 그대로 쓰면 폭주 시 8KiB 청크(≈4096 이벤트)마다
+        // flush가 터져 초당 수천 메시지가 UI(winit 이벤트 큐)로 흘러 클릭·RunCompleted가
+        // 수 초씩 밀린다. 256KiB는 폭주 입력 ~16ms 분량 상한 ≈ 틱당 1회 flush로 수렴.
+        if batch.len() >= PTY_FLUSH_MAX_EVENTS || batch.bytes >= PTY_FLUSH_MAX_BYTES {
             flush_event_batch(output, session_id, &mut batch).await;
             flush_at = None;
         }
     }
 }
+
+/// PTY 배치 메모리 가드 (pipe 경로의 64/16KiB와 별개 — 위 주석 참조).
+#[cfg(unix)]
+const PTY_FLUSH_MAX_EVENTS: usize = 8192;
+#[cfg(unix)]
+const PTY_FLUSH_MAX_BYTES: usize = 256 * 1024;
 
 /// 이벤트 배치를 한 개의 `OutputReceived`로 전송. 비어 있으면 no-op.
 #[cfg(unix)]
