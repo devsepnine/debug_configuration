@@ -742,17 +742,45 @@ fn pty_reader_thread(fd: std::os::fd::OwnedFd, tx: tokio::sync::mpsc::Sender<Vec
 /// 수신측 소멸 후에만 버리므로 관측자가 없어 순서 역전도 없다.
 /// 종료: Ok(0) 또는 Err(BrokenPipe 등) — Windows 익명 파이프는 EOF를 어느 쪽으로도
 /// 표현할 수 있어 Interrupted 외 모든 Err를 EOF 등가로 취급한다.
+///
+/// **DSR(커서 위치) 핸드셰이크 — 자식 기동의 전제조건**: portable-pty는
+/// CreatePseudoConsole에 `PSEUDOCONSOLE_INHERIT_CURSOR`를 하드코딩하는데, 이 모드의
+/// conhost는 기동 직후 터미널에 `ESC[6n`(커서 위치 질의)을 내보내고 **응답이 입력
+/// 파이프로 올 때까지 자식의 콘솔 초기화를 블록**한다. 진짜 터미널(wezterm 등)은
+/// 이에 응답하지만 우리는 터미널 에뮬레이터가 아니므로, 여기서 질의를 감지해
+/// `ESC[1;1R`(1행 1열)로 대신 응답한다 — 안 하면 자식이 명령 실행조차 시작하지
+/// 못한 채 영원히 대기한다 (CI에서 실증). 질의는 청크 경계에 걸릴 수 있어 직전
+/// 꼬리 3바이트를 이월해 검색한다.
 #[cfg(windows)]
 fn pty_reader_thread(
     mut reader: Box<dyn std::io::Read + Send>,
     tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    dsr_writer: Arc<Mutex<Box<dyn std::io::Write + Send>>>,
 ) {
+    const DSR_REQUEST: &[u8] = b"\x1b[6n";
+
     let mut buf = [0u8; 8192];
     let mut forwarding = true;
+    let mut dsr_answered = false;
+    let mut dsr_tail: Vec<u8> = Vec::new();
     loop {
         match reader.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
+                if !dsr_answered {
+                    // 직전 꼬리 + 이번 청크에서 질의 검색 (경계 걸침 대응).
+                    let mut window = std::mem::take(&mut dsr_tail);
+                    window.extend_from_slice(&buf[..n]);
+                    if window.windows(DSR_REQUEST.len()).any(|w| w == DSR_REQUEST) {
+                        if let Ok(mut w) = dsr_writer.lock() {
+                            let _ = w.write_all(b"\x1b[1;1R").and_then(|()| w.flush());
+                        }
+                        dsr_answered = true;
+                    } else {
+                        let keep = window.len().min(DSR_REQUEST.len() - 1);
+                        dsr_tail = window[window.len() - keep..].to_vec();
+                    }
+                }
                 if forwarding && tx.blocking_send(buf[..n].to_vec()).is_err() {
                     forwarding = false;
                 }
@@ -844,20 +872,31 @@ fn spawn_in_pty(
         .master
         .take_writer()
         .map_err(|e| PtySpawnError::Spawn(format!("Failed to open pty writer: {e}")))?;
+    let writer = Arc::new(Mutex::new(writer));
+    // windows: 리더 스레드가 conhost의 INHERIT_CURSOR 질의(ESC[6n)에 응답할 수 있게
+    // stdin writer를 공유한다 (응답 없이는 자식이 콘솔 초기화에서 영원히 대기).
+    #[cfg(windows)]
+    let dsr_writer = Arc::clone(&writer);
 
     // ProcessStarted 발송 전에 등록 — 첫 프레임의 resize가 핸들을 찾을 수 있게.
     register_session_io(
         session_id,
         SessionIo {
             master: Some(pair.master),
-            writer: Some(SessionWriter::Pty(Arc::new(Mutex::new(writer)))),
+            writer: Some(SessionWriter::Pty(writer)),
         },
     );
 
     let (chunks_tx, chunks_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+    #[cfg(unix)]
     let reader_thread = std::thread::Builder::new()
         .name(format!("pty-read-{session_id}"))
         .spawn(move || pty_reader_thread(reader_src, chunks_tx))
+        .ok();
+    #[cfg(windows)]
+    let reader_thread = std::thread::Builder::new()
+        .name(format!("pty-read-{session_id}"))
+        .spawn(move || pty_reader_thread(reader_src, chunks_tx, dsr_writer))
         .ok();
 
     // waiter가 child를 소유하고 blocking wait로 reap한다 (좀비 방지, 스트림 패닉과 무관).
@@ -2863,6 +2902,12 @@ mod tests {
 
         impl Drop for HangWatchdog {
             fn drop(&mut self) {
+                // 패닉 unwind 중에는 해제하지 않는다 — 패닉 후 teardown(런타임 drop이
+                // 살아 있는 자식의 waiter를 기다리는 등)이 wedge되면 워치독이 마지막
+                // 안전망으로 abort한다.
+                if std::thread::panicking() {
+                    return;
+                }
                 self.disarmed
                     .store(true, std::sync::atomic::Ordering::Relaxed);
             }
@@ -2896,13 +2941,14 @@ mod tests {
                 }
                 Err(PtySpawnError::Spawn(e)) => panic!("spawn failed: {e}"),
             };
+            let pty_pid = pty.pid;
             let mut chunks_rx = pty.chunks_rx;
             let mut exit_rx = pty.exit_rx;
 
             // 자식 exit까지: 출력을 소비하면서 대기 (ConPTY는 exit로 EOF가 안 온다).
             wd.mark("awaiting child exit (consuming output)");
             let mut collected = Vec::new();
-            let status = tokio::time::timeout(T, async {
+            let status = match tokio::time::timeout(T, async {
                 loop {
                     tokio::select! {
                         chunk = chunks_rx.recv() => {
@@ -2915,7 +2961,21 @@ mod tests {
                 }
             })
             .await
-            .expect("child did not exit in time");
+            {
+                Ok(status) => status,
+                Err(_) => {
+                    // 살아 있는 자식을 남기면 waiter(child.wait)가 계속 블록해 tokio
+                    // 런타임 drop이 영원히 기다린다 — 트리를 죽여 풀고, 수집분을 담아
+                    // 패닉(무엇이 왔는지가 곧 진단이다).
+                    if let Some(pid) = pty_pid {
+                        force_kill_process_tree(pid);
+                    }
+                    panic!(
+                        "child did not exit in time; collected: {:?}",
+                        String::from_utf8_lossy(&collected)
+                    );
+                }
+            };
 
             wd.mark("teardown: unregister on blocking pool + drain to EOF");
             let close = tokio::task::spawn_blocking(move || unregister_session_io(session_id));
@@ -2950,6 +3010,21 @@ mod tests {
                 }
                 Err(PtySpawnError::Spawn(e)) => panic!("spawn failed: {e}"),
             };
+            let pty_pid = pty.pid;
+            let mut chunks_rx = pty.chunks_rx;
+            let mut exit_rx = pty.exit_rx;
+            let mut collected = Vec::new();
+
+            // 자식 콘솔 초기화(DSR 핸드셰이크) 이후에 입력을 넣는다 — 초기화 전
+            // 입력은 conhost의 DSR 응답 스캔과 섞일 수 있다. 첫 출력 청크(프롬프트
+            // 렌더)가 초기화 완료 신호다.
+            wd.mark("waiting first output before stdin write");
+            let first = tokio::time::timeout(T, chunks_rx.recv())
+                .await
+                .expect("no initial output from conpty child")
+                .expect("stream closed before any output");
+            collected.extend_from_slice(&first);
+
             wd.mark("writing stdin bytes");
             {
                 let map = SESSION_IO.lock().unwrap();
@@ -2964,11 +3039,8 @@ mod tests {
                     SessionWriter::Pipe(_) => unreachable!("conpty session uses Pty writer"),
                 }
             }
-            let mut chunks_rx = pty.chunks_rx;
-            let mut exit_rx = pty.exit_rx;
             wd.mark("awaiting child exit after stdin write");
-            let mut collected = Vec::new();
-            let status = tokio::time::timeout(T, async {
+            let status = match tokio::time::timeout(T, async {
                 loop {
                     tokio::select! {
                         chunk = chunks_rx.recv() => {
@@ -2981,7 +3053,18 @@ mod tests {
                 }
             })
             .await
-            .expect("child did not exit after stdin write — line terminator did not submit?");
+            {
+                Ok(status) => status,
+                Err(_) => {
+                    if let Some(pid) = pty_pid {
+                        force_kill_process_tree(pid);
+                    }
+                    panic!(
+                        "child did not exit after stdin write; collected: {:?}",
+                        String::from_utf8_lossy(&collected)
+                    );
+                }
+            };
             wd.mark("teardown: unregister on blocking pool + drain to EOF");
             let close = tokio::task::spawn_blocking(move || unregister_session_io(session_id));
             tokio::time::timeout(T, async {
@@ -3141,10 +3224,11 @@ mod tests {
                 }
                 Err(PtySpawnError::Spawn(e)) => panic!("spawn failed: {e}"),
             };
+            let pty_pid = pty.pid;
             let mut chunks_rx = pty.chunks_rx;
             let mut exit_rx = pty.exit_rx;
             wd.mark("awaiting child exit");
-            let status = tokio::time::timeout(T, async {
+            let status = match tokio::time::timeout(T, async {
                 loop {
                     tokio::select! {
                         chunk = chunks_rx.recv() => { let _ = chunk; }
@@ -3155,7 +3239,15 @@ mod tests {
                 }
             })
             .await
-            .expect("child did not exit");
+            {
+                Ok(status) => status,
+                Err(_) => {
+                    if let Some(pid) = pty_pid {
+                        force_kill_process_tree(pid);
+                    }
+                    panic!("child did not exit");
+                }
+            };
             assert_eq!(status, Ok(0));
 
             wd.mark("unregister on blocking pool + drain to EOF");
