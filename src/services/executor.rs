@@ -108,13 +108,16 @@ enum SessionWriter {
 
 /// 세션 하나의 프로세스 I/O 핸들 묶음.
 struct SessionIo {
-    /// PTY master (resize용). pipe 세션은 None.
+    /// PTY master. pipe 세션은 None. unix에선 resize에 읽고, windows에선 읽지
+    /// 않지만 **보유 자체가 하중이다** — drop이 ClosePseudoConsole을 트리거하는
+    /// 유일한 teardown 경로(리더 EOF의 근원)라 필드 제거 금지.
+    #[cfg_attr(windows, allow(dead_code))]
     master: Option<Box<dyn portable_pty::MasterPty + Send>>,
     /// stdin writer. unix pipe 폴백(출력 전용)은 None.
     writer: Option<SessionWriter>,
-    /// 마지막으로 적용된 PTY 크기 — 동일 크기 재요청을 no-op으로 만든다.
-    /// Windows ConPTY는 RESIZE_QUIRK로 리사이즈마다 전체 리페인트(빈 행 무더기)를
-    /// 내보낼 수 있어, 불필요한 ResizePseudoConsole 호출 자체를 막는 것이 중요하다.
+    /// 마지막으로 적용된 PTY 크기 — 동일 크기 재요청을 no-op으로 만든다 (unix
+    /// 라이브 리사이즈 전용; windows는 라이브 리사이즈 자체를 전파하지 않는다).
+    #[cfg_attr(windows, allow(dead_code))]
     last_pty_size: Option<(u16, u16)>,
 }
 
@@ -151,7 +154,19 @@ pub fn terminate_session_process(pid: u32) {
 }
 
 /// 세션 PTY의 화면 크기를 갱신한다. pipe 세션/미등록 세션/동일 크기는 no-op.
+///
+/// **Windows는 라이브 리사이즈를 전파하지 않는다**: ConPTY(RESIZE_QUIRK)는
+/// ResizePseudoConsole마다 보이는 화면 전체를 다시 내보내는데, 위치 제어를 버리는
+/// 라인 스크롤백에서는 그 재방출이 열린 프롬프트에 이어붙고("namename") 뷰포트
+/// 높이만큼의 행 블록이 리사이즈마다 스크롤백에 쌓인다(실기 QA 실증). 크기는
+/// 스폰 시점(최근 관측 pane 크기)에 고정되고, 새 크기는 세션의 pty_viewport로
+/// 추적되어 다음 실행(rerun)에 반영된다.
 pub fn resize_session_pty(session_id: Uuid, cols: u16, rows: u16) {
+    #[cfg(windows)]
+    {
+        let _ = (session_id, cols, rows);
+    }
+    #[cfg(not(windows))]
     if let Ok(mut map) = SESSION_IO.lock()
         && let Some(io) = map.get_mut(&session_id)
         && let Some(master) = &io.master
