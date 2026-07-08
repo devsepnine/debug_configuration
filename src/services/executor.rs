@@ -315,6 +315,9 @@ impl Drop for CompletionGuard {
         // 블록할 수 있다. 이 Drop은 tokio 워커에서 돌므로(취소/패닉 경로), 엔트리를
         // 여기서 꺼내되 실제 drop은 블로킹 풀로 분리 투하한다 — 느린/wedge된 conhost가
         // 고정 워커를 점유하지 못하게. 런타임 밖이면(이론상) 인라인 drop 폴백.
+        // 셧다운 경합(tokio 1.x 확인): 셧다운 중 spawn_blocking은 panic하지 않고
+        // 클로저를 호출 스레드에서 동기 실행(cancel_task)한다 → try_current 폴백과
+        // 동일한 인라인 drop으로 수렴. 이 가정은 tokio 메이저 업그레이드 시 재확인.
         #[cfg(windows)]
         {
             let session_id = self.session_id;
@@ -1082,8 +1085,9 @@ const CONPTY_EOF_FAILSAFE: Duration = Duration::from_secs(5);
 /// (300ms, 청크마다 갱신 — 수다스런 손자는 안 끊김) → **블로킹 풀에서** unregister
 /// (ClosePseudoConsole; 루프는 계속 소비해 정상 배관으로 꼬리를 드레인 — 루프 태스크
 /// 인라인 unregister는 [Close 블록 ↔ 리더 blocking_send ↔ 수신 없는 루프] 3자 교착)
-/// → 리더 EOF → 기존 EOF 분기로 Completed. failsafe(5s, teardown 착수 시점 무장)는
-/// wedge된 conhost에서도 세션 고착을 방지한다.
+/// → 리더 EOF → 기존 EOF 분기로 Completed. failsafe(5s, teardown 착수 시점 무장 +
+/// **청크 도착마다 rolling 갱신**)는 wedge된 conhost — 청크가 아예 안 오는 상태 —
+/// 에서만 세션 고착을 방지하고, 정상적으로 흐르는 드레인은 절대 절단하지 않는다.
 ///
 /// 상태 전이(가드가 핵심): teardown 팔 `teardown_at.is_some() && !teardown_started`
 /// (없으면 과거 시각으로 매 반복 spawn_blocking 스핀), failsafe는 teardown 착수
@@ -1136,6 +1140,13 @@ async fn pty_output_loop(
                         // quiet 타이머 갱신: exit 후에도 출력이 흐르는 동안은 살려 둔다.
                         if exit_status.is_some() && !teardown_started {
                             teardown_at = Some(Instant::now() + CONPTY_EXIT_QUIET_GRACE);
+                        }
+                        // failsafe도 rolling: teardown 후 드레인이 정상적으로 흐르는
+                        // 동안은 절단하지 않는다 — 실링은 "청크가 아예 안 오는 wedge"
+                        // 에만 걸린다. 고정 시각이면 5s를 넘는 건강한 대용량 드레인을
+                        // 조기 절단한다 (리뷰에서 재현 실증된 결함).
+                        if teardown_started {
+                            failsafe_at = Some(Instant::now() + CONPTY_EOF_FAILSAFE);
                         }
                     }
                     // EOF: ClosePseudoConsole 이후에만 도달한다 (teardown 정상 귀결
@@ -2517,6 +2528,64 @@ mod tests {
             );
         }
 
+        /// 회귀 방지(windows 종료 상태기계, 리뷰 실증 결함): teardown 착수 후에도
+        /// 청크가 정상적으로 계속 흐르면 failsafe는 rolling 갱신되어 절단하지 않아야
+        /// 한다 — 고정 시각 failsafe는 5s를 넘는 건강한 드레인의 꼬리를 버렸다.
+        /// 가상 시간(start_paused)으로 8초 넘는 드레인을 ms 단위에 검증한다.
+        #[cfg(windows)]
+        #[tokio::test(start_paused = true)]
+        async fn failsafe_rolls_while_teardown_drain_flows() {
+            let (mut tx, mut rx) = iced::futures::channel::mpsc::channel::<Message>(1000);
+            let cancel = Arc::new(AtomicBool::new(false));
+            let (chunks_tx, mut chunks_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+            let (exit_tx, mut exit_rx) = tokio::sync::oneshot::channel::<Result<i32, String>>();
+
+            exit_tx.send(Ok(0)).unwrap();
+            let feeder = tokio::spawn(async move {
+                // exit 소비 + quiet-grace(300ms) 경과로 teardown이 착수된 뒤,
+                // failsafe(5s)를 훌쩍 넘는 가상 8초 동안 1초 간격으로 계속 출력.
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                for i in 0..8 {
+                    chunks_tx
+                        .send(format!("tail-{i}\n").into_bytes())
+                        .await
+                        .unwrap();
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+                chunks_tx.send(b"final-marker\n".to_vec()).await.unwrap();
+                // drop(chunks_tx) → EOF
+            });
+
+            let end = tokio::time::timeout(
+                Duration::from_secs(60),
+                pty_output_loop(
+                    &mut tx,
+                    Uuid::new_v4(),
+                    &mut chunks_rx,
+                    &mut exit_rx,
+                    &cancel,
+                ),
+            )
+            .await
+            .expect("loop timed out");
+            feeder.await.unwrap();
+            assert!(
+                matches!(end, PtyLoopEnd::Completed(Ok(0))),
+                "정상 드레인은 EOF까지 완주해야 함"
+            );
+
+            drop(tx);
+            let mut messages = Vec::new();
+            while let Some(msg) = rx.next().await {
+                messages.push(msg);
+            }
+            let events = collect_events(&messages);
+            assert!(
+                events.contains(&OutputEvent::Line(String::from("final-marker"))),
+                "failsafe가 흐르는 드레인을 절단하면 안 됨: {events:?}"
+            );
+        }
+
         /// 회귀 방지: exit 팔이 oneshot을 소비한 뒤 Stop → 과거엔 terminate_and_reap_pty가
         /// 소비된 exit_rx를 재폴링해 panic("called after complete")했다 (CompletionGuard가
         /// "Run interrupted unexpectedly"로 은폐). Cancelled{exit_taken}이 재await를 건너뛴다.
@@ -2979,7 +3048,11 @@ mod tests {
         async fn conpty_cr_progress_collapses_in_assembler() {
             // conhost가 라인 내 \r를 보존하는지의 카나리아 — CHA(ESC[G) 재인코딩으로
             // 바뀌면 여기서 잡힌다 (그 경우 CHA→되감기 매핑이 후속 과제).
-            let Some((raw, status)) = run_conpty("Write-Host \"a`rb`rc\"").await else {
+            // [char]13 사용: 임베디드 이중따옴표+백틱은 ArgvQuote(OS)와 PowerShell
+            // 토크나이저의 이중 인용 레이어를 겹쳐 지나는 가장 취약한 형태라 회피.
+            let Some((raw, status)) =
+                run_conpty("Write-Host ('a' + [char]13 + 'b' + [char]13 + 'c')").await
+            else {
                 return;
             };
             assert_eq!(status, Ok(0));

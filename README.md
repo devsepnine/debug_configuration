@@ -257,8 +257,9 @@ Configuration files are automatically saved in the OS-specific settings director
 
 The application automatically cleans up all running processes on exit:
 1. Drop trait executes on Ctrl+C or window close
-2. Unix: SIGTERM to each session's process group, a 2-second grace window,
-   then SIGKILL for whatever remains
+2. Unix: immediate SIGKILL to each session's process group (no grace window —
+   a graceful SIGTERM-then-wait is what the Stop button does; blocking the
+   closing UI thread for it would freeze the window)
 3. Windows: `taskkill /T /F` immediately — ConPTY offers no graceful signal
    path, so the tree is force-killed
 

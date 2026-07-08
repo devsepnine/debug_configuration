@@ -253,7 +253,9 @@ open /Applications/RunConfigManager.app
 
 アプリケーション終了時に実行中の全プロセスを自動的にクリーンアップします:
 1. Ctrl+C またはウィンドウクローズで Drop trait が実行
-2. Unix: セッションごとのプロセスグループに SIGTERM → 2 秒の猶予 → 残存に SIGKILL
+2. Unix: セッションごとのプロセスグループに直ちに SIGKILL (猶予なし —
+   graceful な SIGTERM 待機は Stop ボタン経路専用; 終了中の UI スレッドを
+   その分ブロックするとウィンドウが固まる)
 3. Windows: 直ちに `taskkill /T /F` — ConPTY には graceful なシグナル経路が
    ないためツリーを強制終了
 

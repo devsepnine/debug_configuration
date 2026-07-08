@@ -32,3 +32,8 @@ libc = "0.2"
 
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"
+
+[dev-dependencies]
+# 가상 시간 테스트(start_paused) — windows ConPTY 종료 상태기계의 장시간
+# 드레인 시나리오를 ms 단위로 검증한다. 테스트 빌드에만 피처 적용.
+tokio = { version = "1.50", features = ["test-util"] }

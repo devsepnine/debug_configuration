@@ -248,7 +248,9 @@ open /Applications/RunConfigManager.app
 
 애플리케이션 종료 시 실행 중인 모든 프로세스를 자동으로 정리합니다:
 1. Ctrl+C 또는 창 닫기 시 Drop trait 실행
-2. Unix: 세션별 프로세스 그룹에 SIGTERM → 2초 유예 → 잔여 SIGKILL
+2. Unix: 세션별 프로세스 그룹에 즉시 SIGKILL (유예 없음 — graceful한
+   SIGTERM 대기는 Stop 버튼 경로 전용; 종료 중인 UI 스레드를 그만큼
+   블록하면 창이 멈춤)
 3. Windows: 즉시 `taskkill /T /F` — ConPTY에는 graceful 신호 경로가 없어
    트리를 강제 종료
 
