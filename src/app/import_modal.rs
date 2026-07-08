@@ -2,7 +2,8 @@
 //!
 //! Open(전체 교체)을 대체하는 기능: 파일에서 읽은 구성 중 선택한 것만 현재 목록에
 //! **병합**한다. 같은 id가 이미 있으면 제자리 교체(같은 UUID = 같은 구성의 다른 버전),
-//! 새 id는 목록 끝에 추가한다. 현재 작업 파일 경로(`last_file_path`)는 건드리지 않는다.
+//! 새 id는 목록 끝에 추가한다. 병합은 메모리 목록에만 반영되며, 앱 저장소에는
+//! 사용자가 Save할 때 기록된다 (import 자체는 영속 저장소를 건드리지 않는다).
 
 use super::{RunConfigManager, cancellable_status};
 use crate::messages::Message;

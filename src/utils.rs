@@ -110,6 +110,7 @@ pub const ICON_ARROW_DOWN_LINE: &[u8] =
 pub const ICON_PANE_MAXIMIZE: &[u8] = include_bytes!("../assets/app--pane-maximize.svg");
 pub const ICON_PANE_RESTORE: &[u8] = include_bytes!("../assets/app--pane-restore.svg");
 pub const ICON_SEARCH: &[u8] = include_bytes!("../assets/app--search.svg");
+pub const ICON_TERMINAL_INPUT: &[u8] = include_bytes!("../assets/app--terminal-input.svg");
 pub const ICON_MORE: &[u8] = include_bytes!("../assets/app--more.svg");
 pub const ICON_ERASER: &[u8] = include_bytes!("../assets/mingcute--eraser-line.svg");
 

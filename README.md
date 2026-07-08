@@ -47,7 +47,15 @@ Grab the latest pre-built binary for your platform from the [Releases page](http
 
 ### Execution Session Management
 - Run multiple sessions simultaneously
-- Real-time output display (ANSI color support)
+- Real PTY execution on macOS/Linux: programs detect a terminal, so colors,
+  progress bars, and interactive prompts work as in a real shell
+  (`TERM=xterm-256color`, viewport-aware resize)
+- Live single-line progress bars (carriage-return redraws render in place)
+- stdin input bar per session (toggle button or Cmd+I): answer prompts and
+  feed REPLs — PTY echoes input naturally; on Windows (pipe transport) the
+  app echoes locally
+- Real-time output display (ANSI color support; OSC/DCS control sequences
+  are filtered out)
 - Rerun, stop, remove, and hide sessions from a workspace
 - Status badge on finished sessions (success, failed exit code, run duration)
 - Desktop notification when a run finishes while the window is unfocused
@@ -221,6 +229,19 @@ Configuration files are automatically saved in the OS-specific settings director
 - **Linux**: `~/.config/run_config_manager/configs.json`
 - **macOS**: `~/Library/Application Support/run_config_manager/configs.json`
 - **Windows**: `%APPDATA%\run_config_manager\configs.json`
+
+## Known Limitations
+
+- **Full-screen TUI apps are out of scope**: the terminal is a line-scrollback
+  renderer, not a screen grid — `vim`, `htop`, `less` and other alt-screen
+  programs will render garbage (the app stays responsive; use Stop to recover).
+  Interactive line-based prompts (`python`'s `input()`, `read`, REPLs) work.
+- **Windows runs on pipes** (ConPTY is planned): colors/progress depend on the
+  tool honoring non-tty output, stdin input works with local echo, and since
+  `-NonInteractive` was removed a PowerShell cmdlet prompting unexpectedly can
+  appear to hang — press Stop to terminate it.
+- On macOS/Linux, `sh -l` plus a real tty means shell profiles may print
+  banners into the session output.
 
 ## Shutdown Handling
 

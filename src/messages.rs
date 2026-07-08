@@ -27,8 +27,12 @@ pub enum Message {
     // 구성 관리 메시지
     /// 새 구성 추가
     AddConfiguration,
-    /// 지정된 구성 삭제
-    DeleteConfiguration(Option<usize>),
+    /// 구성 삭제 요청 — 즉시 지우지 않고 확인 모달을 연다 (undo 없는 파괴적 조작)
+    RequestDeleteConfiguration(Option<usize>),
+    /// 삭제 확인 모달의 Delete 확정 → 실제 삭제
+    ConfirmDeleteConfiguration,
+    /// 삭제 확인 모달 취소 (Cancel/X/Esc)
+    CancelDeleteConfiguration,
     /// 지정된 구성 복제 (옵션을 그대로 복사한 새 구성 생성)
     CloneConfiguration(Option<usize>),
     /// 지정된 구성 실행
@@ -228,10 +232,12 @@ pub enum Message {
     // 실행 세션 메시지
     /// 프로세스 시작됨 (세션 ID, PID) - Drop cleanup을 위한 PID 추적
     ProcessStarted(Uuid, u32),
-    /// 프로세스 출력 수신 (세션 ID, 출력 텍스트)
-    OutputReceived(Uuid, String),
+    /// 프로세스 출력 수신 (세션 ID, 출력 이벤트 배치 — Line=추가, Replace=마지막 라인 교체)
+    OutputReceived(Uuid, Vec<crate::models::OutputEvent>),
     /// 프로세스 실행 완료 (세션 ID, 종료 코드 또는 에러 메시지)
     RunCompleted(Uuid, Result<i32, String>),
+    /// 터미널 뷰포트 크기 변경 (세션 ID, cols, rows) — PTY resize로 전달 (변경 시에만 발행)
+    SessionViewportResized(Uuid, u16, u16),
 
     // 세션 관리 메시지 (세션은 안정적인 `Uuid`로 식별 — stale 인덱스 방지)
     /// 세션 재실행 (`session_id`)
@@ -315,12 +321,27 @@ pub enum Message {
     ToggleSessionSearchRegex(Uuid),
     /// 활성 pane의 세션에 검색바 열기 (Ctrl+F — 대상 세션은 핸들러가 해석)
     OpenSearchInActivePane,
-    /// 활성 검색바 닫기 (ESC — 대상 세션은 핸들러가 해석)
-    CloseActiveSearch,
+    /// 활성 바(stdin 우선, 다음 검색) 하나 닫기 (ESC — 대상은 핸들러가 우선순위로 해석)
+    CloseActiveBar,
     /// 활성 pane 검색의 다음 매치로 이동 (Enter — 대상 세션은 핸들러가 해석)
     SearchNextInActivePane,
     /// 활성 pane 검색의 이전 매치로 이동 (Shift+Enter — 대상 세션은 핸들러가 해석)
     SearchPrevInActivePane,
+
+    // 세션 stdin 입력 (PTY/pipe stdin으로 한 줄 전송; search 클러스터와 동일 컨벤션)
+    /// stdin 입력바 열기 (`session_id`)
+    OpenSessionStdin(Uuid),
+    /// stdin 입력바 닫기 (`session_id`)
+    CloseSessionStdin(Uuid),
+    /// stdin 드래프트 변경 (`session_id`, 입력 값)
+    SessionStdinChanged(Uuid, String),
+    /// stdin 드래프트 제출 — 프로세스 stdin으로 전송 (`session_id`)
+    SessionStdinSubmitted(Uuid),
+    /// stdin 쓰기 완료 (`session_id`, 제출 원문(실패 복원·pipe 로컬 에코용),
+    /// 성공 시 로컬 에코 필요 여부 / 실패 사유)
+    SessionStdinWriteCompleted(Uuid, String, Result<bool, crate::models::StdinWriteError>),
+    /// 활성 pane 세션에 stdin 바 열기 (Cmd+I — 대상은 핸들러가 해석, Sessions 뷰 전용)
+    OpenStdinInActivePane,
     /// 세션 출력 버퍼 비우기 (`session_id`) — 실행 중인 프로세스는 유지, 화면 로그만 클리어
     ClearSessionOutput(Uuid),
     /// 세션 출력을 파일로 내보내기 (`session_id`)
@@ -350,6 +371,20 @@ pub enum Message {
     UpdateCheckCompleted(Result<crate::services::UpdateOutcome, String>),
     /// 확인 중 로딩 스피너 프레임 진행 (타이머 tick)
     UpdateSpinnerTick,
+    /// 실행 중 세션의 라이브 경과시간 갱신 tick (1초, 상태 변경 없음 — 재렌더 트리거)
+    SessionTimerTick,
+    /// Cmd+R: 컨텍스트 실행 — Sessions 뷰에서 포커스 세션이 있으면 재실행, 아니면 선택 구성 실행
+    RunShortcut,
+    /// Cmd+W: 포커스된 세션 pane을 현재 워크스페이스에서 숨김 (세션은 목록에 유지)
+    CloseFocusedPane,
+    /// 인앱 업데이트 요청 — 즉시 설치하지 않고 확인 모달을 연다 (설치 성공 시 재시작되므로)
+    RequestInstallUpdate,
+    /// 업데이트 확인 모달의 Update 확정 → 실제 설치 시작
+    ConfirmInstallUpdate,
+    /// 업데이트 확인 모달 취소 (Cancel/X/Esc)
+    CancelInstallUpdate,
+    /// 인앱 업데이트 다운로드·검증·적용 완료 (성공 시 재실행 계획 포함)
+    UpdateInstallCompleted(Result<crate::services::RelaunchPlan, String>),
 
     // 윈도우 chrome 제어
     /// 메인 윈도우가 열림

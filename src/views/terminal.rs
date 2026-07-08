@@ -130,6 +130,12 @@ struct ScrollState {
     /// offset을 보정(②)하는 데 쓴다. None이면 증분 불가(전체 재빌드).
     cached_first_line_id: Option<usize>,
     cached_last_line_id: Option<usize>,
+    /// 캐시를 만든 세션. "id 범위·길이 불변 + content_version만 변경"을 tail Replace로
+    /// 판정할 때, 세션 전환/재시작으로 line_id가 우연히 겹치는 경우를 배제하는 판별자.
+    /// 불일치면 증분을 시도하지 않고 전체 재빌드한다.
+    cached_session_id: Option<Uuid>,
+    /// 마지막으로 앱에 통지한 PTY 뷰포트 (cols, rows). 변경 프레임에서만 publish.
+    last_reported_viewport: Option<(u16, u16)>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -437,6 +443,7 @@ impl<'a> TerminalCanvas<'a> {
         state.cached_render_key = self.render_key.clone();
         state.cached_first_line_id = self.first_line_id;
         state.cached_last_line_id = self.last_line_id;
+        state.cached_session_id = Some(self.session_id);
         0
     }
 
@@ -458,6 +465,12 @@ impl<'a> TerminalCanvas<'a> {
         {
             return None;
         }
+        // 세션 판별자: line_id 범위 비교는 같은 세션 안에서만 의미가 있다. 세션
+        // 전환/재시작으로 id가 우연히 겹치면 아래의 tail-Replace 판정이 오염되므로
+        // 불일치 시 전체 재빌드로 넘긴다.
+        if state.cached_session_id != Some(self.session_id) {
+            return None;
+        }
         let cached_first = state.cached_first_line_id?;
         let cached_last = state.cached_last_line_id?;
         let cur_first = self.first_line_id?;
@@ -466,13 +479,24 @@ impl<'a> TerminalCanvas<'a> {
         // line_id는 단조 증가하고 evict는 앞에서만 일어난다. 범위 변화로 evict/append 수를 구한다.
         let evicted = cur_first.checked_sub(cached_first)?;
         let appended = cur_last.checked_sub(cached_last)?;
-        // 줄 범위 변화가 전혀 없는데 캐시 미스(content_version 변경)로 여기 도달한 경우:
-        // 기존 줄의 in-place 변경이거나 세션 전환/재시작으로 line_id가 우연히 겹친 경우다.
-        // 증분으로는 그 변화를 반영할 수 없으므로(stale 캐시 위험) 전체 재빌드에 맡긴다.
-        if evicted == 0 && appended == 0 {
-            return None;
-        }
         let old_len = state.line_counts.len();
+
+        // 같은 세션에서 id 범위·길이가 모두 불변인데 content_version만 바뀐 경우 =
+        // 마지막 줄 in-place Replace (replace_last_line이 코드베이스 유일의 in-place
+        // 변경이며 line_id를 재사용한다). 마지막 원소만 재계산 — 라이브 진행바(초당
+        // 수십 Replace)가 전체 O(n) 재빌드로 흐르면 대형 버퍼에서 UI가 무너진다.
+        if evicted == 0 && appended == 0 {
+            if old_len != self.lines.len() || old_len == 0 {
+                return None;
+            }
+            let last_idx = old_len - 1;
+            let new_count = Self::calculate_wrapped_count(&self.lines[last_idx], max_chars) as u32;
+            let old_count = state.line_counts[last_idx];
+            state.cached_total = state.cached_total - old_count as usize + new_count as usize;
+            state.line_counts[last_idx] = new_count;
+            state.cached_render_key = self.render_key.clone();
+            return Some(0);
+        }
         // 정합성: 추론한 새 길이가 실제 표시 줄 수와 같아야 한다(아니면 clear/재배열 → 전체 재빌드).
         let expected_len = old_len.checked_sub(evicted)?.checked_add(appended)?;
         if expected_len != self.lines.len() {
@@ -481,6 +505,15 @@ impl<'a> TerminalCanvas<'a> {
 
         // 앞에서 evicted개 제거(그 행 수 합이 offset 보정량), 뒤에 append된 줄만 wrap 계산.
         let evicted_wrapped: usize = state.line_counts.drain(..evicted).map(|c| c as usize).sum();
+        // 같은 프레임 배치에 Replace가 섞였다면 잔존 구간의 tail(=append 직전 경계 줄)
+        // 내용이 바뀌었을 수 있다 — [Replace, Line…] 프레임과 "Replace가 바이트 예산
+        // eviction을 유발한" 프레임(appended==0) 둘 다 커버하도록 무조건 재계산 (O(1)).
+        if let Some(boundary_idx) = state.line_counts.len().checked_sub(1)
+            && boundary_idx < self.lines.len()
+        {
+            state.line_counts[boundary_idx] =
+                Self::calculate_wrapped_count(&self.lines[boundary_idx], max_chars) as u32;
+        }
         let appended_start = self.lines.len() - appended;
         for line in &self.lines[appended_start..] {
             state
@@ -640,7 +673,27 @@ impl<'a> canvas::Program<Message> for TerminalCanvas<'a> {
             if let Some(action) = self.apply_scroll_target(state, metrics) {
                 return Some(action);
             }
-            return self.apply_auto_scroll(state, metrics);
+            if let Some(action) = self.apply_auto_scroll(state, metrics) {
+                return Some(action);
+            }
+            // PTY 뷰포트 통지: 스크롤 액션이 없는 조용한 프레임에서, 크기가 실제로
+            // 바뀌었을 때만 publish한다 (한 update는 한 액션만 반환 가능 — 점프/재고정을
+            // 선점하면 그 프레임의 스크롤 동작이 밀린다. 리사이즈는 드물고 프레임은
+            // 연속이라 다음 조용한 프레임에 즉시 수렴한다). cols는 wrap 계산과 동일한
+            // max_chars, rows는 보이는 행 수. 최소값 clamp는 병적인 소형 pane 방어.
+            let viewport = (
+                u16::try_from(max_chars).unwrap_or(u16::MAX).max(20),
+                (Self::calculate_visible_lines(bounds.height).max(0.0) as u16).max(5),
+            );
+            if state.last_reported_viewport != Some(viewport) {
+                state.last_reported_viewport = Some(viewport);
+                return Some(canvas::Action::publish(Message::SessionViewportResized(
+                    self.session_id,
+                    viewport.0,
+                    viewport.1,
+                )));
+            }
+            return None;
         }
 
         match event {
@@ -832,6 +885,11 @@ impl<'a> TerminalCanvas<'a> {
         // 바뀌면 content_version/줄 수가 달라 rebuild_wrap_cache_if_needed가 캐시 미스로
         // 전체 재빌드하며 자연스럽게 새 세션 기준으로 갱신되고, 증분 경로도 line_id 범위
         // 불일치(checked_sub None / 변화 0 가드)로 차단되므로 명시적 리셋이 불필요하다.
+        //
+        // 단, 뷰포트 보고 기억은 리셋한다 — State는 pane(위젯)에 붙어 세션 교체를 넘어
+        // 살아남으므로, 같은 크기라도 **새 세션**에게는 아직 통지된 적이 없다. 리셋하지
+        // 않으면 새 세션의 PTY가 실측 크기(SIGWINCH)를 영영 못 받아 기본 120×40에 고정된다.
+        state.last_reported_viewport = None;
 
         let metrics = self.scroll_metrics(state, bounds);
         state.offset =
@@ -859,9 +917,8 @@ impl<'a> TerminalCanvas<'a> {
     ///
     /// 불변식: `line_counts`는 update 선두의 `rebuild_wrap_cache_if_needed`로 항상 `lines`와
     /// 길이가 일치하므로 슬라이스 경계가 안전하다.
-    /// 한계: `scroll_target`은 `output_lines`의 현재 인덱스라, 실행 중 스트리밍으로 앞쪽 줄이
-    /// evict되면 stale해져 점프가 어긋날 수 있다(드묾·비치명적). 근본 해결은 line_id 기반
-    /// 앵커(deferred)로 다룬다.
+    /// `scroll_target`은 뷰 빌드 시점에 안정 line_id에서 해석된 **이 프레임의 canvas 행**
+    /// 이라(`prepare_lines` 참고), 스트리밍 eviction으로 어긋나지 않는다.
     fn apply_scroll_target(
         &self,
         state: &mut ScrollState,
@@ -1898,7 +1955,7 @@ fn render_key_for(session: &RunSession) -> RenderKey {
 /// # Arguments
 /// * `session` - 렌더링할 세션의 참조
 pub fn view_terminal_for_session(session: &RunSession, is_dragging: bool) -> Element<'_, Message> {
-    let (lines, highlights) = prepare_lines(session);
+    let (lines, highlights, scroll_target_row) = prepare_lines(session);
 
     let canvas = Canvas::new(TerminalCanvas {
         lines,
@@ -1906,7 +1963,8 @@ pub fn view_terminal_for_session(session: &RunSession, is_dragging: bool) -> Ele
         session_id: session.id,
         initial_scroll_progress: session.scroll_progress,
         auto_scroll: session.auto_scroll,
-        scroll_target: session.scroll_target,
+        // 안정 line_id(session.scroll_target)를 이 프레임의 canvas 행으로 해석한 값.
+        scroll_target: scroll_target_row,
         first_line_id: session.output_lines.front().map(|(id, _)| *id),
         last_line_id: session.output_lines.back().map(|(id, _)| *id),
         render_key: render_key_for(session),
@@ -1948,7 +2006,14 @@ pub fn view_terminal_for_session(session: &RunSession, is_dragging: bool) -> Ele
 /// 줄을 표시한다(버퍼가 MAX_OUTPUT_LINES로 상한되고 가상화로 가시 영역만 그리므로 별도
 /// 렌더 상한/"older lines hidden" 헤더는 없다). 줄은 세션 버퍼를 빌려(zero-copy) 전달하며,
 /// 각 출력 라인의 매치 글자 범위로 `LineSearch`(매치/현재 매치 강조)를 부여한다.
-fn prepare_lines(session: &RunSession) -> (Vec<LineRef<'_>>, Vec<LineSearch>) {
+/// 세션 출력에서 canvas에 넘길 (줄, 강조, 검색 점프 목표 행)을 구성한다.
+///
+/// `scroll_target`(안정 line_id)은 여기서 **현재 프레임의 canvas 행 인덱스**로 해석된다 —
+/// 필터 모드(매치 줄만 표시)에서도 실제로 그려지는 행 기준이라 정확하고, 스트리밍으로
+/// 앞쪽 줄이 evict돼도 id 비교라 어긋나지 않는다. 목표 줄이 이미 evict됐거나(드묾)
+/// 필터로 가려졌으면 행 0으로 clamp한다 — 점프가 반드시 1회 적용·소비돼야
+/// `SessionScrollChanged`가 목표를 클리어하고 auto_scroll 판정이 정상 복귀한다.
+fn prepare_lines(session: &RunSession) -> (Vec<LineRef<'_>>, Vec<LineSearch>, Option<usize>) {
     use crate::ansi::TextSegment;
 
     let search = session.search.as_ref();
@@ -1979,6 +2044,8 @@ fn prepare_lines(session: &RunSession) -> (Vec<LineRef<'_>>, Vec<LineSearch>) {
 
     let mut lines: Vec<LineRef<'_>> = Vec::new();
     let mut highlights = Vec::new();
+    let target_id = session.scroll_target;
+    let mut target_row: Option<usize> = None;
 
     if active && filter {
         // 필터 모드: 매치된 라인만(같은 라인의 매치가 여러 개여도 한 줄만, 입력 순서 유지).
@@ -1988,27 +2055,48 @@ fn prepare_lines(session: &RunSession) -> (Vec<LineRef<'_>>, Vec<LineSearch>) {
                 "No lines match \"{query}\""
             ))]));
             highlights.push(LineSearch::default());
-            return (lines, highlights);
+            // 목표 미소비 방지: 안내 줄뿐이어도 목표가 있으면 행 0으로 소비시킨다.
+            return (lines, highlights, target_id.map(|_| 0));
         }
         let mut seen = HashSet::new();
         for m in matches {
             if seen.insert(m.line_idx)
-                && let Some((_, segments)) = session.output_lines.get(m.line_idx)
+                && let Some((line_id, segments)) = session.output_lines.get(m.line_idx)
             {
+                if target_id == Some(*line_id) {
+                    target_row = Some(lines.len());
+                }
                 lines.push(LineRef::Ref(segments));
                 highlights.push(by_line.remove(&m.line_idx).unwrap_or_default());
             }
         }
-        return (lines, highlights);
+        target_row = clamp_unresolved_target(target_id, target_row, lines.len());
+        return (lines, highlights, target_row);
     }
 
     // 일반 모드: 보관된 모든 줄을 빌려서 그대로 표시(zero-copy). 출력 인덱스로 매치 범위 판정.
-    for (output_idx, (_, segments)) in session.output_lines.iter().enumerate() {
+    for (output_idx, (line_id, segments)) in session.output_lines.iter().enumerate() {
+        if target_id == Some(*line_id) {
+            target_row = Some(output_idx);
+        }
         lines.push(LineRef::Ref(segments));
         highlights.push(by_line.remove(&output_idx).unwrap_or_default());
     }
 
-    (lines, highlights)
+    target_row = clamp_unresolved_target(target_id, target_row, lines.len());
+    (lines, highlights, target_row)
+}
+
+/// 점프 목표가 있는데 현재 프레임 행으로 해석되지 못한 경우(evict/필터 가림)
+/// 행 0으로 clamp한다 — 목표는 반드시 1회 적용·소비돼야 `SessionScrollChanged`가
+/// 클리어하고 auto_scroll 판정이 정상 복귀한다. 그릴 줄이 없으면 clamp하지 않는다
+/// (빈 버퍼는 `clear_output`이 목표 자체를 함께 버린다).
+fn clamp_unresolved_target(
+    target_id: Option<usize>,
+    target_row: Option<usize>,
+    line_count: usize,
+) -> Option<usize> {
+    target_row.or_else(|| (target_id.is_some() && line_count > 0).then_some(0))
 }
 
 #[cfg(test)]
@@ -2017,6 +2105,119 @@ mod tests {
     use crate::ansi::TextSegment;
     use iced::Size;
     use iced::widget::canvas::Program as _;
+
+    // ---- 검색 점프 앵커: prepare_lines의 line_id → canvas 행 해석 ----
+
+    /// n개 라인("line 0"..)을 가진 세션. `keep`을 지정하면 그만큼만 보관(FIFO evict 유발).
+    fn session_with_lines(n: usize, keep: Option<usize>) -> RunSession {
+        let mut session = RunSession::new("t".to_string());
+        if let Some(keep) = keep {
+            session.max_output_lines = keep;
+        }
+        for i in 0..n {
+            session.add_output_line(&format!("line {i}"));
+        }
+        session
+    }
+
+    #[test]
+    fn scroll_target_resolves_by_line_id_after_eviction() {
+        // 5줄 추가, 3줄만 보관 → id 0,1 evict, 버퍼엔 id 2,3,4 (행 0,1,2).
+        let mut session = session_with_lines(5, Some(3));
+        session.scroll_target = Some(3); // 안정 id 3 → 현재 행 1
+        let (lines, _, target_row) = prepare_lines(&session);
+        assert_eq!(lines.len(), 3);
+        assert_eq!(
+            target_row,
+            Some(1),
+            "id 3 must resolve to row 1 after eviction"
+        );
+    }
+
+    #[test]
+    fn evicted_scroll_target_clamps_to_row_zero() {
+        let mut session = session_with_lines(5, Some(3));
+        session.scroll_target = Some(0); // 이미 evict된 id → 반드시 소비되도록 행 0
+        let (_, _, target_row) = prepare_lines(&session);
+        assert_eq!(target_row, Some(0));
+    }
+
+    #[test]
+    fn scroll_target_resolves_within_filtered_rows() {
+        // 필터 모드: 매치된 줄만 그려지므로 목표 행도 필터된 목록 기준이어야 한다.
+        let mut session = session_with_lines(6, None); // "line 0".."line 5"
+        session.search = Some(crate::models::SearchState {
+            query: String::from("line 3|line 5"),
+            filter: true,
+            current: 0,
+            regex: true,
+            matches: Vec::new(),
+        });
+        session.refresh_search_matches();
+        session.scroll_target = Some(5); // id 5 ("line 5") → 필터 행 1
+        let (lines, _, target_row) = prepare_lines(&session);
+        assert_eq!(lines.len(), 2, "filter must show only matched lines");
+        assert_eq!(target_row, Some(1));
+    }
+
+    #[test]
+    fn viewport_publishes_once_per_change_on_quiet_frames() {
+        // 조용한(스크롤 액션 없는) redraw 프레임: 첫 관측에 1회 publish(action 발생 +
+        // last_reported 기록), 이후 동일 크기면 침묵 — 매 프레임 메시지 낭비 방지.
+        // (canvas::Action 내부는 불투명 — 발생 여부 + 상태 부수효과로 검증한다.)
+        let (canvas, id) = canvas_with_lines(3, false);
+        let mut state = ready_state(id);
+        let redraw = Event::Window(window::Event::RedrawRequested(std::time::Instant::now()));
+
+        let first = canvas.update(&mut state, &redraw, test_bounds(), cursor_inside());
+        assert!(first.is_some(), "첫 조용한 프레임에 뷰포트 publish");
+        let recorded = state
+            .last_reported_viewport
+            .expect("viewport must be recorded");
+        assert!(recorded.0 >= 20 && recorded.1 >= 5, "clamp 하한 보장");
+
+        let second = canvas.update(&mut state, &redraw, test_bounds(), cursor_inside());
+        assert!(second.is_none(), "크기 불변이면 재발행 없음");
+        assert_eq!(state.last_reported_viewport, Some(recorded));
+    }
+
+    #[test]
+    fn session_swap_republishes_viewport_for_new_session() {
+        // State는 pane(위젯)에 붙어 세션 교체를 넘어 살아남는다. 교체 후 크기가 같아도
+        // 새 세션에게는 통지된 적이 없으므로, init이 last_reported_viewport를 리셋해
+        // 다음 조용한 프레임에 새 세션 id로 재발행되어야 한다 — 아니면 새 세션 PTY가
+        // 실측 크기(SIGWINCH)를 영영 못 받아 기본 120×40에 고정된다.
+        let (canvas_a, id_a) = canvas_with_lines(3, false);
+        let mut state = ready_state(id_a);
+        let redraw = Event::Window(window::Event::RedrawRequested(std::time::Instant::now()));
+
+        canvas_a.update(&mut state, &redraw, test_bounds(), cursor_inside());
+        let recorded = state
+            .last_reported_viewport
+            .expect("세션 A viewport 기록 전제");
+
+        // 같은 pane(State 재사용)에 다른 세션 마운트: 첫 프레임은 init(request_redraw)이
+        // 선점하며 보고 기억을 리셋한다.
+        let (canvas_b, _id_b) = canvas_with_lines(3, false);
+        let swap_frame = canvas_b.update(&mut state, &redraw, test_bounds(), cursor_inside());
+        assert!(swap_frame.is_some(), "스왑 프레임은 init 액션");
+        assert_eq!(
+            state.last_reported_viewport, None,
+            "세션 교체 시 보고 기억 리셋"
+        );
+
+        // 다음 조용한 프레임: 크기가 이전과 동일해도 새 세션 앞으로 재발행.
+        let quiet = canvas_b.update(&mut state, &redraw, test_bounds(), cursor_inside());
+        assert!(quiet.is_some(), "새 세션에 viewport 재발행");
+        assert_eq!(state.last_reported_viewport, Some(recorded));
+    }
+
+    #[test]
+    fn no_scroll_target_yields_no_row() {
+        let session = session_with_lines(3, None);
+        let (_, _, target_row) = prepare_lines(&session);
+        assert_eq!(target_row, None);
+    }
 
     #[test]
     fn match_rect_in_chunk_clips_and_uses_display_width() {
@@ -2288,6 +2489,7 @@ mod tests {
         texts: Vec<String>,
         first_id: usize,
         content_version: u64,
+        session_id: Uuid,
     ) -> TerminalCanvas<'static> {
         let n = texts.len();
         let last_id = first_id + n.saturating_sub(1);
@@ -2297,7 +2499,7 @@ mod tests {
                 .map(|t| LineRef::Owned(vec![TextSegment::new(t)]))
                 .collect(),
             highlights: vec![LineSearch::default(); n],
-            session_id: Uuid::new_v4(),
+            session_id,
             initial_scroll_progress: 1.0,
             auto_scroll: false,
             scroll_target: None,
@@ -2329,8 +2531,9 @@ mod tests {
     fn incremental_wrap_update_matches_full_rebuild() {
         let mc = test_max_chars();
 
+        let sid = Uuid::new_v4();
         let mut state = ScrollState::default();
-        let c1 = canvas_with_ids(varied_texts(0..5), 0, 1);
+        let c1 = canvas_with_ids(varied_texts(0..5), 0, 1, sid);
         assert_eq!(
             c1.rebuild_wrap_cache_if_needed(&mut state, mc),
             0,
@@ -2338,8 +2541,8 @@ mod tests {
         );
         let evicted_first_two: usize = state.line_counts[..2].iter().map(|&c| c as usize).sum();
 
-        // [2..7]: id 0,1 evict + id 5,6 append.
-        let c2 = canvas_with_ids(varied_texts(2..7), 2, 2);
+        // [2..7]: id 0,1 evict + id 5,6 append (같은 세션 스트리밍).
+        let c2 = canvas_with_ids(varied_texts(2..7), 2, 2, sid);
         let evicted_wrapped = c2.rebuild_wrap_cache_if_needed(&mut state, mc);
         let incremental = state.line_counts.clone();
 
@@ -2350,7 +2553,7 @@ mod tests {
 
         // 동일 내용을 처음부터 전체 재빌드한 결과와 일치해야 한다.
         let mut state_full = ScrollState::default();
-        let c2_full = canvas_with_ids(varied_texts(2..7), 2, 2);
+        let c2_full = canvas_with_ids(varied_texts(2..7), 2, 2, sid);
         c2_full.rebuild_wrap_cache_if_needed(&mut state_full, mc);
 
         assert_eq!(incremental, state_full.line_counts, "증분 == 전체 재빌드");
@@ -2367,13 +2570,14 @@ mod tests {
         let bounds = test_bounds();
         let mc = test_max_chars();
 
+        let sid = Uuid::new_v4();
         let mut state = ScrollState::default();
-        let c1 = canvas_with_ids(varied_texts(0..60), 0, 1);
+        let c1 = canvas_with_ids(varied_texts(0..60), 0, 1, sid);
         c1.rebuild_wrap_cache_if_needed(&mut state, mc);
         let evicted_rows: f32 = state.line_counts[..2].iter().map(|&c| c as f32).sum();
 
         // [2..62]: id 0,1 evict. auto_scroll=false(위로 스크롤한 상태) + 초기화 완료로 표시.
-        let c2 = canvas_with_ids(varied_texts(2..62), 2, 2);
+        let c2 = canvas_with_ids(varied_texts(2..62), 2, 2, sid);
         state.last_session_id = Some(c2.session_id);
         state.is_initialized = true;
         state.offset = 20.0;
@@ -2393,26 +2597,90 @@ mod tests {
     /// 증분을 건너뛰고 전체 재빌드해야 한다(stale wrap 캐시 방지). 실제 add_output_line
     /// 모델에선 발생하지 않지만, in-place 변경/세션 전환 우연 일치에 대한 안전장치.
     #[test]
-    fn incremental_skips_and_rebuilds_when_line_id_range_unchanged() {
+    fn session_swap_with_overlapping_ids_forces_full_rebuild() {
+        // 세션 전환/재시작으로 line_id 범위가 우연히 겹쳐도, 세션 판별자
+        // (cached_session_id) 불일치가 증분을 차단해 stale 캐시를 막는다.
         let mc = test_max_chars();
         let mut state = ScrollState::default();
 
-        // 짧은 줄 5개(wrap 1행씩) 캐시.
-        let c1 = canvas_with_ids(vec!["x".repeat(40); 5], 0, 1);
+        let c1 = canvas_with_ids(vec!["x".repeat(40); 5], 0, 1, Uuid::new_v4());
         c1.rebuild_wrap_cache_if_needed(&mut state, mc);
         assert!(state.line_counts.iter().all(|&c| c == 1), "짧은 줄은 1행");
 
-        // 같은 line_id 범위(0..5)지만 내용이 긴 줄로 교체 + content_version만 증가.
-        // 증분이 스킵되고 전체 재빌드돼야 wrap 행 수가 갱신된다.
-        let c2 = canvas_with_ids(vec!["x".repeat(400); 5], 0, 2);
+        // 다른 세션, 같은 id 범위(0..5), 전부 긴 줄 — 전체 재빌드로 반영돼야 한다.
+        let c2 = canvas_with_ids(vec!["x".repeat(400); 5], 0, 2, Uuid::new_v4());
         let evicted = c2.rebuild_wrap_cache_if_needed(&mut state, mc);
 
-        assert_eq!(evicted, 0, "범위 변화 없음 → evict 0");
+        assert_eq!(evicted, 0, "전체 재빌드는 evict 보정 0");
         assert_eq!(state.line_counts.len(), 5, "줄 수 유지");
         assert!(
             state.line_counts.iter().all(|&c| c > 1),
-            "내용 변경이 전체 재빌드로 반영돼 wrap 행 수가 갱신돼야 함(stale 아님)"
+            "세션 스왑이 전체 재빌드로 반영돼 wrap 행 수가 갱신돼야 함(stale 아님)"
         );
+    }
+
+    #[test]
+    fn same_session_tail_replace_recomputes_only_last_line() {
+        // 같은 세션 + id 범위·길이 불변 + content_version만 변경 = tail Replace 프레임.
+        // 마지막 줄만 재계산돼야 한다 (라이브 진행바 60/s × 전체 재빌드 = UI 붕괴 방지).
+        let mc = test_max_chars();
+        let sid = Uuid::new_v4();
+        let mut state = ScrollState::default();
+
+        let c1 = canvas_with_ids(vec!["x".repeat(40); 5], 0, 1, sid);
+        c1.rebuild_wrap_cache_if_needed(&mut state, mc);
+        assert!(state.line_counts.iter().all(|&c| c == 1));
+        let total_before = state.cached_total;
+
+        // tail만 긴 줄로 교체된 프레임 (replace_last_line은 line_id를 재사용).
+        let mut texts = vec!["x".repeat(40); 4];
+        texts.push("x".repeat(400));
+        let c2 = canvas_with_ids(texts, 0, 2, sid);
+        let evicted = c2.rebuild_wrap_cache_if_needed(&mut state, mc);
+
+        assert_eq!(evicted, 0);
+        let last = *state.line_counts.last().unwrap();
+        assert!(last > 1, "tail의 wrap 행 수가 갱신돼야 함");
+        assert!(
+            state.line_counts[..4].iter().all(|&c| c == 1),
+            "tail 외 줄은 재계산 대상이 아님 (증분 경로 확인)"
+        );
+        assert_eq!(
+            state.cached_total,
+            total_before - 1 + last as usize,
+            "cached_total이 델타로 갱신돼야 함"
+        );
+    }
+
+    #[test]
+    fn replace_then_append_frame_recomputes_boundary_line() {
+        // 한 프레임 배치가 [Replace(구 tail), Line(신규)]인 경우: append 경로에서도
+        // 경계(구 tail) 줄을 함께 재계산해야 stale wrap이 남지 않는다.
+        let mc = test_max_chars();
+        let sid = Uuid::new_v4();
+        let mut state = ScrollState::default();
+
+        let c1 = canvas_with_ids(vec!["x".repeat(40); 3], 0, 1, sid);
+        c1.rebuild_wrap_cache_if_needed(&mut state, mc);
+        assert!(state.line_counts.iter().all(|&c| c == 1));
+
+        // id 0..3 유지 + tail(id 2)이 길어짐 + id 3 신규 append.
+        let texts = vec![
+            "x".repeat(40),
+            "x".repeat(40),
+            "x".repeat(400), // 구 tail — Replace로 길어짐
+            "x".repeat(40),  // 신규 라인
+        ];
+        let c2 = canvas_with_ids(texts, 0, 2, sid);
+        let evicted = c2.rebuild_wrap_cache_if_needed(&mut state, mc);
+
+        assert_eq!(evicted, 0, "evict 없음");
+        assert_eq!(state.line_counts.len(), 4);
+        assert!(
+            state.line_counts[2] > 1,
+            "경계(구 tail) 줄의 wrap이 재계산돼야 함"
+        );
+        assert_eq!(state.line_counts[3], 1, "신규 줄은 1행");
     }
 
     // ── S1/S3: 가상화 wrap 수학 (순수 함수) ─────────────────────────────────
@@ -2422,5 +2690,77 @@ mod tests {
         assert_eq!(TerminalCanvas::wrapped_total(&[]), 0);
         assert_eq!(TerminalCanvas::wrapped_total(&[1, 1, 1]), 3);
         assert_eq!(TerminalCanvas::wrapped_total(&[1, 3, 2, 1]), 7);
+    }
+}
+
+#[cfg(test)]
+mod flood_bench {
+    use super::*;
+    use crate::models::{OutputEvent, RunSession};
+    use std::time::Instant;
+
+    /// 폭주 정지 지연 진단용 수치 측정 (통과/실패 없음 — --nocapture로 관찰).
+    #[test]
+    fn measure_flood_regime_costs() {
+        let mut session = RunSession::new("bench".to_string());
+        session.max_output_lines = 50_000;
+
+        // 캡 도달까지 4096-이벤트 배치 적용 (yes 폭주 시 청크당 이벤트 수 근사)
+        let batch: Vec<OutputEvent> = (0..4096)
+            .map(|_| OutputEvent::Line("y".to_string()))
+            .collect();
+        let mut t_fill = std::time::Duration::ZERO;
+        let mut batches = 0;
+        while session.output_lines.len() < 50_000 {
+            let t = Instant::now();
+            for e in &batch {
+                session.apply_output_event(e);
+            }
+            t_fill += t.elapsed();
+            batches += 1;
+        }
+        eprintln!(
+            "[bench] fill-to-cap: {batches} batches, avg {:?}/batch (pre-cap regime)",
+            t_fill / batches
+        );
+
+        // 캡 이후(eviction 동반) 배치 적용 비용
+        let mut t_cap = std::time::Duration::ZERO;
+        for _ in 0..20 {
+            let t = Instant::now();
+            for e in &batch {
+                session.apply_output_event(e);
+            }
+            t_cap += t.elapsed();
+        }
+        eprintln!(
+            "[bench] cap-regime apply: avg {:?}/4096-event batch",
+            t_cap / 20
+        );
+
+        // 프레임당 view 비용: prepare_lines (라인 Vec + highlights 구축)
+        let mut t_prep = std::time::Duration::ZERO;
+        for _ in 0..30 {
+            let t = Instant::now();
+            let (lines, highlights, _) = prepare_lines(&session);
+            std::hint::black_box((&lines, &highlights));
+            t_prep += t.elapsed();
+        }
+        eprintln!("[bench] prepare_lines at 50k: avg {:?}/frame", t_prep / 30);
+
+        // 검색 열림 시 배치당 refresh_search_matches 비용 (flood 중 검색 열면)
+        session.search = Some(crate::models::SearchState {
+            query: String::from("y"),
+            filter: false,
+            current: 0,
+            regex: false,
+            matches: Vec::new(),
+        });
+        let t = Instant::now();
+        session.refresh_search_matches();
+        eprintln!(
+            "[bench] refresh_search_matches at 50k (query 'y'): {:?}",
+            t.elapsed()
+        );
     }
 }

@@ -129,9 +129,11 @@ jobs:
           - name: macos-x64
             os: macos-15-intel
             artifact_name: run_config_manager-macos-x64.dmg
+            update_archive_name: run_config_manager-macos-x64-app.tar.gz
           - name: macos-arm64
             os: macos-latest
             artifact_name: run_config_manager-macos-arm64.dmg
+            update_archive_name: run_config_manager-macos-arm64-app.tar.gz
 
     steps:
       - name: Checkout
@@ -196,11 +198,40 @@ jobs:
           ./scripts/package-macos.sh "${{ matrix.artifact_name }}"
           cp "target/packaging/macos/${{ matrix.artifact_name }}" "${{ matrix.artifact_name }}"
 
+      # 인앱 자기 업데이트용 .app 아카이브. 반드시 build_macos_app.sh(서명 포함) 이후에
+      # 생성해야 Info.plist 버전·ad-hoc 서명이 일치한다. 자산 이름은
+      # src/services/update_check.rs의 platform_asset_name()과 일치해야 한다.
+      # COPYFILE_DISABLE: bsdtar가 파일마다 ._* AppleDouble 사이드카를 넣는 것을 막는다
+      # — 섞이면 설치된 번들의 코드서명 리소스 실이 깨진다 (앱 추출기도 방어하지만 원천 차단).
+      - name: Package macOS update archive
+        if: runner.os == 'macOS'
+        env:
+          COPYFILE_DISABLE: "1"
+        run: |
+          tar -czf "${{ matrix.update_archive_name }}" -C target/release RunConfigManager.app
+
+      # 방금 만든 실제 아카이브가 앱의 추출→검사→스왑 코드로 정상 적용되는지 검증한다.
+      # (레시피 회귀 — pax/AppleDouble 등 — 를 릴리스 전에 잡는 게이트)
+      - name: Verify update archive applies cleanly
+        if: runner.os == 'macOS'
+        env:
+          RCM_E2E_ARCHIVE: ${{ github.workspace }}/${{ matrix.update_archive_name }}
+        run: |
+          cargo test --locked services::self_update::tests::real_archive_applies_to_fake_bundle -- --ignored --exact
+
       - name: Upload build artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ${{ matrix.name }}
           path: ${{ matrix.artifact_name }}
+          if-no-files-found: error
+
+      - name: Upload update archive
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ matrix.name }}-update
+          path: ${{ matrix.update_archive_name }}
           if-no-files-found: error
 
   publish:
@@ -220,6 +251,25 @@ jobs:
         run: |
           cd dist
           sha256sum * > checksums.txt
+
+      # 인앱 업데이트 무결성: checksums.txt를 minisign 개인키로 서명한다.
+      # 앱은 내장 공개키(src/services/self_update.rs)로 이 서명을 검증한 뒤에만
+      # 체크섬을 신뢰하므로, Secret이 없으면 서명 없는 릴리스가 나가지 않도록 실패시킨다.
+      - name: Sign checksums (minisign)
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+        run: |
+          if [ -z "$MINISIGN_SECRET_KEY" ]; then
+            echo "::error::MINISIGN_SECRET_KEY secret is not set — in-app updates require signed checksums."
+            exit 1
+          fi
+          sudo apt-get update
+          sudo apt-get install -y minisign
+          # 서명 실패로 스텝이 중단돼도 개인키 파일이 남지 않도록 항상 정리한다.
+          trap 'rm -f minisign.key' EXIT
+          printf '%s\n' "$MINISIGN_SECRET_KEY" > minisign.key
+          minisign -S -s minisign.key -m dist/checksums.txt
+          test -f dist/checksums.txt.minisig
 
       - name: Publish draft release
         env:

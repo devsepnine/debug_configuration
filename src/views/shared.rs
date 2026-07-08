@@ -11,6 +11,12 @@ pub(crate) fn session_search_input_id(session_id: Uuid) -> iced::advanced::widge
     iced::advanced::widget::Id::from(format!("session-search-{session_id}"))
 }
 
+/// 세션 stdin 입력바 위젯의 안정적 Id (세션별 고유). Cmd+I 포커스(app)와
+/// text_input `.id()`(pane_view)가 동일 Id를 공유한다.
+pub(crate) fn session_stdin_input_id(session_id: Uuid) -> iced::advanced::widget::Id {
+    iced::advanced::widget::Id::from(format!("session-stdin-{session_id}"))
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum IconButtonState {
     Active,

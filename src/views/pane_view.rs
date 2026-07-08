@@ -3,6 +3,7 @@ use crate::models::{Pane, RunSession, SessionStatusKind};
 use crate::utils::{
     ICON_ARROW_DOWN_FILL, ICON_ARROW_DOWN_LINE, ICON_CLOSE, ICON_ERASER, ICON_MORE,
     ICON_PANE_MAXIMIZE, ICON_PANE_RESTORE, ICON_REFRESH, ICON_SAVE, ICON_SEARCH, ICON_STOP,
+    ICON_TERMINAL_INPUT,
 };
 use crate::views::shared::{
     IconButtonState, icon_button_foreground, icon_button_style, icon_tooltip,
@@ -195,10 +196,9 @@ fn view_pane_content<'a>(
     let session_name =
         current_session.map_or_else(|| String::from("Empty"), |s| s.config_name.clone());
     let session_status = current_session.map(RunSession::status_kind);
-    // 상태 배지는 완료된 세션에만 표시 (실행 중은 점으로 충분).
-    let session_badge = current_session
-        .filter(|session| !session.is_running)
-        .map(RunSession::status_badge_label);
+    // 상태 배지: 실행 중엔 라이브 경과시간("Running 12.3s" — 1초 tick으로 갱신),
+    // 종료 후엔 결과와 소요 시간을 표시한다.
+    let session_badge = current_session.map(RunSession::status_badge_label);
 
     let mut title_controls: Option<(Element<'a, Message>, Element<'a, Message>)> = None;
     let content: Element<'a, Message> = if let Some(session_id) = pane.session_id {
@@ -228,7 +228,13 @@ fn view_pane_content<'a>(
             if session.search.is_some() {
                 stacked = stacked.push(view_session_search_bar(session));
             }
-            let body: Element<'a, Message> = stacked.push(terminal_output).into();
+            // stdin 입력바는 터미널 **아래** — 프롬프트가 나타나는 위치(맨 아래) 옆에서
+            // 바로 응답하도록 (터미널이 Fill이라 바는 pane 바닥에 붙는다).
+            let mut stacked = stacked.push(terminal_output);
+            if session.stdin_input.is_some() {
+                stacked = stacked.push(view_session_stdin_bar(session));
+            }
+            let body: Element<'a, Message> = stacked.into();
 
             container(body)
                 .width(Length::Fill)
@@ -382,6 +388,26 @@ fn view_session_controls(
         is_dragging,
     );
 
+    // stdin 입력바 버튼 — 열려 있으면 active 강조 + 토글로 닫기. 실행 여부와 무관하게
+    // 항상 누를 수 있다(비활성 상태는 바 자체가 표시 — 드래프트 확인/작성 가능).
+    let stdin_open = session.stdin_input.is_some();
+    let stdin_state = if stdin_open {
+        IconButtonState::Active
+    } else {
+        IconButtonState::Inactive
+    };
+    let stdin_message = if stdin_open {
+        Message::CloseSessionStdin(session_id)
+    } else {
+        Message::OpenSessionStdin(session_id)
+    };
+    let stdin_button = control_button(
+        control_icon(svg::Handle::from_memory(ICON_TERMINAL_INPUT), stdin_state),
+        Some(stdin_message),
+        stdin_state,
+        is_dragging,
+    );
+
     // export(파일 저장)·clear(로그 지우기) 공용 상태 — 출력이 있을 때만 활성화
     // (export는 빈 0바이트 파일 방지, clear는 빈 버퍼 no-op 방지)
     let has_output = !session.output_lines.is_empty();
@@ -437,6 +463,8 @@ fn view_session_controls(
         auto_scroll_button,
         Space::new().width(4),
         search_button,
+        Space::new().width(4),
+        stdin_button,
         Space::new().width(4),
         export_button,
         Space::new().width(4),
@@ -580,6 +608,16 @@ fn view_session_controls_menu(
         false,
     );
 
+    let stdin = control_button(
+        control_icon(
+            svg::Handle::from_memory(ICON_TERMINAL_INPUT),
+            IconButtonState::Active,
+        ),
+        Some(Message::OpenSessionStdin(session_id)),
+        IconButtonState::Active,
+        false,
+    );
+
     let has_output = !session.output_lines.is_empty();
     let output_action_state = if has_output {
         IconButtonState::Active
@@ -609,6 +647,8 @@ fn view_session_controls_menu(
         Space::new().width(4),
         search,
         Space::new().width(4),
+        stdin,
+        Space::new().width(4),
         export,
         Space::new().width(4),
         clear,
@@ -634,6 +674,69 @@ fn view_session_controls_menu(
     }
 
     container(controls_row)
+        .padding([4, 8])
+        .width(Length::Fill)
+        .style(|theme: &Theme| container::Style {
+            background: Some(Background::Color(
+                theme.extended_palette().background.weak.color,
+            )),
+            ..container::Style::default()
+        })
+        .into()
+}
+
+/// stdin 입력바 (터미널 아래에 표시). Enter/⏎ 제출, x/Esc 닫기.
+/// 프로세스가 실행 중이 아니면 입력·제출이 비활성화되고 placeholder로 상태를 알린다
+/// (드래프트는 유지 — 종료/rerun에도 타이핑 내용을 잃지 않는다).
+fn view_session_stdin_bar(session: &RunSession) -> Element<'_, Message> {
+    let draft = session
+        .stdin_input
+        .as_deref()
+        .expect("view_session_stdin_bar requires stdin state");
+    let session_id = session.id;
+    let running = session.is_running;
+
+    let placeholder = if running {
+        "Send input to process (Enter)"
+    } else {
+        "Process not running"
+    };
+    let mut input = text_input(placeholder, draft)
+        .id(crate::views::shared::session_stdin_input_id(session_id))
+        .size(12)
+        .padding([2, 6])
+        .width(Length::Fill);
+    if running {
+        input = input
+            .on_input(move |value| Message::SessionStdinChanged(session_id, value))
+            // on_submit이 있어 Enter를 capture한다 — 검색 nav(Enter, Ignored 게이트)와
+            // 이중 발화하지 않는 근거. 빈 제출 허용(bare \n — "press enter" 프롬프트).
+            .on_submit(Message::SessionStdinSubmitted(session_id));
+    }
+
+    let send_state = if running {
+        IconButtonState::Active
+    } else {
+        IconButtonState::Inactive
+    };
+    let controls = row![
+        glyph_button(
+            "⏎",
+            "Send (Enter)",
+            Message::SessionStdinSubmitted(session_id),
+            send_state
+        ),
+        glyph_button(
+            "x",
+            "Close input (Esc)",
+            Message::CloseSessionStdin(session_id),
+            IconButtonState::Active
+        ),
+    ]
+    .spacing(2)
+    .align_y(Alignment::Center);
+
+    container(row![input, controls].spacing(8).align_y(Alignment::Center))
         .padding([4, 8])
         .width(Length::Fill)
         .style(|theme: &Theme| container::Style {

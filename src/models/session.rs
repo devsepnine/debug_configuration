@@ -4,6 +4,32 @@ use std::sync::{Arc, atomic::AtomicBool};
 use std::time::{Duration, SystemTime};
 use uuid::Uuid;
 
+/// 실행 스트림이 앱으로 전달하는 출력 이벤트 하나.
+///
+/// `Replace`는 직전에 추가된 라인을 통째로 교체한다 — PTY 환경에서 진행바가
+/// `\r`로 같은 줄을 되감아 재그리는 것을 라이브로 렌더하기 위한 시맨틱.
+/// (pipes 경로는 `Line`만 방출한다.)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OutputEvent {
+    /// 새 라인 추가 (확정된 라인, 또는 새로 열린 라이브 라인)
+    Line(String),
+    /// 가장 최근에 추가된 라인의 내용 교체 (라이브 진행바 갱신).
+    /// PTY(unix) 경로에서만 생성된다 — Windows(pipe)는 Line만 방출.
+    #[cfg_attr(windows, allow(dead_code))]
+    Replace(String),
+}
+
+/// stdin 쓰기 실패 사유. `Timeout`은 "자식이 아직 읽지 않음"의 조기 신호일 뿐
+/// 쓰기 자체는 백그라운드에서 결국 완료된다(드래프트 복원 금지 — 복원 후 재제출은
+/// 중복 입력이 된다). `Broken`은 파이프/PTY가 닫힌 하드 실패(복원 대상).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StdinWriteError {
+    /// 쓰기가 제한 시간 안에 끝나지 않음 (자식이 stdin을 읽지 않는 중 — 데이터는 유지됨)
+    Timeout,
+    /// 쓰기 채널이 닫힘/실패 (EPIPE/EIO 등)
+    Broken(String),
+}
+
 /// 세션의 현재 상태 (배지 표시용).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionStatusKind {
@@ -29,7 +55,7 @@ const MAX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 /// 단일 줄의 최대 저장 바이트. 개행 없는 초대형 줄 하나가 바이트 예산·폭 계산을 한 번에
 /// 폭증시키지 못하도록, 이 크기를 넘는 줄은 char 경계에서 잘라 마커를 붙여 저장한다.
 /// (executor의 1 MiB per-line read 상한보다 작은 표시/저장 상한.)
-const MAX_LINE_BYTES: usize = 64 * 1024;
+const MAX_STORED_LINE_BYTES: usize = 64 * 1024;
 
 /// 잘린 줄 끝에 붙는 마커.
 const TRUNCATED_MARKER: &str = "…[truncated]";
@@ -144,10 +170,18 @@ pub struct RunSession {
     pub process_pid: Option<u32>,
     /// 출력 검색/필터 상태 (검색바가 열려 있으면 `Some`)
     pub search: Option<SearchState>,
-    /// 검색 점프 1회성 목표 (논리줄 인덱스). 터미널 뷰가 이 값을 읽어 wrapped offset으로
-    /// 변환해 스크롤한 뒤, `SessionScrollChanged` 핸들러에서 `None`으로 클리어한다.
+    /// 검색 점프 1회성 목표 (**안정 line_id** — `output_lines`의 튜플 첫 요소).
+    /// 뷰 빌드 시점에 현재 canvas 행으로 해석되므로, 스트리밍 중 앞쪽 줄이 evict돼도
+    /// 목표가 어긋나지 않는다. 터미널 뷰가 wrapped offset으로 변환해 스크롤한 뒤
+    /// `SessionScrollChanged` 핸들러에서 `None`으로 클리어한다.
     /// (app→terminal 역방향 스크롤 명령 경로 — 비율 기반으론 매치로 점프가 안 됐다)
     pub scroll_target: Option<usize>,
+    /// stdin 입력바 드래프트. `Some`이면 바가 열려 있음 (`search`와 동일 컨벤션).
+    /// 프로세스 종료/rerun에도 생존한다 — 타이핑 중이던 내용을 잃지 않기 위함.
+    pub stdin_input: Option<String>,
+    /// 마지막으로 관측된 터미널 뷰포트 (cols, rows). rerun의 초기 PTY 크기와
+    /// `ProcessStarted` 직후 재푸시에 쓴다 (신규 pane은 첫 프레임 publish가 채움).
+    pub pty_viewport: Option<(u16, u16)>,
     /// 컨트롤 오버플로 메뉴(⋯) 열림 여부. pane이 좁아 전체 컨트롤 버튼이 들어가지
     /// 않을 때 `⋯` 버튼으로 펼치는 세로 액션 메뉴의 토글 상태(터미널 위에 표시).
     pub controls_menu_open: bool,
@@ -198,6 +232,8 @@ impl RunSession {
             process_pid: None,
             search: None,
             scroll_target: None,
+            stdin_input: None,
+            pty_viewport: None,
             controls_menu_open: false,
             max_output_lines: DEFAULT_MAX_OUTPUT_LINES,
         }
@@ -277,25 +313,9 @@ impl RunSession {
     /// # Arguments
     /// * `line` - 추가할 출력 라인 (\n이 포함된 경우 여러 줄로 분리됨)
     pub fn add_output_line(&mut self, line: &str) {
-        use crate::ansi::parse_ansi_text;
-
         // \n으로 분리하여 각 줄을 별도로 추가
         for single_line in line.split('\n') {
-            // 초대형 단일 줄은 char 경계에서 잘라 저장(바이트 예산·폭 계산 폭증 방지).
-            let truncated;
-            let stored: &str = if single_line.len() > MAX_LINE_BYTES {
-                let mut end = MAX_LINE_BYTES;
-                while end > 0 && !single_line.is_char_boundary(end) {
-                    end -= 1;
-                }
-                truncated = format!("{}{TRUNCATED_MARKER}", &single_line[..end]);
-                &truncated
-            } else {
-                single_line
-            };
-
-            // ANSI 색상 코드를 파싱하여 텍스트 세그먼트로 변환
-            let segments = parse_ansi_text(stored);
+            let segments = Self::normalize_line(single_line);
             let bytes = segments_bytes(&segments);
 
             // 고유 ID와 함께 새 라인 추가
@@ -303,30 +323,86 @@ impl RunSession {
             self.next_line_id += 1;
             self.output_lines.push_back((line_id, segments));
             self.total_bytes += bytes;
-
-            // 줄 수와 바이트 예산을 모두 만족할 때까지 앞에서 제거(FIFO, O(1) per pop).
-            // 방금 추가한 줄 하나만 남을 때까지는 비우지 않는다(최소 1줄 유지).
-            // worst-case: 단일 줄이 예산을 넘으면 total_bytes가 MAX_OUTPUT_BYTES + 마지막 줄
-            // 크기(≤ MAX_LINE_BYTES + 마커)까지 일시 초과한다 — 버퍼를 완전히 비우는 것보다
-            // 1줄 유지가 낫다는 의도적 트레이드오프이며, 메모리는 여전히 상수로 묶인다.
-            while self.output_lines.len() > self.max_output_lines
-                || (self.total_bytes > MAX_OUTPUT_BYTES && self.output_lines.len() > 1)
-            {
-                if let Some((_, evicted)) = self.output_lines.pop_front() {
-                    self.total_bytes = self.total_bytes.saturating_sub(segments_bytes(&evicted));
-                } else {
-                    break;
-                }
-            }
+            self.evict_over_budget();
         }
         // 콘텐츠가 바뀌었으니 wrap 캐시 무효화 키를 올린다.
         self.content_version = self.content_version.wrapping_add(1);
+    }
+
+    /// 실행 스트림 이벤트 1건 적용 (`Line`=추가, `Replace`=마지막 라인 교체).
+    pub fn apply_output_event(&mut self, event: &OutputEvent) {
+        match event {
+            OutputEvent::Line(text) => self.add_output_line(text),
+            OutputEvent::Replace(text) => self.replace_last_line(text),
+        }
+    }
+
+    /// 가장 최근에 추가된 라인의 내용을 교체한다 (라이브 진행바 갱신).
+    /// line_id를 **재사용**해 keyed 렌더/wrap 캐시의 증분 판정("마지막 줄만 변경")이
+    /// 성립하게 한다. 버퍼가 비어 있으면 추가로 폴백한다 (방어적).
+    pub fn replace_last_line(&mut self, line: &str) {
+        let Some((line_id, old_segments)) = self.output_lines.pop_back() else {
+            self.add_output_line(line);
+            return;
+        };
+        self.total_bytes = self
+            .total_bytes
+            .saturating_sub(segments_bytes(&old_segments));
+        let segments = Self::normalize_line(line);
+        self.total_bytes += segments_bytes(&segments);
+        self.output_lines.push_back((line_id, segments));
+        self.evict_over_budget();
+        self.content_version = self.content_version.wrapping_add(1);
+    }
+
+    /// 단일 라인 정규화 공통 경로: CR 붕괴 → 크기 제한 → ANSI 파싱.
+    /// add/replace 양쪽이 공유해 방어(특히 `\r` collapse)가 대칭이 되게 한다.
+    fn normalize_line(single_line: &str) -> Vec<TextSegment> {
+        use crate::ansi::parse_ansi_text;
+
+        // CR 덮어쓰기 시맨틱: 진행바(cargo/npm/pip)는 "10%\r50%\r100%"처럼 같은 줄을
+        // \r로 되감아 다시 그린다. 마지막 \r 이후 내용(=최종 상태)만 남긴다 — 전체 라인
+        // 교체 근사(문자단위 col0 덮어쓰기 아님). LineAssembler가 \r를 소비하는 PTY
+        // 경로에서도 방어선으로 유지한다. 끝의 bare \r은 "아직 아무것도 덮어쓰지 않음"
+        // 이므로 먼저 제거한다 ("42%\r"가 빈 줄로 붕괴하는 것 방지).
+        let single_line = single_line.trim_end_matches('\r');
+        let single_line = single_line.rsplit('\r').next().unwrap_or(single_line);
+        // 초대형 단일 줄은 char 경계에서 잘라 저장(바이트 예산·폭 계산 폭증 방지).
+        let truncated;
+        let stored: &str = if single_line.len() > MAX_STORED_LINE_BYTES {
+            let mut end = MAX_STORED_LINE_BYTES;
+            while end > 0 && !single_line.is_char_boundary(end) {
+                end -= 1;
+            }
+            truncated = format!("{}{TRUNCATED_MARKER}", &single_line[..end]);
+            &truncated
+        } else {
+            single_line
+        };
+        parse_ansi_text(stored)
+    }
+
+    /// 줄 수/바이트 예산 초과분을 앞에서 제거(FIFO, O(1) per pop).
+    /// 마지막 1줄은 유지 — worst-case 초과 폭은 MAX_OUTPUT_BYTES + 줄 상한(의도적 트레이드오프).
+    fn evict_over_budget(&mut self) {
+        while self.output_lines.len() > self.max_output_lines
+            || (self.total_bytes > MAX_OUTPUT_BYTES && self.output_lines.len() > 1)
+        {
+            if let Some((_, evicted)) = self.output_lines.pop_front() {
+                self.total_bytes = self.total_bytes.saturating_sub(segments_bytes(&evicted));
+            } else {
+                break;
+            }
+        }
     }
 
     /// 출력 버퍼 초기화
     pub fn clear_output(&mut self) {
         self.output_lines.clear();
         self.total_bytes = 0;
+        // 점프할 대상이 사라졌으므로 1회성 목표도 함께 버린다 — 남겨두면 빈 버퍼에선
+        // 소비(clamp)가 게이트돼 영영 Some으로 남아 auto_scroll 판정을 계속 우회시킨다.
+        self.scroll_target = None;
         self.content_version = self.content_version.wrapping_add(1);
     }
 
@@ -349,16 +425,48 @@ impl RunSession {
             .and_then(|finished| finished.duration_since(self.started_at).ok())
     }
 
-    /// 상태 배지에 표시할 짧은 라벨 (예: "✓ 1.2s", "✕ exit 1", "Stopped", "Running").
-    pub fn status_badge_label(&self) -> String {
+    /// 실행 시작 후 현재까지의 경과 시간 (라이브 표시용). 시스템 시계가 뒤로 간
+    /// 경우(NTP 보정 등) 0으로 처리한다.
+    pub fn elapsed_since_start(&self) -> Duration {
+        SystemTime::now()
+            .duration_since(self.started_at)
+            .unwrap_or_default()
+    }
+
+    /// 사이드바(고정 폭 배지)용 압축 라벨. 실행 중엔 경과시간만("12.3s"), 종료 상태는
+    /// 소요시간 없는 짧은 형태 — 전체 정보는 pane 타이틀의 `status_badge_label`이 담당.
+    pub fn status_badge_label_compact(&self) -> String {
         match self.status_kind() {
-            SessionStatusKind::Running => String::from("Running"),
+            SessionStatusKind::Running => format_duration(self.elapsed_since_start()),
             SessionStatusKind::Succeeded => self.run_duration().map_or_else(
                 || String::from("✓ done"),
                 |d| format!("✓ {}", format_duration(d)),
             ),
             SessionStatusKind::Failed(code) => format!("✕ exit {code}"),
             SessionStatusKind::Stopped => String::from("Stopped"),
+        }
+    }
+
+    /// 상태 배지에 표시할 라벨 (pane 타이틀 등 폭 여유가 있는 표면용).
+    /// 실행 중엔 라이브 경과 시간을, 종료 후엔 결과와 소요 시간을 함께 표시한다
+    /// (예: "Running 12.3s", "✓ 1.2s", "✕ exit 1 · 3.4s", "Stopped · 3.4s").
+    pub fn status_badge_label(&self) -> String {
+        match self.status_kind() {
+            SessionStatusKind::Running => {
+                format!("Running {}", format_duration(self.elapsed_since_start()))
+            }
+            SessionStatusKind::Succeeded => self.run_duration().map_or_else(
+                || String::from("✓ done"),
+                |d| format!("✓ {}", format_duration(d)),
+            ),
+            SessionStatusKind::Failed(code) => self.run_duration().map_or_else(
+                || format!("✕ exit {code}"),
+                |d| format!("✕ exit {code} · {}", format_duration(d)),
+            ),
+            SessionStatusKind::Stopped => self.run_duration().map_or_else(
+                || String::from("Stopped"),
+                |d| format!("Stopped · {}", format_duration(d)),
+            ),
         }
     }
 }
@@ -525,7 +633,7 @@ mod tests {
     #[test]
     fn long_line_is_truncated_with_marker() {
         let mut session = RunSession::new("x".to_string());
-        let huge = "a".repeat(200 * 1024); // 200KB > MAX_LINE_BYTES(64KB)
+        let huge = "a".repeat(200 * 1024); // 200KB > MAX_STORED_LINE_BYTES(64KB)
         session.add_output_line(&huge);
 
         let stored: String = session
@@ -541,7 +649,7 @@ mod tests {
             "초대형 줄은 truncation 마커로 끝나야 함"
         );
         assert!(
-            stored.len() <= MAX_LINE_BYTES + TRUNCATED_MARKER.len(),
+            stored.len() <= MAX_STORED_LINE_BYTES + TRUNCATED_MARKER.len(),
             "저장 길이가 상한 + 마커 이내여야 함 (got {})",
             stored.len()
         );
@@ -583,6 +691,169 @@ mod tests {
 
         session.exit_code = None; // 사용자 중지
         assert_eq!(session.status_kind(), SessionStatusKind::Stopped);
+    }
+
+    /// 저장된 라인의 순수 텍스트 (세그먼트 join) — CR 붕괴 검증용.
+    fn line_text_at(session: &RunSession, idx: usize) -> String {
+        session.output_lines[idx]
+            .1
+            .iter()
+            .map(|seg| seg.text.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn replace_last_line_swaps_content_keeping_line_id() {
+        let mut session = RunSession::new("x".to_string());
+        session.add_output_line("building 10%");
+        let (id_before, _) = session.output_lines[0].clone();
+        let bytes_before = session.total_bytes;
+        let version_before = session.content_version;
+
+        session.replace_last_line("building 100% done");
+
+        assert_eq!(session.output_lines.len(), 1);
+        let (id_after, _) = &session.output_lines[0];
+        assert_eq!(
+            *id_after, id_before,
+            "line_id must be reused (keyed render)"
+        );
+        assert_eq!(line_text_at(&session, 0), "building 100% done");
+        assert_ne!(session.total_bytes, bytes_before);
+        assert!(session.content_version > version_before);
+    }
+
+    #[test]
+    fn replace_last_line_on_empty_appends() {
+        let mut session = RunSession::new("x".to_string());
+        session.replace_last_line("hello");
+        assert_eq!(session.output_lines.len(), 1);
+        assert_eq!(line_text_at(&session, 0), "hello");
+    }
+
+    #[test]
+    fn replace_last_line_applies_cr_collapse_defense() {
+        // 방어 대칭: Replace 텍스트에 \r가 섞여 와도 add와 동일하게 붕괴한다.
+        let mut session = RunSession::new("x".to_string());
+        session.add_output_line("start");
+        session.replace_last_line("10%\r99%\r");
+        assert_eq!(line_text_at(&session, 0), "99%");
+    }
+
+    #[test]
+    fn apply_output_event_routes_line_and_replace() {
+        use super::OutputEvent;
+        let mut session = RunSession::new("x".to_string());
+        session.apply_output_event(&OutputEvent::Line(String::from("a")));
+        session.apply_output_event(&OutputEvent::Line(String::from("b")));
+        session.apply_output_event(&OutputEvent::Replace(String::from("B")));
+        assert_eq!(session.output_lines.len(), 2);
+        assert_eq!(line_text_at(&session, 0), "a");
+        assert_eq!(line_text_at(&session, 1), "B");
+    }
+
+    #[test]
+    fn cr_collapses_progress_bar_to_final_state() {
+        // cargo/npm 진행바 형태: 같은 줄을 \r로 되감아 재그림 → 최종 상태만 남는다.
+        let mut session = RunSession::new("x".to_string());
+        session.add_output_line("Downloading 10%\rDownloading 55%\rDownloading 100%");
+        assert_eq!(session.output_lines.len(), 1);
+        assert_eq!(line_text_at(&session, 0), "Downloading 100%");
+    }
+
+    #[test]
+    fn cr_collapse_respects_newline_boundaries() {
+        let mut session = RunSession::new("x".to_string());
+        session.add_output_line("a\rb\nc");
+        assert_eq!(session.output_lines.len(), 2);
+        assert_eq!(line_text_at(&session, 0), "b");
+        assert_eq!(line_text_at(&session, 1), "c");
+    }
+
+    #[test]
+    fn trailing_bare_cr_preserves_last_content() {
+        // 청크 경계/EOF가 \r 직후에 떨어진 경우 — 아직 덮어쓴 내용이 없으므로
+        // 마지막 상태를 보존해야 한다 (빈 줄로 붕괴 금지).
+        let mut session = RunSession::new("x".to_string());
+        session.add_output_line("Downloading 42%\r");
+        assert_eq!(line_text_at(&session, 0), "Downloading 42%");
+
+        let mut session = RunSession::new("x".to_string());
+        session.add_output_line("a\rb\r\r\r");
+        assert_eq!(line_text_at(&session, 0), "b");
+    }
+
+    #[test]
+    fn clear_output_drops_pending_scroll_target() {
+        // Clear Log 시 1회성 점프 목표도 함께 버린다 — 남으면 빈 버퍼에서 소비되지
+        // 못해 auto_scroll 판정을 계속 우회시킨다 (리뷰 회귀 테스트).
+        let mut session = RunSession::new("x".to_string());
+        session.add_output_line("hello");
+        session.scroll_target = Some(0);
+        session.clear_output();
+        assert!(session.scroll_target.is_none());
+    }
+
+    #[test]
+    fn cr_with_erase_sequence_keeps_clean_final_text() {
+        // "\r\x1b[K" (줄 되감기 + 지우기) — 지우기 시퀀스는 ANSI 파서가 소비해
+        // 최종 텍스트만 남는다.
+        let mut session = RunSession::new("x".to_string());
+        session.add_output_line("building 3/10\r\x1b[Kbuilding 10/10 done");
+        assert_eq!(session.output_lines.len(), 1);
+        assert_eq!(line_text_at(&session, 0), "building 10/10 done");
+    }
+
+    #[test]
+    fn status_badge_includes_duration_for_all_terminal_states() {
+        let mut session = RunSession::new("x".to_string());
+        session.is_running = false;
+        session.finished_at = Some(session.started_at + Duration::from_millis(3400));
+
+        session.exit_code = Some(0);
+        assert_eq!(session.status_badge_label(), "✓ 3.4s");
+        session.exit_code = Some(1);
+        assert_eq!(session.status_badge_label(), "✕ exit 1 · 3.4s");
+        session.exit_code = None; // 사용자 중지
+        assert_eq!(session.status_badge_label(), "Stopped · 3.4s");
+    }
+
+    #[test]
+    fn compact_badge_stays_short_for_fixed_width_sidebar() {
+        let mut session = RunSession::new("x".to_string());
+        // 실행 중: 경과시간만 (접두사 없음 — 고정 폭 배지에 맞춤).
+        assert!(!session.status_badge_label_compact().starts_with("Running"));
+
+        session.is_running = false;
+        session.finished_at = Some(session.started_at + Duration::from_millis(3400));
+        session.exit_code = Some(130);
+        // 종료 상태는 소요시간 없이 짧게 (풀 라벨은 pane 타이틀 담당).
+        assert_eq!(session.status_badge_label_compact(), "✕ exit 130");
+        session.exit_code = None;
+        assert_eq!(session.status_badge_label_compact(), "Stopped");
+        session.exit_code = Some(0);
+        assert_eq!(session.status_badge_label_compact(), "✓ 3.4s");
+    }
+
+    #[test]
+    fn status_badge_shows_live_elapsed_while_running() {
+        let session = RunSession::new("x".to_string());
+        let label = session.status_badge_label();
+        // 경과 시간은 비결정적이므로 형식만 검증 ("Running <duration>").
+        assert!(
+            label.starts_with("Running ") && label.len() > "Running ".len(),
+            "unexpected running label: {label}"
+        );
+    }
+
+    #[test]
+    fn status_badge_without_finish_time_omits_duration() {
+        let mut session = RunSession::new("x".to_string());
+        session.is_running = false;
+        session.exit_code = Some(1);
+        assert_eq!(session.status_badge_label(), "✕ exit 1");
+        session.exit_code = None;
+        assert_eq!(session.status_badge_label(), "Stopped");
     }
 
     #[test]
