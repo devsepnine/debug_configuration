@@ -786,6 +786,20 @@ fn pty_reader_thread(
 ) {
     const DSR_REQUEST: &[u8] = b"\x1b[6n";
 
+    // 진단용 원시 덤프 (환경변수 게이트): `RCM_PTY_DUMP=1`이면 conhost가 내보내는
+    // 바이트를 escape_debug 텍스트로 %TEMP%\rcm-pty-dump-<thread>.txt에 기록한다.
+    // ConPTY 렌더 시퀀스는 conhost 버전마다 달라 실기기 관찰이 유일한 근거다.
+    let mut dump = std::env::var_os("RCM_PTY_DUMP").map(|_| {
+        let path = std::env::temp_dir().join(format!(
+            "rcm-pty-dump-{}.txt",
+            std::thread::current()
+                .name()
+                .unwrap_or("pty")
+                .replace(':', "_")
+        ));
+        std::fs::File::create(path).ok()
+    });
+
     let mut buf = [0u8; 8192];
     let mut forwarding = true;
     let mut dsr_answered = false;
@@ -794,6 +808,15 @@ fn pty_reader_thread(
         match reader.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
+                if let Some(Some(f)) = dump.as_mut() {
+                    use std::io::Write;
+                    let _ = writeln!(
+                        f,
+                        "[chunk {n}B] {}",
+                        String::from_utf8_lossy(&buf[..n]).escape_debug()
+                    );
+                    let _ = f.flush();
+                }
                 if !dsr_answered {
                     // 직전 꼬리 + 이번 청크에서 질의 검색 (경계 걸침 대응).
                     let mut window = std::mem::take(&mut dsr_tail);
