@@ -112,6 +112,10 @@ struct SessionIo {
     master: Option<Box<dyn portable_pty::MasterPty + Send>>,
     /// stdin writer. unix pipe 폴백(출력 전용)은 None.
     writer: Option<SessionWriter>,
+    /// 마지막으로 적용된 PTY 크기 — 동일 크기 재요청을 no-op으로 만든다.
+    /// Windows ConPTY는 RESIZE_QUIRK로 리사이즈마다 전체 리페인트(빈 행 무더기)를
+    /// 내보낼 수 있어, 불필요한 ResizePseudoConsole 호출 자체를 막는 것이 중요하다.
+    last_pty_size: Option<(u16, u16)>,
 }
 
 static SESSION_IO: LazyLock<Mutex<HashMap<Uuid, SessionIo>>> =
@@ -146,18 +150,26 @@ pub fn terminate_session_process(pid: u32) {
     force_kill_process_tree(pid);
 }
 
-/// 세션 PTY의 화면 크기를 갱신한다. pipe 세션/미등록 세션은 no-op.
+/// 세션 PTY의 화면 크기를 갱신한다. pipe 세션/미등록 세션/동일 크기는 no-op.
 pub fn resize_session_pty(session_id: Uuid, cols: u16, rows: u16) {
-    if let Ok(map) = SESSION_IO.lock()
-        && let Some(io) = map.get(&session_id)
+    if let Ok(mut map) = SESSION_IO.lock()
+        && let Some(io) = map.get_mut(&session_id)
         && let Some(master) = &io.master
     {
-        let _ = master.resize(portable_pty::PtySize {
-            rows,
-            cols,
-            pixel_width: 0,
-            pixel_height: 0,
-        });
+        if io.last_pty_size == Some((cols, rows)) {
+            return;
+        }
+        if master
+            .resize(portable_pty::PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .is_ok()
+        {
+            io.last_pty_size = Some((cols, rows));
+        }
     }
 }
 
@@ -884,6 +896,7 @@ fn spawn_in_pty(
         SessionIo {
             master: Some(pair.master),
             writer: Some(SessionWriter::Pty(writer)),
+            last_pty_size: Some(viewport),
         },
     );
 
@@ -1342,6 +1355,7 @@ async fn handle_spawned_process(
                 writer: Some(SessionWriter::Pipe(Arc::new(tokio::sync::Mutex::new(
                     stdin,
                 )))),
+                last_pty_size: None,
             },
         );
     }

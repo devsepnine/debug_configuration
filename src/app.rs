@@ -432,6 +432,9 @@ pub struct RunConfigManager {
     sessions: Vec<RunSession>,
     /// 세션 리스트에서 hover 중인 항목 (표시용 인덱스)
     hovered_session_index: Option<usize>,
+    /// 가장 최근 관측된 터미널 pane 뷰포트 (cols, rows) — 신규 세션 PTY의 초기
+    /// 크기로 사용해 시작 직후 리사이즈(ConPTY 전체 리페인트)를 피한다.
+    last_seen_viewport: Option<(u16, u16)>,
 
     /// 워크스페이스 탭 목록 (각 탭은 독립적인 `pane_grid` 레이아웃을 가짐)
     workspace_tabs: Vec<WorkspaceTab>,
@@ -528,6 +531,7 @@ impl RunConfigManager {
             available_jdks: vec![("Default (system)".to_string(), "java".to_string())],
             sessions: vec![],
             hovered_session_index: None,
+            last_seen_viewport: None,
             workspace_tabs: vec![WorkspaceTab::empty(String::from("Workspace 1"))],
             selected_tab_index: 0,
             configuration_layout: pane_grid::State::with_configuration(
@@ -1486,8 +1490,11 @@ impl RunConfigManager {
                     session_id,
                     cancel_flag,
                     self.show_environment_on_run,
-                    // 신규 세션 — 첫 프레임의 SessionViewportResized가 실측값을 채운다.
-                    None,
+                    // 신규 세션: 최근 관측된 pane 뷰포트로 스폰해 시작 직후의 리사이즈를
+                    // 없앤다 — Windows ConPTY는 리사이즈마다 전체 리페인트(빈 행 무더기)를
+                    // 내보내 첫 출력이 화면 아래로 밀린다. 실측과 다르면 첫 프레임의
+                    // SessionViewportResized가 보정한다.
+                    self.last_seen_viewport,
                 ),
                 |msg| msg,
             );
@@ -1556,7 +1563,8 @@ impl RunConfigManager {
                     session_id,
                     cancel_flag,
                     self.show_environment_on_run,
-                    None,
+                    // compound 멤버도 최근 pane 뷰포트로 스폰 (위 run 경로와 동일 근거).
+                    self.last_seen_viewport,
                 ),
                 |msg| msg,
             ));
@@ -2528,6 +2536,10 @@ impl RunConfigManager {
         cols: u16,
         rows: u16,
     ) -> Task<Message> {
+        // 신규 세션 스폰의 초기 크기 후보 — pane들은 대개 비슷한 크기라, 이 값으로
+        // 스폰하면 시작 직후의 리사이즈(ConPTY 전체 리페인트 유발)가 사라진다.
+        // 세션 존재 여부와 무관하게 기록한다(어느 pane이든 유효한 실측값).
+        self.last_seen_viewport = Some((cols, rows));
         if let Some(session) = self.session_by_id_mut(session_id) {
             if session.pty_viewport == Some((cols, rows)) {
                 return Task::none();
