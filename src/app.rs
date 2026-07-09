@@ -2860,6 +2860,8 @@ impl RunConfigManager {
     fn handle_close_session_stdin(&mut self, session_id: Uuid) -> Task<Message> {
         if let Some(session) = self.session_by_id_mut(session_id) {
             session.stdin_input = None;
+            // 드래프트가 죽었으므로 보관 드래프트가 다음 열기에서 부활하지 않게 리셋.
+            session.reset_stdin_history_navigation();
         }
         Task::none()
     }
@@ -2869,6 +2871,10 @@ impl RunConfigManager {
             && session.stdin_input.is_some()
         {
             session.stdin_input = Some(value);
+            // 수동 편집은 탐색을 끝낸다 — 편집된 텍스트가 새 라이브 드래프트가 되고,
+            // 다음 ↑가 그것을 보관한다. (히스토리 탐색의 드래프트 교체는 on_input을
+            // 거치지 않으므로 여기로 오지 않는다.)
+            session.reset_stdin_history_navigation();
         }
         Task::none()
     }
@@ -2887,6 +2893,9 @@ impl RunConfigManager {
             return Task::none();
         };
         let line = std::mem::take(draft);
+        // 이력은 제출 시점에 기록한다 — Timeout이어도 쓰기는 결국 전달되고(순서 보존),
+        // Broken 복원→재제출은 연속 중복 제거가 이중 등록을 막는다.
+        session.push_stdin_history(&line);
         let sent = line.clone();
         Task::perform(
             crate::services::write_session_stdin(session_id, line),
@@ -5375,6 +5384,68 @@ mod tests {
             .find(|s| s.config_name == "a")
             .expect("session survives rerun");
         assert_eq!(session.stdin_input.as_deref(), Some("typed"));
+    }
+
+    #[test]
+    fn stdin_submit_pushes_history() {
+        let (mut app, ids) = manager_with_open_panes(&["a"]);
+        let sid = ids[0];
+        app.session_by_id_mut(sid).unwrap().is_running = true;
+        let _ = app.handle_open_session_stdin(sid);
+
+        let _ = app.handle_session_stdin_changed(sid, String::from("foo"));
+        let _ = app.handle_session_stdin_submitted(sid);
+        // 빈 Enter는 전송되지만 이력에는 남지 않는다.
+        let _ = app.handle_session_stdin_submitted(sid);
+
+        let session = app.session_by_id_mut(sid).unwrap();
+        assert_eq!(session.stdin_history, vec!["foo"]);
+        assert_eq!(session.stdin_input.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn stdin_broken_restore_then_resubmit_does_not_duplicate_history() {
+        use crate::models::StdinWriteError;
+        let (mut app, ids) = manager_with_open_panes(&["a"]);
+        let sid = ids[0];
+        app.session_by_id_mut(sid).unwrap().is_running = true;
+        let _ = app.handle_open_session_stdin(sid);
+
+        let _ = app.handle_session_stdin_changed(sid, String::from("x"));
+        let _ = app.handle_session_stdin_submitted(sid);
+        let _ = app.handle_session_stdin_write_completed(
+            sid,
+            String::from("x"),
+            Err(StdinWriteError::Broken(String::from("EPIPE"))),
+        );
+        // 복원된 드래프트를 그대로 재제출 → 연속 중복 제거로 이력은 한 번만.
+        assert_eq!(
+            app.session_by_id_mut(sid).unwrap().stdin_input.as_deref(),
+            Some("x")
+        );
+        let _ = app.handle_session_stdin_submitted(sid);
+        assert_eq!(app.session_by_id_mut(sid).unwrap().stdin_history, vec!["x"]);
+    }
+
+    #[test]
+    fn stdin_history_survives_rerun() {
+        // rerun은 세션 객체를 재사용하며 stdin_history를 건드리지 않는다
+        // (`stdin_draft_survives_rerun`과 동형의 회귀 방지).
+        let (mut app, ids) = manager_with_open_panes(&["a"]);
+        let sid = ids[0];
+        app.session_by_id_mut(sid).unwrap().is_running = true;
+        let _ = app.handle_open_session_stdin(sid);
+        let _ = app.handle_session_stdin_changed(sid, String::from("cmd"));
+        let _ = app.handle_session_stdin_submitted(sid);
+
+        let _ = app.handle_rerun_session(sid);
+
+        let session = app
+            .sessions
+            .iter()
+            .find(|s| s.config_name == "a")
+            .expect("session survives rerun");
+        assert_eq!(session.stdin_history, vec!["cmd"]);
     }
 
     #[test]

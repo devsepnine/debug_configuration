@@ -58,6 +58,9 @@ const MAX_STORED_LINE_BYTES: usize = 64 * 1024;
 /// 잘린 줄 끝에 붙는 마커.
 const TRUNCATED_MARKER: &str = "…[truncated]";
 
+/// stdin 제출 이력의 보관 상한. 초과 시 가장 오래된 항목부터 제거한다.
+const STDIN_HISTORY_MAX: usize = 50;
+
 /// 세그먼트들의 텍스트 바이트 길이 합 (바이트 예산 계산용).
 fn segments_bytes(segments: &[TextSegment]) -> usize {
     segments.iter().map(|s| s.text.len()).sum()
@@ -177,6 +180,16 @@ pub struct RunSession {
     /// stdin 입력바 드래프트. `Some`이면 바가 열려 있음 (`search`와 동일 컨벤션).
     /// 프로세스 종료/rerun에도 생존한다 — 타이핑 중이던 내용을 잃지 않기 위함.
     pub stdin_input: Option<String>,
+    /// stdin 제출 이력 (0=가장 오래됨, 마지막=최신). 빈 라인과 직전 항목의 연속
+    /// 중복은 저장하지 않으며 `STDIN_HISTORY_MAX` 초과 시 앞에서 제거한다.
+    /// 드래프트와 마찬가지로 rerun에도 생존한다.
+    pub stdin_history: Vec<String>,
+    /// 히스토리 탐색 커서. `Some(i)`면 `stdin_history[i]` 열람 중, `None`이면 라이브
+    /// 드래프트 편집 중. 제출/수동 편집/바 닫기가 리셋한다.
+    stdin_history_cursor: Option<usize>,
+    /// 탐색 진입(커서 None에서의 첫 ↑) 시 보관한 라이브 드래프트 — ↓로 최신 항목을
+    /// 지나치면 복원된다.
+    stdin_saved_draft: Option<String>,
     /// 마지막으로 관측된 터미널 뷰포트 (cols, rows). rerun의 초기 PTY 크기와
     /// `ProcessStarted` 직후 재푸시에 쓴다 (신규 pane은 첫 프레임 publish가 채움).
     pub pty_viewport: Option<(u16, u16)>,
@@ -231,10 +244,34 @@ impl RunSession {
             search: None,
             scroll_target: None,
             stdin_input: None,
+            stdin_history: Vec::new(),
+            stdin_history_cursor: None,
+            stdin_saved_draft: None,
             pty_viewport: None,
             controls_menu_open: false,
             max_output_lines: DEFAULT_MAX_OUTPUT_LINES,
         }
+    }
+
+    /// stdin 제출 라인을 이력에 추가한다. 빈 라인은 저장하지 않고(전송 자체는 호출측
+    /// 책임 — 빈 Enter도 프로세스엔 보낸다), 직전 항목과 동일하면 스킵한다(연속 중복
+    /// 제거). 상한 초과 시 가장 오래된 항목을 제거한다. 제출은 항상 탐색 모드를 끝낸다.
+    pub fn push_stdin_history(&mut self, line: &str) {
+        self.reset_stdin_history_navigation();
+        if line.is_empty() || self.stdin_history.last().is_some_and(|last| last == line) {
+            return;
+        }
+        self.stdin_history.push(line.to_string());
+        if self.stdin_history.len() > STDIN_HISTORY_MAX {
+            self.stdin_history.remove(0);
+        }
+    }
+
+    /// 히스토리 탐색 상태만 리셋한다(드래프트 텍스트와 이력 자체는 유지). 수동 편집·
+    /// 바 닫기·제출이 호출한다 — 이후 첫 ↑는 그 시점의 드래프트를 새로 보관한다.
+    pub fn reset_stdin_history_navigation(&mut self) {
+        self.stdin_history_cursor = None;
+        self.stdin_saved_draft = None;
     }
 
     /// 검색 매치 캐시(`search.matches`)를 현재 출력/검색어로 갱신하고 `current`를
@@ -924,5 +961,38 @@ mod tests {
         assert_eq!(format_duration(Duration::from_millis(820)), "820ms");
         assert_eq!(format_duration(Duration::from_millis(1200)), "1.2s");
         assert_eq!(format_duration(Duration::from_secs(75)), "1m 15s");
+    }
+
+    // ---- stdin 히스토리 ----
+
+    #[test]
+    fn stdin_history_dedupes_consecutive_and_caps() {
+        let mut session = RunSession::new("x".to_string());
+        session.push_stdin_history("a");
+        session.push_stdin_history("a"); // 연속 중복 → 스킵
+        session.push_stdin_history("b");
+        session.push_stdin_history("a"); // 비연속 재등장은 허용
+        assert_eq!(session.stdin_history, vec!["a", "b", "a"]);
+
+        // 상한 초과 시 가장 오래된 항목부터 제거된다.
+        for i in 0..STDIN_HISTORY_MAX + 10 {
+            session.push_stdin_history(&format!("line {i}"));
+        }
+        assert_eq!(session.stdin_history.len(), STDIN_HISTORY_MAX);
+        assert_eq!(
+            session.stdin_history.last().map(String::as_str),
+            Some(format!("line {}", STDIN_HISTORY_MAX + 9).as_str())
+        );
+        assert!(!session.stdin_history.iter().any(|l| l == "a"));
+    }
+
+    #[test]
+    fn stdin_history_skips_empty_lines() {
+        let mut session = RunSession::new("x".to_string());
+        session.push_stdin_history("");
+        assert!(session.stdin_history.is_empty());
+        session.push_stdin_history("a");
+        session.push_stdin_history("");
+        assert_eq!(session.stdin_history, vec!["a"]);
     }
 }
