@@ -55,7 +55,10 @@ Grab the latest pre-built binary for your platform from the [Releases page](http
   backspace erases)
 - stdin input bar per session (toggle button or Cmd+I): answer prompts and
   feed REPLs — the terminal echoes input naturally; on the legacy Windows
-  pipe fallback (pre-1809) the app echoes locally
+  pipe fallback (pre-1809) the app echoes locally. Submitted lines are kept
+  in a per-session history (recall with ArrowUp/ArrowDown), and the ^C
+  button — or Ctrl+C while the input is focused — sends an interrupt to the
+  running process
 - Real-time output display (ANSI color support; OSC/DCS control sequences
   are filtered out)
 - Rerun, stop, remove, and hide sessions from a workspace
@@ -252,9 +255,14 @@ Configuration files are automatically saved in the OS-specific settings director
   exits, a grandchild that stays silent for ~300ms has any later output cut
   off (unix keeps streaming until true EOF). On Windows before 10 1809 (no
   ConPTY) the app falls back to pipes — no colors/progress bars, input echoes
-  locally, and a banner marks the session; the old note about a PowerShell
-  cmdlet prompting unexpectedly (appearing to hang — press Stop) applies to
-  this fallback only.
+  locally, interrupts (^C) cannot be delivered, and a banner marks the
+  session; the old note about a PowerShell cmdlet prompting unexpectedly
+  (appearing to hang — press Stop) applies to this fallback only.
+- **Ctrl+C in the stdin bar means interrupt**: while a session's stdin input
+  is focused, Ctrl+C is sent to the process. On Windows/Linux it takes
+  priority over "copy" — with an active selection the text is still copied
+  and the interrupt is sent as well. Copying from the output area and macOS
+  Cmd+C are unaffected.
 - On macOS/Linux, `sh -l` plus a real tty means shell profiles may print
   banners into the session output.
 
