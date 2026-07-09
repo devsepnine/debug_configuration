@@ -259,10 +259,9 @@ Configuration files are automatically saved in the OS-specific settings director
   session; the old note about a PowerShell cmdlet prompting unexpectedly
   (appearing to hang — press Stop) applies to this fallback only.
 - **Ctrl+C in the stdin bar means interrupt**: while a session's stdin input
-  is focused, Ctrl+C is sent to the process. On Windows/Linux it takes
-  priority over "copy" — with an active selection the text is still copied
-  and the interrupt is sent as well. Copying from the output area and macOS
-  Cmd+C are unaffected.
+  is focused, Ctrl+C always sends an interrupt to the process; on
+  Windows/Linux, if the input has an active selection, the text is also
+  copied. Copying from the output area and macOS Cmd+C are unaffected.
 - On macOS/Linux, `sh -l` plus a real tty means shell profiles may print
   banners into the session output.
 

@@ -249,9 +249,9 @@ open /Applications/RunConfigManager.app
   예기치 않은 PowerShell 프롬프트 대기(행처럼 보임 — Stop으로 종료) 노트는
   이 폴백에만 해당합니다.
 - **stdin 입력바의 Ctrl+C는 인터럽트**: 세션 stdin 입력창이 포커스일 때 Ctrl+C는
-  프로세스로 전달됩니다. Windows/Linux에선 "복사"보다 우선 — 선택 영역이 있으면
-  복사도 수행된 뒤 인터럽트가 함께 전송됩니다. 출력 영역 복사와 macOS의 Cmd+C
-  복사에는 영향이 없습니다.
+  항상 프로세스로 인터럽트를 보냅니다. Windows/Linux에서 입력창에 선택 영역이
+  있으면 복사도 함께 수행됩니다. 출력 영역 복사와 macOS의 Cmd+C 복사에는 영향이
+  없습니다.
 - macOS/Linux에서 `sh -l` + 진짜 tty 조합이라 셸 프로파일의 배너가 세션 출력에
   나타날 수 있습니다.
 

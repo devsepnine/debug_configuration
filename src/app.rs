@@ -2950,6 +2950,9 @@ impl RunConfigManager {
                     && session.stdin_input.as_deref() == Some("")
                 {
                     session.stdin_input = Some(line);
+                    // 방어적 리셋 — 현재는 제출 시점의 push가 탐색을 이미 끝냈지만,
+                    // 그 불변식에 기대지 않고 직접 대입엔 항상 리셋을 동반시킨다.
+                    session.reset_stdin_history_navigation();
                 }
             }
         }
@@ -3030,27 +3033,32 @@ impl RunConfigManager {
     ///   동일(SIGINT 2회)이라 무해하다.
     /// - `Broken`(PTY 경로 부재/파손 — unix pipe 폴백 세션 등).
     ///
-    /// 폴백도 불가하면(windows <1809 폴백, pid 부재) 상태 메시지로 안내한다.
+    /// 폴백도 불가하면(windows <1809 폴백, pid 부재) 상태 메시지로 안내한다. 단,
+    /// 그 사이 Stop/Remove/자연 종료가 선행된 세션엔 침묵한다 — 인터럽트 결과가
+    /// 이미 무의미하고, 방금 표시된 "Session stopped" 류 메시지를 덮어쓰지 않는다.
     fn handle_session_interrupt_completed(
         &mut self,
         session_id: Uuid,
         result: Result<(), crate::models::StdinWriteError>,
     ) -> Task<Message> {
         use crate::models::StdinWriteError;
-        match result {
-            Ok(()) => {}
-            Err(StdinWriteError::Timeout) => {
-                if !self.try_signal_interrupt(session_id) {
-                    self.status_message =
-                        String::from("Interrupt pending — the process is not reading stdin yet");
+        let Err(error) = result else {
+            return Task::none();
+        };
+        if !self
+            .sessions
+            .iter()
+            .any(|s| s.id == session_id && s.is_running)
+        {
+            return Task::none();
+        }
+        if !self.try_signal_interrupt(session_id) {
+            self.status_message = String::from(match error {
+                StdinWriteError::Timeout => {
+                    "Interrupt pending — the process is not reading stdin yet"
                 }
-            }
-            Err(StdinWriteError::Broken(_)) => {
-                if !self.try_signal_interrupt(session_id) {
-                    self.status_message =
-                        String::from("Interrupt is not available for this session");
-                }
-            }
+                StdinWriteError::Broken(_) => "Interrupt is not available for this session",
+            });
         }
         Task::none()
     }
@@ -3095,8 +3103,9 @@ impl RunConfigManager {
     /// 여닫는 지속 표면이다 — 항목 클릭(rerun/stop/search/stdin/...)은 메뉴를 닫지
     /// 않아 연속 조작이 가능하다(stop→rerun 등). 닫는 경우는 "`⋯`가 사라져 토글로
     /// 닫을 수 없게 되는" 레이아웃 변화뿐:
-    /// - 리사이즈/드래그/pane 닫기 → 모든 메뉴 닫기 (pane이 넓어지면 full 컨트롤로
-    ///   전환돼 `⋯` 자체가 사라진다)
+    /// - 리사이즈/드래그/pane·탭 닫기(Cmd+W 포함) → 모든 메뉴 닫기 (pane이
+    ///   넓어지면 full 컨트롤로 전환돼 `⋯` 자체가 사라지고, 탭/pane 닫기는 세션
+    ///   객체에 남은 열림 플래그가 재열기 시 고아 메뉴로 나타나는 것을 막는다)
     /// - `TogglePaneMaximize` → 해당 pane 세션의 메뉴 닫기 (maximize로 넓어진 pane도
     ///   full 컨트롤로 전환된다; 메뉴에 maximize 항목이 있어 pane→세션으로 해석)
     fn close_controls_menu_on_action(&mut self, message: &Message) {
@@ -3105,6 +3114,8 @@ impl RunConfigManager {
             Message::PaneGridResized(_)
                 | Message::WindowResized(_, _)
                 | Message::ClosePane(_)
+                | Message::CloseTab(_)
+                | Message::CloseFocusedPane
                 | Message::PaneGridDragged(_)
         ) {
             for session in &mut self.sessions {
@@ -3315,10 +3326,12 @@ impl RunConfigManager {
     /// `handle_stdin_bar_key_pressed`의 find_focused가 담당).
     /// - Ctrl+C: **status 게이트 없음** — win/linux의 text_input은 포커스 중 Ctrl+C를
     ///   선택 유무와 무관하게 캡처하므로(복사 arm의 capture가 무조건) Ignored 게이트를
-    ///   두면 키가 영원히 도달하지 않는다. **물리키(KeyC) 매칭** — 한글 등 비라틴
-    ///   레이아웃에선 logical key가 "c"가 아니고, text_input의 복사 판정도
-    ///   to_latin(physical)이므로 물리키가 위젯 동작과 정합한다. macOS의 복사는
-    ///   Cmd+C(logo)라 이 arm(control 전용, logo 배제)과 겹치지 않는다.
+    ///   두면 키가 영원히 도달하지 않는다. 판정은 **물리 KeyC 또는 logical "c"의
+    ///   합집합** — 물리키는 한글 등 비라틴 레이아웃(logical이 "ㅊ"; text_input의
+    ///   복사 판정 to_latin도 비라틴에서만 물리키를 참조)을, logical은 Dvorak처럼
+    ///   라틴 문자가 물리적으로 이동한 레이아웃(to_latin이 logical을 신뢰)을
+    ///   커버한다. macOS의 복사는 Cmd+C(logo)라 이 arm(control 전용, logo 배제)과
+    ///   겹치지 않는다.
     /// - ↑/↓: 수식키 없음 + `Status::Ignored`만 — iced text_input은 수직 방향키를
     ///   캡처하지 않아 포커스 중에도 Ignored로 도달하고, 게이트는 미래에 방향키를
     ///   캡처하는 위젯이 생겨도 이중 발화를 막는 위생 장치다.
@@ -3328,10 +3341,12 @@ impl RunConfigManager {
         modifiers: keyboard::Modifiers,
         status: event::Status,
     ) -> Option<Message> {
-        if matches!(
+        let is_key_c = matches!(
             physical_key,
             keyboard::key::Physical::Code(keyboard::key::Code::KeyC)
-        ) && modifiers.control()
+        ) || matches!(key, keyboard::Key::Character(c) if c.as_str().eq_ignore_ascii_case("c"));
+        if is_key_c
+            && modifiers.control()
             && !modifiers.shift()
             && !modifiers.alt()
             && !modifiers.logo()
@@ -5690,6 +5705,13 @@ mod tests {
             ),
             Some(Message::StdinBarKeyPressed(StdinBarKey::Interrupt))
         ));
+        // Dvorak류: 라틴 문자가 물리적으로 이동한 레이아웃은 logical "c"로 판정한다
+        // (text_input의 복사도 같은 키에서 발화 — 물리 위치가 아닌 문자 기준).
+        let phys_j = Physical::Code(Code::KeyJ);
+        assert!(matches!(
+            RunConfigManager::stdin_bar_key_message(&key_c, phys_j, ctrl, event::Status::Ignored),
+            Some(Message::StdinBarKeyPressed(StdinBarKey::Interrupt))
+        ));
         // 수식키 배제: Ctrl 없음 / +Shift / +Alt / +Logo(macOS Cmd+C 복사 보호).
         for mods in [
             keyboard::Modifiers::empty(),
@@ -5795,6 +5817,15 @@ mod tests {
         // 레이아웃 변화(pane 닫기/리사이즈류)는 모든 메뉴를 닫는다.
         let _ = app.handle_toggle_session_controls_menu(sid);
         app.close_controls_menu_on_action(&Message::ClosePane(pane_id));
+        assert!(!app.session_by_id_mut(sid).unwrap().controls_menu_open);
+
+        // 탭 닫기/Cmd+W도 pane 소멸 경로 — 세션 객체에 열림 플래그가 남아 재열기 시
+        // 고아 메뉴(이중 컨트롤)로 나타나지 않아야 한다.
+        let _ = app.handle_toggle_session_controls_menu(sid);
+        app.close_controls_menu_on_action(&Message::CloseTab(0));
+        assert!(!app.session_by_id_mut(sid).unwrap().controls_menu_open);
+        let _ = app.handle_toggle_session_controls_menu(sid);
+        app.close_controls_menu_on_action(&Message::CloseFocusedPane);
         assert!(!app.session_by_id_mut(sid).unwrap().controls_menu_open);
     }
 
