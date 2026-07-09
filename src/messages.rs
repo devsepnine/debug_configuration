@@ -24,6 +24,8 @@ pub enum StdinBarKey {
     HistoryOlder,
     /// ↓ — 한 단계 최신으로 (최신을 지나면 타이핑 중이던 드래프트 복원)
     HistoryNewer,
+    /// Ctrl+C — 실행 중인 프로세스에 인터럽트 전송 (^C 버튼과 동일 경로)
+    Interrupt,
 }
 
 /// 애플리케이션의 모든 이벤트와 액션을 정의하는 메시지 타입

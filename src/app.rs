@@ -2971,33 +2971,38 @@ impl RunConfigManager {
     }
 
     /// find_focused 결과를 stdin 바로 라우팅한다. 포커스 Id가 stdin 바가 열린 어떤
-    /// 세션의 입력과도 일치하지 않으면(검색창/탭 이름 편집 등) no-op — 히스토리 키가
-    /// 다른 입력의 캐럿 조작과 충돌하지 않는 안전핀.
+    /// 세션의 입력과도 일치하지 않으면(검색창/탭 이름 편집 등) no-op — 히스토리/
+    /// 인터럽트 키가 다른 입력의 복사·캐럿 조작과 충돌하지 않는 안전핀.
     fn handle_stdin_bar_key_resolved(
         &mut self,
         key: StdinBarKey,
         focused: iced::advanced::widget::Id,
     ) -> Task<Message> {
-        let Some(session) = self
+        let Some(session_id) = self
             .sessions
-            .iter_mut()
+            .iter()
             .filter(|s| s.stdin_input.is_some())
-            .find(|s| crate::views::shared::session_stdin_input_id(s.id) == focused)
+            .map(|s| s.id)
+            .find(|id| crate::views::shared::session_stdin_input_id(*id) == focused)
         else {
             return Task::none();
         };
         match key {
             StdinBarKey::HistoryOlder | StdinBarKey::HistoryNewer => {
                 let older = matches!(key, StdinBarKey::HistoryOlder);
+                let Some(session) = self.session_by_id_mut(session_id) else {
+                    return Task::none();
+                };
                 if session.navigate_stdin_history(older) {
                     // 드래프트 교체 후 캐럿은 이전 오프셋에 남으므로 끝으로 보낸다.
                     iced::widget::operation::move_cursor_to_end(
-                        crate::views::shared::session_stdin_input_id(session.id),
+                        crate::views::shared::session_stdin_input_id(session_id),
                     )
                 } else {
                     Task::none()
                 }
             }
+            StdinBarKey::Interrupt => self.handle_session_interrupt_requested(session_id),
         }
     }
 
@@ -3307,14 +3312,31 @@ impl RunConfigManager {
 
     /// stdin 바 전용 키 매칭 (구독 클로저는 fn 포인터 — 대상 해석은
     /// `handle_stdin_bar_key_pressed`의 find_focused가 담당).
-    /// ↑/↓는 수식키 없음 + `Status::Ignored`만 받는다 — iced text_input은 수직
-    /// 방향키를 캡처하지 않아 포커스 중에도 Ignored로 도달하고, 게이트는 미래에
-    /// 방향키를 캡처하는 위젯이 생겨도 이중 발화를 막는 위생 장치다.
+    /// - Ctrl+C: **status 게이트 없음** — win/linux의 text_input은 포커스 중 Ctrl+C를
+    ///   선택 유무와 무관하게 캡처하므로(복사 arm의 capture가 무조건) Ignored 게이트를
+    ///   두면 키가 영원히 도달하지 않는다. **물리키(KeyC) 매칭** — 한글 등 비라틴
+    ///   레이아웃에선 logical key가 "c"가 아니고, text_input의 복사 판정도
+    ///   to_latin(physical)이므로 물리키가 위젯 동작과 정합한다. macOS의 복사는
+    ///   Cmd+C(logo)라 이 arm(control 전용, logo 배제)과 겹치지 않는다.
+    /// - ↑/↓: 수식키 없음 + `Status::Ignored`만 — iced text_input은 수직 방향키를
+    ///   캡처하지 않아 포커스 중에도 Ignored로 도달하고, 게이트는 미래에 방향키를
+    ///   캡처하는 위젯이 생겨도 이중 발화를 막는 위생 장치다.
     fn stdin_bar_key_message(
         key: &keyboard::Key,
+        physical_key: keyboard::key::Physical,
         modifiers: keyboard::Modifiers,
         status: event::Status,
     ) -> Option<Message> {
+        if matches!(
+            physical_key,
+            keyboard::key::Physical::Code(keyboard::key::Code::KeyC)
+        ) && modifiers.control()
+            && !modifiers.shift()
+            && !modifiers.alt()
+            && !modifiers.logo()
+        {
+            return Some(Message::StdinBarKeyPressed(StdinBarKey::Interrupt));
+        }
         let arrow_eligible = modifiers.is_empty() && matches!(status, event::Status::Ignored);
         match key {
             keyboard::Key::Named(keyboard::key::Named::ArrowUp) if arrow_eligible => {
@@ -5032,15 +5054,18 @@ impl RunConfigManager {
             Subscription::none()
         };
 
-        // stdin 바 키(↑/↓ 히스토리): 어떤 세션이든 stdin 바가 열려 있을 때만 활성.
-        // 어느 바가 대상인지는 핸들러의 find_focused 조회가 판정한다.
+        // stdin 바 키(↑/↓ 히스토리, Ctrl+C 인터럽트): 어떤 세션이든 stdin 바가 열려
+        // 있을 때만 활성. 어느 바가 대상인지는 핸들러의 find_focused 조회가 판정한다.
         let stdin_bar_keys_active =
             sessions_active && self.sessions.iter().any(|s| s.stdin_input.is_some());
         let stdin_bar_key_subscription = if stdin_bar_keys_active {
             event::listen_with(|event, status, _id| match event {
-                Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) => {
-                    Self::stdin_bar_key_message(&key, modifiers, status)
-                }
+                Event::Keyboard(keyboard::Event::KeyPressed {
+                    key,
+                    physical_key,
+                    modifiers,
+                    ..
+                }) => Self::stdin_bar_key_message(&key, physical_key, modifiers, status),
                 _ => None,
             })
         } else {
@@ -5597,12 +5622,15 @@ mod tests {
 
     #[test]
     fn stdin_bar_key_message_maps_arrows_only_when_ignored() {
-        use keyboard::key::Named;
+        use keyboard::key::{Code, Named, Physical};
         let up = keyboard::Key::Named(Named::ArrowUp);
         let down = keyboard::Key::Named(Named::ArrowDown);
+        let phys_up = Physical::Code(Code::ArrowUp);
+        let phys_down = Physical::Code(Code::ArrowDown);
         assert!(matches!(
             RunConfigManager::stdin_bar_key_message(
                 &up,
+                phys_up,
                 keyboard::Modifiers::empty(),
                 event::Status::Ignored
             ),
@@ -5611,6 +5639,7 @@ mod tests {
         assert!(matches!(
             RunConfigManager::stdin_bar_key_message(
                 &down,
+                phys_down,
                 keyboard::Modifiers::empty(),
                 event::Status::Ignored
             ),
@@ -5620,6 +5649,7 @@ mod tests {
         assert!(
             RunConfigManager::stdin_bar_key_message(
                 &up,
+                phys_up,
                 keyboard::Modifiers::empty(),
                 event::Status::Captured
             )
@@ -5628,11 +5658,54 @@ mod tests {
         assert!(
             RunConfigManager::stdin_bar_key_message(
                 &up,
+                phys_up,
                 keyboard::Modifiers::SHIFT,
                 event::Status::Ignored
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn stdin_bar_key_message_maps_ctrl_c_regardless_of_status() {
+        use keyboard::key::{Code, Physical};
+        let ctrl = keyboard::Modifiers::CTRL;
+        let phys_c = Physical::Code(Code::KeyC);
+        let key_c = keyboard::Key::Character("c".into());
+        // 캡처 상태에서도 발화해야 한다 — win/linux text_input은 포커스 중 Ctrl+C를
+        // 무조건 캡처하므로 Ignored 게이트가 있으면 이 키는 영원히 도달하지 않는다.
+        assert!(matches!(
+            RunConfigManager::stdin_bar_key_message(&key_c, phys_c, ctrl, event::Status::Captured),
+            Some(Message::StdinBarKeyPressed(StdinBarKey::Interrupt))
+        ));
+        // 한글 레이아웃: logical key가 "ㅊ"이어도 물리 KeyC로 판정한다.
+        let key_hangul = keyboard::Key::Character("ㅊ".into());
+        assert!(matches!(
+            RunConfigManager::stdin_bar_key_message(
+                &key_hangul,
+                phys_c,
+                ctrl,
+                event::Status::Ignored
+            ),
+            Some(Message::StdinBarKeyPressed(StdinBarKey::Interrupt))
+        ));
+        // 수식키 배제: Ctrl 없음 / +Shift / +Alt / +Logo(macOS Cmd+C 복사 보호).
+        for mods in [
+            keyboard::Modifiers::empty(),
+            ctrl | keyboard::Modifiers::SHIFT,
+            ctrl | keyboard::Modifiers::ALT,
+            ctrl | keyboard::Modifiers::LOGO,
+        ] {
+            assert!(
+                RunConfigManager::stdin_bar_key_message(
+                    &key_c,
+                    phys_c,
+                    mods,
+                    event::Status::Ignored
+                )
+                .is_none()
+            );
+        }
     }
 
     #[test]
