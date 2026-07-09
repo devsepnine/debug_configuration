@@ -598,23 +598,41 @@ fn view_session_controls_menu(
         false,
     );
 
+    // search/stdin은 full 컨트롤과 동일한 상태 토글 — 메뉴가 지속 표면이 되면서
+    // "열기 전용" 항목은 두 번째 클릭이 무동작으로 보이는 함정이 된다.
+    let search_open = session.search.is_some();
+    let search_state = if search_open {
+        IconButtonState::Active
+    } else {
+        IconButtonState::Inactive
+    };
+    let search_message = if search_open {
+        Message::CloseSessionSearch(session_id)
+    } else {
+        Message::OpenSessionSearch(session_id)
+    };
     let search = control_button(
-        control_icon(
-            svg::Handle::from_memory(ICON_SEARCH),
-            IconButtonState::Active,
-        ),
-        Some(Message::OpenSessionSearch(session_id)),
-        IconButtonState::Active,
+        control_icon(svg::Handle::from_memory(ICON_SEARCH), search_state),
+        Some(search_message),
+        search_state,
         false,
     );
 
+    let stdin_open = session.stdin_input.is_some();
+    let stdin_state = if stdin_open {
+        IconButtonState::Active
+    } else {
+        IconButtonState::Inactive
+    };
+    let stdin_message = if stdin_open {
+        Message::CloseSessionStdin(session_id)
+    } else {
+        Message::OpenSessionStdin(session_id)
+    };
     let stdin = control_button(
-        control_icon(
-            svg::Handle::from_memory(ICON_TERMINAL_INPUT),
-            IconButtonState::Active,
-        ),
-        Some(Message::OpenSessionStdin(session_id)),
-        IconButtonState::Active,
+        control_icon(svg::Handle::from_memory(ICON_TERMINAL_INPUT), stdin_state),
+        Some(stdin_message),
+        stdin_state,
         false,
     );
 

@@ -3081,12 +3081,14 @@ impl RunConfigManager {
         Task::none()
     }
 
-    /// 오버플로 메뉴를 닫아야 하는 상황을 한곳에서 처리한다.
-    /// - 메뉴 항목이 세션 액션을 실행하면 해당 세션의 메뉴를 닫는다(인라인 full
-    ///   컨트롤에서 온 동일 메시지엔 이미 닫혀 있어 무해). `TogglePaneMaximize`는
-    ///   메뉴에 maximize 항목이 있으므로 pane→세션을 거쳐 닫는다.
-    /// - 리사이즈로 레이아웃이 바뀌면 모든 메뉴를 닫는다. pane이 넓어져 full 컨트롤로
-    ///   돌아가면 `⋯`가 사라져 토글로 닫을 수 없게 되는 상태를 막기 위함이다.
+    /// 오버플로 메뉴를 닫아야 하는 상황을 한곳에서 처리한다. 메뉴는 `⋯` 토글로만
+    /// 여닫는 지속 표면이다 — 항목 클릭(rerun/stop/search/stdin/...)은 메뉴를 닫지
+    /// 않아 연속 조작이 가능하다(stop→rerun 등). 닫는 경우는 "`⋯`가 사라져 토글로
+    /// 닫을 수 없게 되는" 레이아웃 변화뿐:
+    /// - 리사이즈/드래그/pane 닫기 → 모든 메뉴 닫기 (pane이 넓어지면 full 컨트롤로
+    ///   전환돼 `⋯` 자체가 사라진다)
+    /// - `TogglePaneMaximize` → 해당 pane 세션의 메뉴 닫기 (maximize로 넓어진 pane도
+    ///   full 컨트롤로 전환된다; 메뉴에 maximize 항목이 있어 pane→세션으로 해석)
     fn close_controls_menu_on_action(&mut self, message: &Message) {
         if matches!(
             message,
@@ -3101,29 +3103,18 @@ impl RunConfigManager {
             return;
         }
 
-        let session_id = match message {
-            Message::RerunSession(id)
-            | Message::StopSession(id)
-            | Message::ToggleAutoScroll(id)
-            | Message::OpenSessionSearch(id)
-            | Message::OpenSessionStdin(id)
-            | Message::ClearSessionOutput(id)
-            | Message::ExportSessionOutput(id) => *id,
-            Message::TogglePaneMaximize(pane_id) => {
-                let Some(session_id) = self
-                    .workspace_tabs
-                    .get(self.selected_tab_index)
-                    .and_then(|tab| tab.pane_layout.get(*pane_id))
-                    .and_then(|pane| pane.session_id)
-                else {
-                    return;
-                };
-                session_id
+        if let Message::TogglePaneMaximize(pane_id) = message {
+            let Some(session_id) = self
+                .workspace_tabs
+                .get(self.selected_tab_index)
+                .and_then(|tab| tab.pane_layout.get(*pane_id))
+                .and_then(|pane| pane.session_id)
+            else {
+                return;
+            };
+            if let Some(session) = self.session_by_id_mut(session_id) {
+                session.controls_menu_open = false;
             }
-            _ => return,
-        };
-        if let Some(session) = self.session_by_id_mut(session_id) {
-            session.controls_menu_open = false;
         }
     }
 
@@ -5768,6 +5759,33 @@ mod tests {
             app.session_by_id_mut(sid).unwrap().stdin_input.as_deref(),
             Some("bx")
         );
+    }
+
+    #[test]
+    fn controls_menu_persists_across_item_actions_but_closes_on_layout_change() {
+        let (mut app, ids) = manager_with_open_panes(&["a"]);
+        let sid = ids[0];
+        let _ = app.handle_toggle_session_controls_menu(sid);
+        assert!(app.session_by_id_mut(sid).unwrap().controls_menu_open);
+
+        // 항목 액션은 메뉴를 닫지 않는다 — 지속 표면(stop→rerun 연속 조작 등).
+        app.close_controls_menu_on_action(&Message::RerunSession(sid));
+        app.close_controls_menu_on_action(&Message::OpenSessionStdin(sid));
+        app.close_controls_menu_on_action(&Message::StopSession(sid));
+        assert!(
+            app.session_by_id_mut(sid).unwrap().controls_menu_open,
+            "menu must stay open across item actions"
+        );
+
+        // maximize는 pane이 넓어져 full 컨트롤로 전환되므로(⋯ 소멸) 닫는다.
+        let pane_id = pane_for_session(&app.workspace_tabs[app.selected_tab_index], sid);
+        app.close_controls_menu_on_action(&Message::TogglePaneMaximize(pane_id));
+        assert!(!app.session_by_id_mut(sid).unwrap().controls_menu_open);
+
+        // 레이아웃 변화(pane 닫기/리사이즈류)는 모든 메뉴를 닫는다.
+        let _ = app.handle_toggle_session_controls_menu(sid);
+        app.close_controls_menu_on_action(&Message::ClosePane(pane_id));
+        assert!(!app.session_by_id_mut(sid).unwrap().controls_menu_open);
     }
 
     #[test]
