@@ -763,6 +763,8 @@ impl RunConfigManager {
             | Message::OpenStdinInActivePane
             | Message::StdinBarKeyPressed(_)
             | Message::StdinBarKeyResolved(_, _)
+            | Message::SessionInterruptRequested(_)
+            | Message::SessionInterruptCompleted(_, _)
             | Message::SearchNextInActivePane
             | Message::SearchPrevInActivePane
             | Message::ClearSessionOutput(_)
@@ -1004,6 +1006,12 @@ impl RunConfigManager {
             Message::StdinBarKeyPressed(key) => self.handle_stdin_bar_key_pressed(key),
             Message::StdinBarKeyResolved(key, focused) => {
                 self.handle_stdin_bar_key_resolved(key, focused)
+            }
+            Message::SessionInterruptRequested(session_id) => {
+                self.handle_session_interrupt_requested(session_id)
+            }
+            Message::SessionInterruptCompleted(session_id, result) => {
+                self.handle_session_interrupt_completed(session_id, result)
             }
             Message::SearchNextInActivePane => match self.search_nav_target() {
                 Some(session_id) => self.handle_session_search_step(session_id, 1),
@@ -2991,6 +2999,56 @@ impl RunConfigManager {
                 }
             }
         }
+    }
+
+    /// ^C 버튼/Ctrl+C 키 공통 진입점 — 실행 중이 아니면 no-op (버튼은 Inactive
+    /// 상태에서도 on_press가 발화하므로 여기서 가드한다).
+    fn handle_session_interrupt_requested(&mut self, session_id: Uuid) -> Task<Message> {
+        let running = self
+            .session_by_id_mut(session_id)
+            .is_some_and(|s| s.is_running);
+        if !running {
+            return Task::none();
+        }
+        Task::perform(
+            crate::services::interrupt_session(session_id),
+            move |result| Message::SessionInterruptCompleted(session_id, result),
+        )
+    }
+
+    /// 인터럽트 결과 처리. 성공은 침묵 — ^C 에코/KeyboardInterrupt 표시는 터미널과
+    /// 자식의 몫이다(에코는 전송의 책임).
+    /// - `Timeout`: stdin 쓰기와 동일한 조기 신호 — ETX가 결국 전달되면 시그널
+    ///   폴백과 이중 인터럽트가 되므로 에스컬레이션하지 않는다(상태 메시지만).
+    /// - `Broken`(PTY 경로 부재/파손 — unix pipe 폴백 세션 등): pid 그룹 SIGINT
+    ///   폴백을 시도하고, 그것도 불가하면(windows <1809 폴백) 상태 메시지로 안내.
+    fn handle_session_interrupt_completed(
+        &mut self,
+        session_id: Uuid,
+        result: Result<(), crate::models::StdinWriteError>,
+    ) -> Task<Message> {
+        use crate::models::StdinWriteError;
+        match result {
+            Ok(()) => {}
+            Err(StdinWriteError::Timeout) => {
+                self.status_message =
+                    String::from("Interrupt pending — the process is not reading input yet");
+            }
+            Err(StdinWriteError::Broken(_)) => {
+                // Stop과 달리 pid를 take하지 않는다 — 인터럽트 후에도 세션은 계속 산다.
+                let pid = self
+                    .sessions
+                    .iter()
+                    .find(|s| s.id == session_id && s.is_running)
+                    .and_then(|s| s.process_pid);
+                let delivered = pid.is_some_and(crate::services::interrupt_session_process);
+                if !delivered {
+                    self.status_message =
+                        String::from("Interrupt is not available for this session");
+                }
+            }
+        }
+        Task::none()
     }
 
     /// Esc: 활성 바 하나만 닫는다. 우선순위 = 포커스 pane stdin → 포커스 pane 검색 →
@@ -5636,6 +5694,27 @@ mod tests {
         assert_eq!(
             app.session_by_id_mut(sid).unwrap().stdin_input.as_deref(),
             Some("bx")
+        );
+    }
+
+    #[test]
+    fn interrupt_completed_broken_without_pid_sets_status() {
+        use crate::models::StdinWriteError;
+        let (mut app, ids) = manager_with_open_panes(&["a"]);
+        let sid = ids[0];
+        {
+            let session = app.session_by_id_mut(sid).unwrap();
+            session.is_running = true;
+            session.process_pid = None; // 시그널 폴백 불가 케이스
+        }
+        let _ = app.handle_session_interrupt_completed(
+            sid,
+            Err(StdinWriteError::Broken(String::from("no writer"))),
+        );
+        assert!(
+            app.status_message.contains("Interrupt"),
+            "user must be told the interrupt could not be delivered: {:?}",
+            app.status_message
         );
     }
 

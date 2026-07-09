@@ -357,6 +357,10 @@ pub enum Message {
     StdinBarKeyPressed(StdinBarKey),
     /// find_focused 조회 결과 — 포커스된 위젯 Id를 stdin 바 세션과 대조해 적용
     StdinBarKeyResolved(StdinBarKey, iced::advanced::widget::Id),
+    /// 실행 중인 세션에 인터럽트(Ctrl+C/ETX) 전송 (`session_id` — ^C 버튼/키 공용)
+    SessionInterruptRequested(Uuid),
+    /// 인터럽트 전송 결과 (`session_id`) — 성공은 침묵(에코는 터미널 몫), 실패만 폴백/안내
+    SessionInterruptCompleted(Uuid, Result<(), crate::models::StdinWriteError>),
     /// 세션 출력 버퍼 비우기 (`session_id`) — 실행 중인 프로세스는 유지, 화면 로그만 클리어
     ClearSessionOutput(Uuid),
     /// 세션 출력을 파일로 내보내기 (`session_id`)
