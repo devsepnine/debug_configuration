@@ -3022,11 +3022,15 @@ impl RunConfigManager {
     }
 
     /// 인터럽트 결과 처리. 성공은 침묵 — ^C 에코/KeyboardInterrupt 표시는 터미널과
-    /// 자식의 몫이다(에코는 전송의 책임).
-    /// - `Timeout`: stdin 쓰기와 동일한 조기 신호 — ETX가 결국 전달되면 시그널
-    ///   폴백과 이중 인터럽트가 되므로 에스컬레이션하지 않는다(상태 메시지만).
-    /// - `Broken`(PTY 경로 부재/파손 — unix pipe 폴백 세션 등): pid 그룹 SIGINT
-    ///   폴백을 시도하고, 그것도 불가하면(windows <1809 폴백) 상태 메시지로 안내.
+    /// 자식의 몫이다(에코는 전송의 책임). 실패 양쪽 모두 pid 그룹 SIGINT 폴백을
+    /// 시도한다:
+    /// - `Timeout`: 쓰기 경로가 막힌 상태(자식이 stdin을 안 읽어 이전 쓰기가 writer
+    ///   mutex를 문 채 블록 등) — 인터럽트가 가장 필요한 순간이므로 에스컬레이션한다.
+    ///   블록됐던 ETX가 뒤늦게 전달돼도 실제 터미널에서 ^C를 두 번 누른 것과
+    ///   동일(SIGINT 2회)이라 무해하다.
+    /// - `Broken`(PTY 경로 부재/파손 — unix pipe 폴백 세션 등).
+    ///
+    /// 폴백도 불가하면(windows <1809 폴백, pid 부재) 상태 메시지로 안내한다.
     fn handle_session_interrupt_completed(
         &mut self,
         session_id: Uuid,
@@ -3036,24 +3040,30 @@ impl RunConfigManager {
         match result {
             Ok(()) => {}
             Err(StdinWriteError::Timeout) => {
-                self.status_message =
-                    String::from("Interrupt pending — the process is not reading input yet");
+                if !self.try_signal_interrupt(session_id) {
+                    self.status_message =
+                        String::from("Interrupt pending — the process is not reading stdin yet");
+                }
             }
             Err(StdinWriteError::Broken(_)) => {
-                // Stop과 달리 pid를 take하지 않는다 — 인터럽트 후에도 세션은 계속 산다.
-                let pid = self
-                    .sessions
-                    .iter()
-                    .find(|s| s.id == session_id && s.is_running)
-                    .and_then(|s| s.process_pid);
-                let delivered = pid.is_some_and(crate::services::interrupt_session_process);
-                if !delivered {
+                if !self.try_signal_interrupt(session_id) {
                     self.status_message =
                         String::from("Interrupt is not available for this session");
                 }
             }
         }
         Task::none()
+    }
+
+    /// pid 그룹 SIGINT 폴백 — 실제로 신호를 보냈으면 true. Stop과 달리 pid를
+    /// take하지 않는다(인터럽트 후에도 세션은 계속 산다). `is_running` 재확인이
+    /// 종료 직후의 낡은 pid로 신호를 쏘는 것을 막는다.
+    fn try_signal_interrupt(&self, session_id: Uuid) -> bool {
+        self.sessions
+            .iter()
+            .find(|s| s.id == session_id && s.is_running)
+            .and_then(|s| s.process_pid)
+            .is_some_and(crate::services::interrupt_session_process)
     }
 
     /// Esc: 활성 바 하나만 닫는다. 우선순위 = 포커스 pane stdin → 포커스 pane 검색 →
@@ -5805,6 +5815,15 @@ mod tests {
         assert!(
             app.status_message.contains("Interrupt"),
             "user must be told the interrupt could not be delivered: {:?}",
+            app.status_message
+        );
+
+        // Timeout도 폴백 불가면 안내한다 (막힌 쓰기 경로의 에스컬레이션 실패 케이스).
+        app.status_message.clear();
+        let _ = app.handle_session_interrupt_completed(sid, Err(StdinWriteError::Timeout));
+        assert!(
+            app.status_message.contains("Interrupt pending"),
+            "timeout without a fallback pid must surface: {:?}",
             app.status_message
         );
     }
