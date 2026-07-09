@@ -2652,7 +2652,14 @@ impl RunConfigManager {
     fn handle_open_url(&mut self, url: &str) -> Task<Message> {
         // 결과를 반영한다. Linux에 xdg-open(xdg-utils)이 없으면 Err가 나는데,
         // 무시하면 "Opening URL"만 표시되고 아무 일도 안 일어나 혼란을 준다.
-        self.status_message = match open::that(url) {
+        // 테스트 빌드는 실제로 열지 않는다 — 이 경로를 지나는 유닛 테스트가
+        // cargo test마다 개발 머신에 진짜 브라우저 탭(가짜 릴리스 페이지 404 등)을
+        // 띄우는 사고가 실제로 있었다. 상태 메시지 계약만 동일하게 유지한다.
+        #[cfg(test)]
+        let result: std::io::Result<()> = Ok(());
+        #[cfg(not(test))]
+        let result = open::that(url);
+        self.status_message = match result {
             Ok(()) => format!("Opening URL: {url}"),
             Err(error) => format!("Failed to open URL: {error}"),
         };
@@ -4132,8 +4139,8 @@ impl RunConfigManager {
         }
 
         let (label, on_press) = match &self.update_available {
-            // 인앱 설치 가능(자산+서명 존재, 미실패) → 클릭 시 확인 모달을 거쳐 설치.
-            // 불가/실패 시에는 RequestInstallUpdate가 릴리스 페이지 열기로 폴백한다.
+            // 클릭 시 확인 모달을 거쳐 설치. 인앱 설치 불가/실패 시에는 모달이
+            // 수동 모드로 열리고 확정 후에만 릴리스 페이지를 연다 (오클릭 방지).
             Some(update) => (
                 format!("v{current} → v{latest} ⬆", latest = update.latest),
                 Message::RequestInstallUpdate,
@@ -5229,6 +5236,7 @@ impl RunConfigManager {
                 // 열림 이후의 세션 변화도 반영되도록 매 프레임 현재 상태로 계산한다
                 // (열림 시점 스냅샷은 세션을 멈춰도 버튼이 계속 죽어 있게 된다).
                 running_sessions: self.sessions.iter().filter(|s| s.is_running).count(),
+                manual: modal.manual,
             };
             layers = layers.push(view_confirm_update_modal(props));
         }

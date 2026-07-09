@@ -878,13 +878,18 @@ pub struct ConfirmUpdateModalView<'a> {
     pub current: &'a str,
     /// 설치할 새 버전 (v 접두사 없는 형태).
     pub latest: &'a str,
-    /// 실행 중 세션 수. 0이 아니면 Update 버튼을 비활성화하고 사유를 표시한다.
+    /// 실행 중 세션 수. 인앱 모드에서 0이 아니면 Update 버튼을 비활성화하고
+    /// 사유를 표시한다 (수동 모드는 브라우저만 열므로 무관).
     pub running_sessions: usize,
+    /// true = 인앱 설치 불가/실패 — 확정이 릴리스 페이지를 브라우저로 연다.
+    pub manual: bool,
 }
 
-/// 인앱 업데이트 확인 모달. 설치가 성공하면 앱이 곧바로 재시작되므로 확인을 받는다.
-/// 실행 중 세션이 있으면 Update가 비활성화되고 사유가 표시된다 (재시작이 프로세스를
-/// 죽이므로). 다른 확인 모달과 동일한 오버레이 패턴이며 Cancel / X / Esc 로 닫는다.
+/// 인앱 업데이트 확인 모달. 설치가 성공하면 앱이 곧바로 재시작되므로 확인을 받고,
+/// 인앱 설치가 불가한 수동 모드에서도 브라우저를 열기 전에 확인을 받는다(오클릭
+/// 방지). 인앱 모드에서 실행 중 세션이 있으면 Update가 비활성화되고 사유가
+/// 표시된다 (재시작이 프로세스를 죽이므로). 다른 확인 모달과 동일한 오버레이
+/// 패턴이며 Cancel / X / Esc 로 닫는다.
 pub fn view_confirm_update_modal<'a>(props: ConfirmUpdateModalView<'a>) -> Element<'a, Message> {
     let header = row![
         text("Update Available").size(15),
@@ -894,14 +899,20 @@ pub fn view_confirm_update_modal<'a>(props: ConfirmUpdateModalView<'a>) -> Eleme
     .align_y(Alignment::Center)
     .width(Length::Fill);
 
-    let blocked = props.running_sessions > 0;
+    // 수동 모드는 브라우저만 열므로 세션이 돌고 있어도 막지 않는다.
+    let blocked = !props.manual && props.running_sessions > 0;
+    let secondary = if props.manual {
+        "In-app install isn't available for this update — the release page will open in your browser."
+    } else {
+        "The app will restart automatically to finish the update."
+    };
     let mut body = column![
         text(format!(
             "Update from v{} to v{}?",
             props.current, props.latest
         ))
         .size(13),
-        text("The app will restart automatically to finish the update.")
+        text(secondary)
             .size(12)
             .color(Color::from_rgba8(255, 255, 255, 0.55)),
     ]
@@ -924,8 +935,13 @@ pub fn view_confirm_update_modal<'a>(props: ConfirmUpdateModalView<'a>) -> Eleme
         Space::new().height(16),
         modal_footer(
             Message::CancelInstallUpdate,
-            "Update",
-            // 실행 중 세션이 있으면 비활성화 (None → on_press_maybe가 disabled 처리).
+            if props.manual {
+                "Open Release Page"
+            } else {
+                "Update"
+            },
+            // 인앱 모드에서 실행 중 세션이 있으면 비활성화
+            // (None → on_press_maybe가 disabled 처리).
             (!blocked).then_some(Message::ConfirmInstallUpdate),
         ),
     ];
