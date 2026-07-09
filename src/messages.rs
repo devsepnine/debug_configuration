@@ -16,6 +16,16 @@ pub enum ViewMode {
     Sessions,
 }
 
+/// stdin 입력바 전용 키 식별자. 구독은 키 정체만 실어 보내고, 어느 세션의 바가
+/// 대상인지는 핸들러가 포커스된 위젯 Id(find_focused)로 판정한다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StdinBarKey {
+    /// ↑ — 히스토리에서 한 단계 과거로
+    HistoryOlder,
+    /// ↓ — 한 단계 최신으로 (최신을 지나면 타이핑 중이던 드래프트 복원)
+    HistoryNewer,
+}
+
 /// 애플리케이션의 모든 이벤트와 액션을 정의하는 메시지 타입
 /// Elm Architecture의 Message 패턴을 따름
 #[derive(Debug, Clone)]
@@ -342,6 +352,11 @@ pub enum Message {
     SessionStdinWriteCompleted(Uuid, String, Result<bool, crate::models::StdinWriteError>),
     /// 활성 pane 세션에 stdin 바 열기 (Cmd+I — 대상은 핸들러가 해석, Sessions 뷰 전용)
     OpenStdinInActivePane,
+    /// stdin 바 전용 키 눌림 (↑/↓ 히스토리). 구독 클로저는 self를 캡처할 수 없어
+    /// 대상 세션 해석은 핸들러가 find_focused 위젯 조회로 수행한다.
+    StdinBarKeyPressed(StdinBarKey),
+    /// find_focused 조회 결과 — 포커스된 위젯 Id를 stdin 바 세션과 대조해 적용
+    StdinBarKeyResolved(StdinBarKey, iced::advanced::widget::Id),
     /// 세션 출력 버퍼 비우기 (`session_id`) — 실행 중인 프로세스는 유지, 화면 로그만 클리어
     ClearSessionOutput(Uuid),
     /// 세션 출력을 파일로 내보내기 (`session_id`)

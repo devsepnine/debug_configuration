@@ -1,4 +1,4 @@
-use crate::messages::{ConfigurationDropPosition, Message, ViewMode};
+use crate::messages::{ConfigurationDropPosition, Message, StdinBarKey, ViewMode};
 use crate::models::{
     ConfigTypeData, ConfigurationType, ExecuteMode, ExecuteModeType, KotlinLaunchMode,
     KotlinLaunchModeType, LayoutId, PackageManager, RunConfiguration, RunSession, SearchState,
@@ -761,6 +761,8 @@ impl RunConfigManager {
             | Message::SessionStdinSubmitted(_)
             | Message::SessionStdinWriteCompleted(_, _, _)
             | Message::OpenStdinInActivePane
+            | Message::StdinBarKeyPressed(_)
+            | Message::StdinBarKeyResolved(_, _)
             | Message::SearchNextInActivePane
             | Message::SearchPrevInActivePane
             | Message::ClearSessionOutput(_)
@@ -999,6 +1001,10 @@ impl RunConfigManager {
                 Some(session_id) => self.handle_open_session_stdin(session_id),
                 None => Task::none(),
             },
+            Message::StdinBarKeyPressed(key) => self.handle_stdin_bar_key_pressed(key),
+            Message::StdinBarKeyResolved(key, focused) => {
+                self.handle_stdin_bar_key_resolved(key, focused)
+            }
             Message::SearchNextInActivePane => match self.search_nav_target() {
                 Some(session_id) => self.handle_session_search_step(session_id, 1),
                 None => Task::none(),
@@ -2942,6 +2948,51 @@ impl RunConfigManager {
         Task::none()
     }
 
+    /// stdin 바 키(↑/↓)의 공통 진입점: 실제 포커스된 위젯 Id를 조회해 해석 메시지로
+    /// 되돌린다. 구독 클로저는 self를 캡처할 수 없고, pane 포커스는 위젯 포커스와
+    /// 다를 수 있어(검색 입력 포커스 등) find_focused가 권위 판정이다. 포커스된
+    /// 위젯이 없으면 오퍼레이션이 Outcome::None으로 끝나 메시지가 발화되지 않는다.
+    fn handle_stdin_bar_key_pressed(&mut self, key: StdinBarKey) -> Task<Message> {
+        if !self.sessions.iter().any(|s| s.stdin_input.is_some()) {
+            return Task::none();
+        }
+        iced::advanced::widget::operate(
+            iced::advanced::widget::operation::focusable::find_focused(),
+        )
+        .map(move |focused| Message::StdinBarKeyResolved(key, focused))
+    }
+
+    /// find_focused 결과를 stdin 바로 라우팅한다. 포커스 Id가 stdin 바가 열린 어떤
+    /// 세션의 입력과도 일치하지 않으면(검색창/탭 이름 편집 등) no-op — 히스토리 키가
+    /// 다른 입력의 캐럿 조작과 충돌하지 않는 안전핀.
+    fn handle_stdin_bar_key_resolved(
+        &mut self,
+        key: StdinBarKey,
+        focused: iced::advanced::widget::Id,
+    ) -> Task<Message> {
+        let Some(session) = self
+            .sessions
+            .iter_mut()
+            .filter(|s| s.stdin_input.is_some())
+            .find(|s| crate::views::shared::session_stdin_input_id(s.id) == focused)
+        else {
+            return Task::none();
+        };
+        match key {
+            StdinBarKey::HistoryOlder | StdinBarKey::HistoryNewer => {
+                let older = matches!(key, StdinBarKey::HistoryOlder);
+                if session.navigate_stdin_history(older) {
+                    // 드래프트 교체 후 캐럿은 이전 오프셋에 남으므로 끝으로 보낸다.
+                    iced::widget::operation::move_cursor_to_end(
+                        crate::views::shared::session_stdin_input_id(session.id),
+                    )
+                } else {
+                    Task::none()
+                }
+            }
+        }
+    }
+
     /// Esc: 활성 바 하나만 닫는다. 우선순위 = 포커스 pane stdin → 포커스 pane 검색 →
     /// 임의 stdin-open 세션 → 임의 search-open 세션 (LIFO 근사 — 나중에 연 표면 먼저).
     fn handle_close_active_bar(&mut self) -> Task<Message> {
@@ -3191,6 +3242,28 @@ impl RunConfigManager {
                     ',' => Some(Message::OpenSettingsModal),
                     _ => None,
                 }
+            }
+            _ => None,
+        }
+    }
+
+    /// stdin 바 전용 키 매칭 (구독 클로저는 fn 포인터 — 대상 해석은
+    /// `handle_stdin_bar_key_pressed`의 find_focused가 담당).
+    /// ↑/↓는 수식키 없음 + `Status::Ignored`만 받는다 — iced text_input은 수직
+    /// 방향키를 캡처하지 않아 포커스 중에도 Ignored로 도달하고, 게이트는 미래에
+    /// 방향키를 캡처하는 위젯이 생겨도 이중 발화를 막는 위생 장치다.
+    fn stdin_bar_key_message(
+        key: &keyboard::Key,
+        modifiers: keyboard::Modifiers,
+        status: event::Status,
+    ) -> Option<Message> {
+        let arrow_eligible = modifiers.is_empty() && matches!(status, event::Status::Ignored);
+        match key {
+            keyboard::Key::Named(keyboard::key::Named::ArrowUp) if arrow_eligible => {
+                Some(Message::StdinBarKeyPressed(StdinBarKey::HistoryOlder))
+            }
+            keyboard::Key::Named(keyboard::key::Named::ArrowDown) if arrow_eligible => {
+                Some(Message::StdinBarKeyPressed(StdinBarKey::HistoryNewer))
             }
             _ => None,
         }
@@ -4901,6 +4974,21 @@ impl RunConfigManager {
             Subscription::none()
         };
 
+        // stdin 바 키(↑/↓ 히스토리): 어떤 세션이든 stdin 바가 열려 있을 때만 활성.
+        // 어느 바가 대상인지는 핸들러의 find_focused 조회가 판정한다.
+        let stdin_bar_keys_active =
+            sessions_active && self.sessions.iter().any(|s| s.stdin_input.is_some());
+        let stdin_bar_key_subscription = if stdin_bar_keys_active {
+            event::listen_with(|event, status, _id| match event {
+                Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) => {
+                    Self::stdin_bar_key_message(&key, modifiers, status)
+                }
+                _ => None,
+            })
+        } else {
+            Subscription::none()
+        };
+
         // F1/F2 = 화면 전환(Configurations/Sessions), Cmd+1~9 = 해당 워크스페이스로 점프.
         // 모달이 열려 있거나 탭 이름 편집 중이면 비활성화해 입력/모달 작업을 보호한다.
         // 키→메시지 매핑은 nav_shortcut_message로 추출해 단위 테스트와 공유한다.
@@ -4945,6 +5033,7 @@ impl RunConfigManager {
             search_open_subscription,
             bar_close_subscription,
             search_nav_subscription,
+            stdin_bar_key_subscription,
             nav_shortcut_subscription,
             session_timer_subscription,
             update_spinner_subscription,
@@ -5446,6 +5535,127 @@ mod tests {
             .find(|s| s.config_name == "a")
             .expect("session survives rerun");
         assert_eq!(session.stdin_history, vec!["cmd"]);
+    }
+
+    #[test]
+    fn stdin_bar_key_message_maps_arrows_only_when_ignored() {
+        use keyboard::key::Named;
+        let up = keyboard::Key::Named(Named::ArrowUp);
+        let down = keyboard::Key::Named(Named::ArrowDown);
+        assert!(matches!(
+            RunConfigManager::stdin_bar_key_message(
+                &up,
+                keyboard::Modifiers::empty(),
+                event::Status::Ignored
+            ),
+            Some(Message::StdinBarKeyPressed(StdinBarKey::HistoryOlder))
+        ));
+        assert!(matches!(
+            RunConfigManager::stdin_bar_key_message(
+                &down,
+                keyboard::Modifiers::empty(),
+                event::Status::Ignored
+            ),
+            Some(Message::StdinBarKeyPressed(StdinBarKey::HistoryNewer))
+        ));
+        // 위젯이 캡처한 방향키와 수식키 조합은 무시.
+        assert!(
+            RunConfigManager::stdin_bar_key_message(
+                &up,
+                keyboard::Modifiers::empty(),
+                event::Status::Captured
+            )
+            .is_none()
+        );
+        assert!(
+            RunConfigManager::stdin_bar_key_message(
+                &up,
+                keyboard::Modifiers::SHIFT,
+                event::Status::Ignored
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn stdin_history_resolved_walks_and_restores_draft() {
+        let (mut app, ids) = manager_with_open_panes(&["a"]);
+        let sid = ids[0];
+        app.session_by_id_mut(sid).unwrap().is_running = true;
+        let _ = app.handle_open_session_stdin(sid);
+        for line in ["a", "b"] {
+            let _ = app.handle_session_stdin_changed(sid, String::from(line));
+            let _ = app.handle_session_stdin_submitted(sid);
+        }
+        let _ = app.handle_session_stdin_changed(sid, String::from("typing"));
+
+        let input_id = crate::views::shared::session_stdin_input_id(sid);
+        let draft = |app: &mut RunConfigManager| {
+            app.session_by_id_mut(sid)
+                .unwrap()
+                .stdin_input
+                .clone()
+                .unwrap()
+        };
+
+        let _ = app.handle_stdin_bar_key_resolved(StdinBarKey::HistoryOlder, input_id.clone());
+        assert_eq!(draft(&mut app), "b");
+        let _ = app.handle_stdin_bar_key_resolved(StdinBarKey::HistoryOlder, input_id.clone());
+        assert_eq!(draft(&mut app), "a");
+        // 가장 오래된 항목에서 정지.
+        let _ = app.handle_stdin_bar_key_resolved(StdinBarKey::HistoryOlder, input_id.clone());
+        assert_eq!(draft(&mut app), "a");
+        let _ = app.handle_stdin_bar_key_resolved(StdinBarKey::HistoryNewer, input_id.clone());
+        assert_eq!(draft(&mut app), "b");
+        // 최신을 지나면 타이핑 중이던 드래프트 복원.
+        let _ = app.handle_stdin_bar_key_resolved(StdinBarKey::HistoryNewer, input_id);
+        assert_eq!(draft(&mut app), "typing");
+    }
+
+    #[test]
+    fn stdin_history_edit_resets_cursor_midway() {
+        let (mut app, ids) = manager_with_open_panes(&["a"]);
+        let sid = ids[0];
+        app.session_by_id_mut(sid).unwrap().is_running = true;
+        let _ = app.handle_open_session_stdin(sid);
+        for line in ["a", "b"] {
+            let _ = app.handle_session_stdin_changed(sid, String::from(line));
+            let _ = app.handle_session_stdin_submitted(sid);
+        }
+
+        let input_id = crate::views::shared::session_stdin_input_id(sid);
+        let _ = app.handle_stdin_bar_key_resolved(StdinBarKey::HistoryOlder, input_id.clone());
+        // 열람 중 수동 편집 → 탐색이 끝나고 편집본이 새 라이브 드래프트가 된다.
+        let _ = app.handle_session_stdin_changed(sid, String::from("bx"));
+        let _ = app.handle_stdin_bar_key_resolved(StdinBarKey::HistoryOlder, input_id.clone());
+        assert_eq!(
+            app.session_by_id_mut(sid).unwrap().stdin_input.as_deref(),
+            Some("b")
+        );
+        let _ = app.handle_stdin_bar_key_resolved(StdinBarKey::HistoryNewer, input_id);
+        assert_eq!(
+            app.session_by_id_mut(sid).unwrap().stdin_input.as_deref(),
+            Some("bx")
+        );
+    }
+
+    #[test]
+    fn stdin_history_resolved_ignores_foreign_widget_id() {
+        let (mut app, ids) = manager_with_open_panes(&["a"]);
+        let sid = ids[0];
+        app.session_by_id_mut(sid).unwrap().is_running = true;
+        let _ = app.handle_open_session_stdin(sid);
+        let _ = app.handle_session_stdin_changed(sid, String::from("x"));
+        let _ = app.handle_session_stdin_submitted(sid);
+        let _ = app.handle_session_stdin_changed(sid, String::from("typing"));
+
+        // 검색 입력 등 다른 위젯이 포커스면 히스토리 키는 no-op.
+        let foreign = crate::views::shared::session_search_input_id(sid);
+        let _ = app.handle_stdin_bar_key_resolved(StdinBarKey::HistoryOlder, foreign);
+        assert_eq!(
+            app.session_by_id_mut(sid).unwrap().stdin_input.as_deref(),
+            Some("typing")
+        );
     }
 
     #[test]

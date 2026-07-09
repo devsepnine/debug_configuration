@@ -274,6 +274,49 @@ impl RunSession {
         self.stdin_saved_draft = None;
     }
 
+    /// 히스토리 탐색 한 스텝(`older`=↑ / `!older`=↓). 드래프트(`stdin_input`)를 이력
+    /// 항목으로 교체하고, 탐색 진입 시 라이브 드래프트를 보관했다가 최신 항목을 지나
+    /// 내려오면 복원한다(bash 동작). 드래프트가 바뀌면 true — 호출측이 캐럿 끝 이동
+    /// op를 발행한다. 바가 닫혀 있거나 이력이 비면 no-op.
+    pub fn navigate_stdin_history(&mut self, older: bool) -> bool {
+        let Some(draft) = self.stdin_input.as_mut() else {
+            return false;
+        };
+        if self.stdin_history.is_empty() {
+            return false;
+        }
+        match (self.stdin_history_cursor, older) {
+            // 첫 ↑: 라이브 드래프트를 보관하고 최신 항목을 연다.
+            (None, true) => {
+                self.stdin_saved_draft = Some(std::mem::take(draft));
+                let idx = self.stdin_history.len() - 1;
+                *draft = self.stdin_history[idx].clone();
+                self.stdin_history_cursor = Some(idx);
+                true
+            }
+            // 라이브 드래프트에서의 ↓는 갈 곳이 없다.
+            (None, false) => false,
+            // 가장 오래된 항목에서 ↑는 정지.
+            (Some(0), true) => false,
+            (Some(i), true) => {
+                *draft = self.stdin_history[i - 1].clone();
+                self.stdin_history_cursor = Some(i - 1);
+                true
+            }
+            (Some(i), false) => {
+                if i + 1 < self.stdin_history.len() {
+                    *draft = self.stdin_history[i + 1].clone();
+                    self.stdin_history_cursor = Some(i + 1);
+                } else {
+                    // 최신 항목을 지나 내려오면 보관한 드래프트를 복원하고 탐색 종료.
+                    *draft = self.stdin_saved_draft.take().unwrap_or_default();
+                    self.stdin_history_cursor = None;
+                }
+                true
+            }
+        }
+    }
+
     /// 검색 매치 캐시(`search.matches`)를 현재 출력/검색어로 갱신하고 `current`를
     /// 범위 내로 클램프한다. 출력 추가/검색어 변경 등 상태 변화 시 `update()`에서
     /// 호출한다. 검색바가 닫혀 있으면(`search` None) no-op.
@@ -994,5 +1037,58 @@ mod tests {
         session.push_stdin_history("a");
         session.push_stdin_history("");
         assert_eq!(session.stdin_history, vec!["a"]);
+    }
+
+    #[test]
+    fn stdin_history_navigation_walks_and_restores_draft() {
+        let mut session = RunSession::new("x".to_string());
+        // 바 닫힘 → no-op.
+        assert!(!session.navigate_stdin_history(true));
+        // 바 열림 + 이력 없음 → no-op.
+        session.stdin_input = Some(String::from("typing"));
+        assert!(!session.navigate_stdin_history(true));
+
+        session.push_stdin_history("a");
+        session.push_stdin_history("b");
+        session.stdin_input = Some(String::from("typing"));
+
+        // 라이브 드래프트에서 ↓는 갈 곳이 없다.
+        assert!(!session.navigate_stdin_history(false));
+        // ↑: 드래프트 보관 + 최신("b").
+        assert!(session.navigate_stdin_history(true));
+        assert_eq!(session.stdin_input.as_deref(), Some("b"));
+        // ↑: "a".
+        assert!(session.navigate_stdin_history(true));
+        assert_eq!(session.stdin_input.as_deref(), Some("a"));
+        // 가장 오래된 항목에서 ↑ 정지.
+        assert!(!session.navigate_stdin_history(true));
+        assert_eq!(session.stdin_input.as_deref(), Some("a"));
+        // ↓: "b" → ↓: 보관 드래프트 복원.
+        assert!(session.navigate_stdin_history(false));
+        assert_eq!(session.stdin_input.as_deref(), Some("b"));
+        assert!(session.navigate_stdin_history(false));
+        assert_eq!(session.stdin_input.as_deref(), Some("typing"));
+        // 복원 후 ↓는 다시 no-op.
+        assert!(!session.navigate_stdin_history(false));
+    }
+
+    #[test]
+    fn stdin_history_edit_resets_navigation() {
+        let mut session = RunSession::new("x".to_string());
+        session.push_stdin_history("a");
+        session.push_stdin_history("b");
+        session.stdin_input = Some(String::from("draft"));
+        assert!(session.navigate_stdin_history(true));
+        assert_eq!(session.stdin_input.as_deref(), Some("b"));
+
+        // 수동 편집 시뮬레이션 (app 핸들러와 동일 순서: 대입 후 탐색 리셋).
+        session.stdin_input = Some(String::from("bx"));
+        session.reset_stdin_history_navigation();
+
+        // 다음 ↑는 편집본("bx")을 새로 보관하고 최신부터 다시 연다.
+        assert!(session.navigate_stdin_history(true));
+        assert_eq!(session.stdin_input.as_deref(), Some("b"));
+        assert!(session.navigate_stdin_history(false));
+        assert_eq!(session.stdin_input.as_deref(), Some("bx"));
     }
 }
