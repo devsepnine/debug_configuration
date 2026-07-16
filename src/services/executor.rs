@@ -3119,13 +3119,23 @@ mod tests {
         #[tokio::test]
         async fn pty_interrupt_stops_foreground_child() {
             // interrupt_session의 ETX(0x03)가 slave 라인 디시플린(cooked, ISIG)을
-            // 거쳐 fg 프로세스 그룹의 SIGINT로 번역되는지 종단 확인. 전달이 안 되면
-            // sleep 30이 아래 10s 타임아웃을 뚫어 실패한다. 종료 코드는 셸/OS별로
-            // 다르므로(130, 시그널 매핑 등) "즉시 종료" 자체만 단언한다.
+            // 거쳐 fg 프로세스 그룹에 SIGINT로 **전달**되는지 종단 확인. 자식은
+            // SIGINT 처분을 SIG_DFL로 명시 복원하는 python3를 쓴다 — GitHub Actions
+            // 러너는 스텝 프로세스에 SIGINT를 SIG_IGN으로 물려주는데(실측: `sleep`
+            // 자식이 ^C 에코 후에도 생존), POSIX 셸은 "진입 시 무시된 시그널"을
+            // trap으로도 되살릴 수 없어 기본 처분 의존 자식은 러너에서 검증이
+            // 불가하다. 임의 프로그램은 핸들러 설치가 가능하므로 python이 전달
+            // 여부만 정확히 검증한다. (프로덕션은 무관 — exec는 '핸들러'를 SIG_DFL로
+            // 리셋하고 SIG_IGN만 상속되는데, 앱은 SIGINT 핸들러를 설치하므로 세션
+            // 자식은 항상 SIG_DFL로 시작한다.)
             let config = test_config("/tmp");
             let session_id = Uuid::new_v4();
-            let pty = match spawn_in_pty(&config, "echo ready; sleep 30", &[], session_id, (80, 24))
-            {
+            let command = "command -v python3 >/dev/null 2>&1 || { echo no-python3; exit 0; }; \
+                 python3 -u -c 'import signal, time; \
+signal.signal(signal.SIGINT, signal.SIG_DFL); \
+print(\"ready\"); \
+time.sleep(30)'";
+            let pty = match spawn_in_pty(&config, command, &[], session_id, (80, 24)) {
                 Ok(p) => p,
                 Err(PtySpawnError::PtyUnavailable(_)) => {
                     eprintln!("[skip] pty unavailable in this environment");
@@ -3136,12 +3146,21 @@ mod tests {
             let mut chunks_rx = pty.chunks_rx;
             // 자식이 실제로 돌기 시작한 것을 "ready"로 확인한 뒤 인터럽트를 쏜다.
             let mut collected = Vec::new();
-            while !String::from_utf8_lossy(&collected).contains("ready") {
+            loop {
                 let chunk = tokio::time::timeout(Duration::from_secs(10), chunks_rx.recv())
                     .await
                     .expect("initial output within 10s")
                     .expect("stream open before ready marker");
                 collected.extend_from_slice(&chunk);
+                let text = String::from_utf8_lossy(&collected);
+                if text.contains("no-python3") {
+                    eprintln!("[skip] python3 unavailable — interrupt delivery not verifiable");
+                    unregister_session_io(session_id);
+                    return;
+                }
+                if text.contains("ready") {
+                    break;
+                }
             }
 
             interrupt_session(session_id)
