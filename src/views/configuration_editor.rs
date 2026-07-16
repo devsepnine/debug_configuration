@@ -12,7 +12,7 @@ use iced::{
     alignment::{Horizontal, Vertical},
     widget::{
         Column, Space, button, center, checkbox, column, combo_box, container, opaque, row, svg,
-        text, text_input,
+        text, text_editor, text_input,
     },
 };
 use std::fmt::Display;
@@ -121,6 +121,7 @@ pub fn view_configuration_editor<'a>(
     select_state: &'a EditorSelectState,
     available_node_runtimes: &'a [(String, String)],
     available_jdks: &'a [(String, String)],
+    script_editor: &'a text_editor::Content,
 ) -> Element<'a, Message> {
     let Some(index) = selected_config_index else {
         return view_empty_configuration_editor();
@@ -138,6 +139,7 @@ pub fn view_configuration_editor<'a>(
             loading.file_dialog.script_file,
             loading.file_dialog.interpreter,
             select_state,
+            script_editor,
         ),
         ConfigTypeData::Node {
             project_directory,
@@ -345,6 +347,34 @@ where
         .size(14)
         .width(Length::Fill)
         .input_style(flat_text_input_style)
+}
+
+/// `flat_text_input_style`의 text_editor 판 — 같은 배경/보더/포커스 규칙 (icon 필드만 없음).
+fn flat_text_editor_style(theme: &Theme, status: text_editor::Status) -> text_editor::Style {
+    let _palette = theme.extended_palette();
+    let base = Color::from_rgba8(17, 19, 24, 1.0);
+    let line = Color::from_rgba8(255, 255, 255, 0.08);
+    let hover_line = Color::from_rgba8(255, 255, 255, 0.14);
+    let focus_line = Color::from_rgba8(96, 138, 255, 0.72);
+
+    let border_color = match status {
+        text_editor::Status::Active => line,
+        text_editor::Status::Hovered => hover_line,
+        text_editor::Status::Focused { .. } => focus_line,
+        text_editor::Status::Disabled => Color::from_rgba8(255, 255, 255, 0.04),
+    };
+
+    text_editor::Style {
+        background: Background::Color(Color { a: 1.0, ..base }),
+        border: Border {
+            radius: 4.0.into(),
+            width: 1.0,
+            color: border_color,
+        },
+        placeholder: Color::from_rgba8(255, 255, 255, 0.30),
+        value: Color::from_rgba8(255, 255, 255, 0.88),
+        selection: Color::from_rgba8(95, 140, 255, 0.28),
+    }
 }
 
 fn flat_text_input_style(theme: &Theme, status: text_input::Status) -> text_input::Style {
@@ -878,13 +908,18 @@ pub struct ConfirmUpdateModalView<'a> {
     pub current: &'a str,
     /// 설치할 새 버전 (v 접두사 없는 형태).
     pub latest: &'a str,
-    /// 실행 중 세션 수. 0이 아니면 Update 버튼을 비활성화하고 사유를 표시한다.
+    /// 실행 중 세션 수. 인앱 모드에서 0이 아니면 Update 버튼을 비활성화하고
+    /// 사유를 표시한다 (수동 모드는 브라우저만 열므로 무관).
     pub running_sessions: usize,
+    /// true = 인앱 설치 불가/실패 — 확정이 릴리스 페이지를 브라우저로 연다.
+    pub manual: bool,
 }
 
-/// 인앱 업데이트 확인 모달. 설치가 성공하면 앱이 곧바로 재시작되므로 확인을 받는다.
-/// 실행 중 세션이 있으면 Update가 비활성화되고 사유가 표시된다 (재시작이 프로세스를
-/// 죽이므로). 다른 확인 모달과 동일한 오버레이 패턴이며 Cancel / X / Esc 로 닫는다.
+/// 인앱 업데이트 확인 모달. 설치가 성공하면 앱이 곧바로 재시작되므로 확인을 받고,
+/// 인앱 설치가 불가한 수동 모드에서도 브라우저를 열기 전에 확인을 받는다(오클릭
+/// 방지). 인앱 모드에서 실행 중 세션이 있으면 Update가 비활성화되고 사유가
+/// 표시된다 (재시작이 프로세스를 죽이므로). 다른 확인 모달과 동일한 오버레이
+/// 패턴이며 Cancel / X / Esc 로 닫는다.
 pub fn view_confirm_update_modal<'a>(props: ConfirmUpdateModalView<'a>) -> Element<'a, Message> {
     let header = row![
         text("Update Available").size(15),
@@ -894,14 +929,20 @@ pub fn view_confirm_update_modal<'a>(props: ConfirmUpdateModalView<'a>) -> Eleme
     .align_y(Alignment::Center)
     .width(Length::Fill);
 
-    let blocked = props.running_sessions > 0;
+    // 수동 모드는 브라우저만 열므로 세션이 돌고 있어도 막지 않는다.
+    let blocked = !props.manual && props.running_sessions > 0;
+    let secondary = if props.manual {
+        "In-app install isn't available for this update — the release page will open in your browser."
+    } else {
+        "The app will restart automatically to finish the update."
+    };
     let mut body = column![
         text(format!(
             "Update from v{} to v{}?",
             props.current, props.latest
         ))
         .size(13),
-        text("The app will restart automatically to finish the update.")
+        text(secondary)
             .size(12)
             .color(Color::from_rgba8(255, 255, 255, 0.55)),
     ]
@@ -924,8 +965,13 @@ pub fn view_confirm_update_modal<'a>(props: ConfirmUpdateModalView<'a>) -> Eleme
         Space::new().height(16),
         modal_footer(
             Message::CancelInstallUpdate,
-            "Update",
-            // 실행 중 세션이 있으면 비활성화 (None → on_press_maybe가 disabled 처리).
+            if props.manual {
+                "Open Release Page"
+            } else {
+                "Update"
+            },
+            // 인앱 모드에서 실행 중 세션이 있으면 비활성화
+            // (None → on_press_maybe가 disabled 처리).
             (!blocked).then_some(Message::ConfirmInstallUpdate),
         ),
     ];
@@ -1500,6 +1546,7 @@ fn view_shell_script_fields<'a>(
     is_loading_script_file: bool,
     is_loading_interpreter: bool,
     select_state: &'a EditorSelectState,
+    script_editor: &'a text_editor::Content,
 ) -> Element<'a, Message> {
     // 현재 모드 타입 결정
     let current_mode_type = match execute_mode {
@@ -1528,7 +1575,7 @@ fn view_shell_script_fields<'a>(
         ExecuteMode::ScriptFile { .. } => {
             view_script_file_fields(execute_mode, is_loading_script_file, is_loading_interpreter)
         }
-        ExecuteMode::ScriptText { .. } => view_script_text_fields(execute_mode),
+        ExecuteMode::ScriptText { .. } => view_script_text_fields(script_editor),
     };
 
     column![mode_row, Space::new().height(10), mode_fields]
@@ -1664,19 +1711,26 @@ fn view_script_file_fields(
 }
 
 /// Script Text 모드 필드 렌더링
-fn view_script_text_fields(execute_mode: &ExecuteMode) -> Element<'_, Message> {
-    let ExecuteMode::ScriptText { script_text } = execute_mode else {
-        unreachable!();
-    };
-
+/// Script Text 모드 필드: 멀티라인 에디터. 버퍼(`Content`)는 앱 상태가 소유하고
+/// `sync_script_editor`가 모델과 동기화한다 — 여기서는 렌더와 액션 전달만.
+/// Enter=개행, Tab=폼 포커스 순환(위젯이 Tab을 캡처하지 않음), 한글 IME 조합은
+/// 위젯 내장 preedit가 처리한다. max_height 초과분은 에디터 내부 스크롤.
+fn view_script_text_fields(script_editor: &text_editor::Content) -> Element<'_, Message> {
     let text_label = text("Script Text:").size(12).style(editor_label_style);
-    let text_area =
-        editor_input("Enter script here...", script_text).on_input(Message::ScriptTextChanged);
+    let editor = text_editor(script_editor)
+        .placeholder("Enter script here...")
+        .size(14)
+        .padding([7, 10])
+        .font(crate::D2CODING)
+        .min_height(90)
+        .max_height(340)
+        .style(flat_text_editor_style)
+        .on_action(Message::ScriptTextEdited);
 
     column![
         text_label,
         Space::new().height(5),
-        container(text_area).width(Length::Fill),
+        container(editor).width(Length::Fill),
     ]
     .width(Length::Fill)
     .into()

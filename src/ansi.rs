@@ -206,9 +206,27 @@ pub fn parse_ansi_text(text: &str) -> Vec<TextSegment> {
                     let mut params = String::new();
                     for next_ch in chars.by_ref() {
                         if ('\u{40}'..='\u{7e}').contains(&next_ch) {
-                            // 'm'(SGR)만 해석, 나머지 CSI는 폐기
-                            if next_ch == 'm' {
-                                parse_sgr_params(&params, &mut state);
+                            match next_ch {
+                                // SGR만 상태 해석.
+                                'm' => parse_sgr_params(&params, &mut state),
+                                // CUF(커서 전진)는 공백 런의 인코딩으로 쓰인다 (ConPTY가
+                                // 표 레이아웃의 빈 칸을 이걸로 내보냄) — 버리면 컬럼이
+                                // 붕괴하므로 공백으로 복원한다. 단 **스타일 중립 세그먼트**
+                                // 로 방출한다: 진짜 터미널의 CUF는 칠하지 않고 건너뛰므로,
+                                // 활성 배경색을 입히면 존재하지 않는 색 막대가 생긴다.
+                                // 파라미터는 첫 토큰만, 비숫자(?/> 등)는 1로 강등, 512 캡
+                                // (ESC[9999999C 류 메모리 방어).
+                                'C' => {
+                                    let n = params
+                                        .split(';')
+                                        .next()
+                                        .and_then(|t| t.parse::<usize>().ok())
+                                        .unwrap_or(1)
+                                        .clamp(1, 512);
+                                    segments.push(TextSegment::new(" ".repeat(n)));
+                                }
+                                // 나머지 CSI는 폐기.
+                                _ => {}
                             }
                             break;
                         }
@@ -254,6 +272,9 @@ pub fn parse_ansi_text(text: &str) -> Vec<TextSegment> {
                 }
                 None => {}
             }
+        } else if ch == '\x07' {
+            // bare BEL: 시각적 표현이 없다 — 폐기. (OSC/DCS 종결자 BEL은 위의 해당
+            // arm이 시퀀스 소비 중에 처리하므로 여기 오는 것은 순수 벨뿐이다.)
         } else {
             current_text.push(ch);
         }
@@ -408,6 +429,43 @@ mod tests {
         assert_eq!(joined("\x1b(Bplain"), "plain");
         // 단일 문자 ESC (커서 저장/복원 7/8)
         assert_eq!(joined("\x1b7save\x1b8"), "save");
+    }
+
+    #[test]
+    fn cuf_renders_as_spaces() {
+        // 커서 전진(CUF)은 공백 런의 인코딩 — ConPTY가 표의 빈 칸을 이걸로 내보낸다.
+        assert_eq!(joined("A\x1b[3CB"), "A   B");
+        // 파라미터 생략 = 1.
+        assert_eq!(joined("\x1b[CB"), " B");
+        // 비숫자 파라미터(?/> 등)는 1로 강등.
+        assert_eq!(joined("\x1b[?5CB"), " B");
+    }
+
+    #[test]
+    fn cuf_is_capped_and_style_neutral() {
+        // 메모리 방어: ESC[9999999C → 512 캡.
+        assert_eq!(joined("\x1b[9999999C").len(), 512);
+        // 스타일 중립: 활성 배경색이 공백에 칠해지면 존재하지 않는 색 막대가 된다.
+        let segments = parse_ansi_text("\x1b[42mX\x1b[3CY");
+        assert_eq!(segments.len(), 3);
+        assert!(segments[0].background.is_some(), "X는 배경 유지");
+        assert!(
+            segments[1].background.is_none() && segments[1].text == "   ",
+            "CUF 공백은 무스타일"
+        );
+        assert!(
+            segments[2].background.is_some(),
+            "이후 텍스트는 SGR 상태 복원"
+        );
+    }
+
+    #[test]
+    fn bare_bel_is_dropped_but_osc_terminator_still_works() {
+        // bare BEL은 비표시 폐기.
+        assert_eq!(joined("do\x07ne"), "done");
+        // 회귀(ConPTY 타이틀 OSC): BEL이 조립 단계를 그대로 통과해 와야 OSC가 여기서
+        // 정확히 종결되고 뒤 텍스트가 살아남는다.
+        assert_eq!(joined("\x1b]0;C:\\pwsh.EXE\x07c"), "c");
     }
 
     #[test]

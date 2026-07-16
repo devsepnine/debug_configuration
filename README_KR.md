@@ -28,6 +28,8 @@ Rust와 iced GUI 프레임워크로 개발되었으며, 여러 프로그램 실�
 - 구성 타입 선택 (Application, Shell Script, Node, Kotlin, Compound)
 - Compound 타입은 여러 구성을 묶어 한 번에 실행
 - 명령어, 인자, 작업 디렉토리 설정
+- Shell Script 인라인 스크립트를 멀티라인 에디터로 작성 (고정폭 폰트,
+  Enter로 개행, 높이 유계 + 내부 스크롤)
 - 환경 변수 관리 (추가, 수정, 삭제)
 - 드래그 앤 드롭으로 구성 순서 변경
 - 구성 열기/저장 (버전 관리 JSON 형식)
@@ -46,11 +48,14 @@ Rust와 iced GUI 프레임워크로 개발되었으며, 여러 프로그램 실�
 
 ### 실행 세션 관리
 - 다중 세션 동시 실행
-- macOS/Linux에서 진짜 PTY 실행: 프로그램이 터미널을 감지해 색상·진행바·
-  대화형 프롬프트가 실제 셸처럼 동작 (`TERM=xterm-256color`, 뷰포트 연동 resize)
-- 라이브 한 줄 진행바 (캐리지 리턴 재그리기를 제자리에서 렌더)
+- 모든 플랫폼에서 진짜 터미널 실행: macOS/Linux는 PTY, Windows 10 1809+는
+  ConPTY — 프로그램이 실제 콘솔을 감지해 색상·진행바·대화형 프롬프트가 실제
+  셸처럼 동작 (뷰포트 연동 resize; unix는 `TERM=xterm-256color`)
+- 라이브 한 줄 진행바 (캐리지 리턴 재그리기를 제자리에서 렌더; 백스페이스 소거)
 - 세션별 stdin 입력바 (토글 버튼 또는 Cmd+I): 프롬프트 응답·REPL 입력 —
-  PTY가 에코를 자연 처리, Windows(pipe)는 앱이 로컬 에코
+  터미널이 에코를 자연 처리, 구형 Windows pipe 폴백(1809 미만)만 앱이 로컬 에코.
+  제출한 라인은 세션별 히스토리로 저장(↑/↓로 재호출), ^C 버튼 또는 입력창
+  포커스 중 Ctrl+C로 인터럽트 전송, ^D / Ctrl+D로 EOF 전송(REPL·stdin 리더 종료)
 - 실시간 출력 표시 (ANSI 색상 지원; OSC/DCS 제어 시퀀스는 걸러냄)
 - 세션 재실행, 중지, 제거, 워크스페이스에서 숨김
 - 완료된 세션의 상태 배지 (성공 / 실패 종료 코드 / 실행 시간)
@@ -231,11 +236,28 @@ open /Applications/RunConfigManager.app
 - **풀스크린 TUI 앱은 비지원**: 터미널이 스크린 그리드가 아니라 라인 스크롤백
   렌더러라 `vim`, `htop`, `less` 같은 alt-screen 프로그램은 화면이 깨집니다
   (앱은 정상 동작 — Stop으로 복구). `input()`, `read`, REPL 같은 라인 기반
-  대화형 프롬프트는 동작합니다.
-- **Windows는 pipe로 실행** (ConPTY는 후속 예정): 색상/진행바는 도구의 비-tty
-  출력 지원에 따르고, stdin 입력은 로컬 에코로 동작합니다. `-NonInteractive`
-  제거로 예기치 않은 PowerShell 프롬프트가 대기(행처럼 보임)할 수 있습니다 —
-  Stop으로 종료하세요.
+  대화형 프롬프트는 동작합니다. 탭 문자는 리터럴로 표시됩니다(컬럼 확장 없음).
+- **Windows 특이사항**: ConPTY는 이미 렌더링된 VT 스트림을 전달하고 앱은 이를
+  라인 스크롤백으로 표시합니다 — 커서 위주 편집은 라인 단위로 근사됩니다
+  (백스페이스 소거, 캐리지 리턴 라인 재작성). 실행 중 세션에는 pane 리사이즈가
+  전파되지 않습니다 (ConPTY는 라이브 리사이즈에 전체 리페인트로 응답해 스크롤백에
+  출력이 중복됨) — 새 크기는 다음 실행/재실행부터 적용됩니다. 새 세션은 가장
+  최근 관측된 pane 크기로 시작하며(관측 전엔 120×40), 이 추정이 빗나간 경우에도
+  다음 실행/재실행까지 유지됩니다. Stop은 `taskkill /T /F` 하드
+  종료라 종료 코드가 보통 1로 보고됩니다(드물게 259/STILL_ACTIVE 관측 가능).
+  자식 종료 후 ~300ms간 침묵한 손자 프로세스의 이후 출력은 잘립니다(unix는
+  실제 EOF까지 유지). ConPTY가 없는 Windows 10 1809 미만은 pipe로 폴백 —
+  색상/진행바 없음, 로컬 에코, 인터럽트(^C) 전달 불가, 세션에 배너 표시.
+  예기치 않은 PowerShell 프롬프트 대기(행처럼 보임 — Stop으로 종료) 노트는
+  이 폴백에만 해당합니다.
+- **stdin 입력바의 Ctrl+C는 인터럽트**: 세션 stdin 입력창이 포커스일 때 Ctrl+C는
+  항상 프로세스로 인터럽트를 보냅니다. Windows/Linux에서 입력창에 선택 영역이
+  있으면 복사도 함께 수행됩니다. 출력 영역 복사와 macOS의 Cmd+C 복사에는 영향이
+  없습니다.
+- **Ctrl+D는 EOF**: 실제 터미널처럼 줄 시작에서 동작합니다 — stdin 입력바의
+  미제출 드래프트는 먼저 전송되지 않습니다(Enter로 제출 후 Ctrl+D). Windows는
+  내부적으로 콘솔 EOF 시퀀스(Ctrl+Z+Enter)를 전달하고, 구형 pipe 폴백은 stdin
+  핸들을 닫는 방식으로 EOF를 만듭니다.
 - macOS/Linux에서 `sh -l` + 진짜 tty 조합이라 셸 프로파일의 배너가 세션 출력에
   나타날 수 있습니다.
 
@@ -243,9 +265,11 @@ open /Applications/RunConfigManager.app
 
 애플리케이션 종료 시 실행 중인 모든 프로세스를 자동으로 정리합니다:
 1. Ctrl+C 또는 창 닫기 시 Drop trait 실행
-2. 모든 세션에 SIGTERM (또는 Windows에서 taskkill) 전송
-3. 2초 대기 (Graceful shutdown 기회 제공)
-4. 남아있는 프로세스 강제 종료 (SIGKILL 또는 taskkill /F)
+2. Unix: 세션별 프로세스 그룹에 즉시 SIGKILL (유예 없음 — graceful한
+   SIGTERM 대기는 Stop 버튼 경로 전용; 종료 중인 UI 스레드를 그만큼
+   블록하면 창이 멈춤)
+3. Windows: 즉시 `taskkill /T /F` — ConPTY에는 graceful 신호 경로가 없어
+   트리를 강제 종료
 
 ## 라이선스
 

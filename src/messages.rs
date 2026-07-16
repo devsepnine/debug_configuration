@@ -16,6 +16,20 @@ pub enum ViewMode {
     Sessions,
 }
 
+/// stdin 입력바 전용 키 식별자. 구독은 키 정체만 실어 보내고, 어느 세션의 바가
+/// 대상인지는 핸들러가 포커스된 위젯 Id(find_focused)로 판정한다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StdinBarKey {
+    /// ↑ — 히스토리에서 한 단계 과거로
+    HistoryOlder,
+    /// ↓ — 한 단계 최신으로 (최신을 지나면 타이핑 중이던 드래프트 복원)
+    HistoryNewer,
+    /// Ctrl+C — 실행 중인 프로세스에 인터럽트 전송 (^C 버튼과 동일 경로)
+    Interrupt,
+    /// Ctrl+D — 실행 중인 프로세스 stdin에 EOF 전송 (^D 버튼과 동일 경로)
+    Eof,
+}
+
 /// 애플리케이션의 모든 이벤트와 액션을 정의하는 메시지 타입
 /// Elm Architecture의 Message 패턴을 따름
 #[derive(Debug, Clone)]
@@ -79,8 +93,8 @@ pub enum Message {
     InterpreterPathSelected(Result<String, String>),
     /// 인터프리터 옵션 변경
     InterpreterOptionsChanged(String),
-    /// 스크립트 텍스트 변경
-    ScriptTextChanged(String),
+    /// 스크립트 텍스트 멀티라인 에디터 액션 (편집/커서/스크롤 — text_editor 위젯)
+    ScriptTextEdited(iced::widget::text_editor::Action),
 
     // Node 구성 편집 메시지
     /// Node 프로젝트 디렉토리 선택 다이얼로그 열기
@@ -337,11 +351,24 @@ pub enum Message {
     SessionStdinChanged(Uuid, String),
     /// stdin 드래프트 제출 — 프로세스 stdin으로 전송 (`session_id`)
     SessionStdinSubmitted(Uuid),
-    /// stdin 쓰기 완료 (`session_id`, 제출 원문(실패 복원·pipe 로컬 에코용),
-    /// 성공 시 로컬 에코 필요 여부 / 실패 사유)
+    /// stdin 쓰기 완료 (`session_id`, 제출 원문(실패 복원·폴백 pipe 로컬 에코용),
+    /// 성공 시 로컬 에코 필요 여부(PTY/ConPTY=false, <1809 폴백 pipe=true) / 실패 사유)
     SessionStdinWriteCompleted(Uuid, String, Result<bool, crate::models::StdinWriteError>),
     /// 활성 pane 세션에 stdin 바 열기 (Cmd+I — 대상은 핸들러가 해석, Sessions 뷰 전용)
     OpenStdinInActivePane,
+    /// stdin 바 전용 키 눌림 (↑/↓ 히스토리). 구독 클로저는 self를 캡처할 수 없어
+    /// 대상 세션 해석은 핸들러가 find_focused 위젯 조회로 수행한다.
+    StdinBarKeyPressed(StdinBarKey),
+    /// find_focused 조회 결과 — 포커스된 위젯 Id를 stdin 바 세션과 대조해 적용
+    StdinBarKeyResolved(StdinBarKey, iced::advanced::widget::Id),
+    /// 실행 중인 세션에 인터럽트(Ctrl+C/ETX) 전송 (`session_id` — ^C 버튼/키 공용)
+    SessionInterruptRequested(Uuid),
+    /// 인터럽트 전송 결과 (`session_id`) — 성공은 침묵(에코는 터미널 몫), 실패만 폴백/안내
+    SessionInterruptCompleted(Uuid, Result<(), crate::models::StdinWriteError>),
+    /// 실행 중인 세션 stdin에 EOF(Ctrl+D) 전송 (`session_id` — ^D 버튼/키 공용)
+    SessionEofRequested(Uuid),
+    /// EOF 전송 결과 (`session_id`) — 성공은 침묵, 실패만 안내(EOF엔 시그널 폴백 없음)
+    SessionEofCompleted(Uuid, Result<(), crate::models::StdinWriteError>),
     /// 세션 출력 버퍼 비우기 (`session_id`) — 실행 중인 프로세스는 유지, 화면 로그만 클리어
     ClearSessionOutput(Uuid),
     /// 세션 출력을 파일로 내보내기 (`session_id`)

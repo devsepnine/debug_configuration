@@ -28,6 +28,8 @@ Grab the latest pre-built binary for your platform from the [Releases page](http
 - Select configuration type (Application, Shell Script, Node, Kotlin, Compound)
 - Compound type runs several configurations together as one group
 - Set command, arguments, and working directory
+- Write inline Shell Script text in a multi-line editor (monospace font,
+  Enter for new lines, bounded height with internal scrolling)
 - Manage environment variables (add, edit, delete)
 - Reorder configurations with drag and drop
 - Save configurations (versioned JSON format)
@@ -47,13 +49,18 @@ Grab the latest pre-built binary for your platform from the [Releases page](http
 
 ### Execution Session Management
 - Run multiple sessions simultaneously
-- Real PTY execution on macOS/Linux: programs detect a terminal, so colors,
-  progress bars, and interactive prompts work as in a real shell
-  (`TERM=xterm-256color`, viewport-aware resize)
-- Live single-line progress bars (carriage-return redraws render in place)
+- Real terminal execution everywhere: PTY on macOS/Linux, ConPTY on
+  Windows 10 1809+ — programs detect a real console, so colors, progress
+  bars, and interactive prompts behave as in a real shell (viewport-aware
+  resize; `TERM=xterm-256color` on unix)
+- Live single-line progress bars (carriage-return redraws render in place;
+  backspace erases)
 - stdin input bar per session (toggle button or Cmd+I): answer prompts and
-  feed REPLs — PTY echoes input naturally; on Windows (pipe transport) the
-  app echoes locally
+  feed REPLs — the terminal echoes input naturally; on the legacy Windows
+  pipe fallback (pre-1809) the app echoes locally. Submitted lines are kept
+  in a per-session history (recall with ArrowUp/ArrowDown), the ^C
+  button — or Ctrl+C while the input is focused — sends an interrupt to the
+  running process, and ^D / Ctrl+D sends EOF (ends REPLs and stdin readers)
 - Real-time output display (ANSI color support; OSC/DCS control sequences
   are filtered out)
 - Rerun, stop, remove, and hide sessions from a workspace
@@ -236,10 +243,32 @@ Configuration files are automatically saved in the OS-specific settings director
   renderer, not a screen grid — `vim`, `htop`, `less` and other alt-screen
   programs will render garbage (the app stays responsive; use Stop to recover).
   Interactive line-based prompts (`python`'s `input()`, `read`, REPLs) work.
-- **Windows runs on pipes** (ConPTY is planned): colors/progress depend on the
-  tool honoring non-tty output, stdin input works with local echo, and since
-  `-NonInteractive` was removed a PowerShell cmdlet prompting unexpectedly can
-  appear to hang — press Stop to terminate it.
+  Tabs render literally (no column-stop expansion).
+- **Windows specifics**: ConPTY delivers an already-rendered VT stream and the
+  app shows it as line scrollback — cursor-heavy editing is approximated per
+  line (backspace erases, carriage return rewrites the line). Pane resizes are
+  not propagated to a running session's console (ConPTY answers a live resize
+  with a full-screen repaint that would duplicate output in scrollback); the
+  new size applies from the next run/rerun. New sessions spawn at the most
+  recently observed pane size (120×40 before any pane has been measured) — if
+  that guess misses, the mismatch also persists until the next run/rerun. Stop uses
+  `taskkill /T /F`: processes are killed hard, typically reporting exit code 1
+  (a rare 259/STILL_ACTIVE can surface during teardown races). After the child
+  exits, a grandchild that stays silent for ~300ms has any later output cut
+  off (unix keeps streaming until true EOF). On Windows before 10 1809 (no
+  ConPTY) the app falls back to pipes — no colors/progress bars, input echoes
+  locally, interrupts (^C) cannot be delivered, and a banner marks the
+  session; the old note about a PowerShell cmdlet prompting unexpectedly
+  (appearing to hang — press Stop) applies to this fallback only.
+- **Ctrl+C in the stdin bar means interrupt**: while a session's stdin input
+  is focused, Ctrl+C always sends an interrupt to the process; on
+  Windows/Linux, if the input has an active selection, the text is also
+  copied. Copying from the output area and macOS Cmd+C are unaffected.
+- **Ctrl+D sends EOF**: like a real terminal it takes effect at the start of
+  a line — an unsubmitted draft in the stdin bar is not sent first (press
+  Enter, then Ctrl+D). On Windows the console EOF sequence (Ctrl+Z+Enter) is
+  delivered under the hood; the legacy pipe fallback closes the stdin handle
+  instead.
 - On macOS/Linux, `sh -l` plus a real tty means shell profiles may print
   banners into the session output.
 
@@ -247,9 +276,11 @@ Configuration files are automatically saved in the OS-specific settings director
 
 The application automatically cleans up all running processes on exit:
 1. Drop trait executes on Ctrl+C or window close
-2. Send SIGTERM (or taskkill on Windows) to all sessions
-3. Wait 2 seconds (provides graceful shutdown opportunity)
-4. Force kill remaining processes (SIGKILL or taskkill /F)
+2. Unix: immediate SIGKILL to each session's process group (no grace window —
+   a graceful SIGTERM-then-wait is what the Stop button does; blocking the
+   closing UI thread for it would freeze the window)
+3. Windows: `taskkill /T /F` immediately — ConPTY offers no graceful signal
+   path, so the tree is force-killed
 
 ## License
 

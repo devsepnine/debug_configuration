@@ -8,14 +8,12 @@ use uuid::Uuid;
 ///
 /// `Replace`는 직전에 추가된 라인을 통째로 교체한다 — PTY 환경에서 진행바가
 /// `\r`로 같은 줄을 되감아 재그리는 것을 라이브로 렌더하기 위한 시맨틱.
-/// (pipes 경로는 `Line`만 방출한다.)
+/// PTY 경로(unix PTY / Windows ConPTY)가 방출하고, pipe 폴백은 `Line`만 방출한다.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OutputEvent {
     /// 새 라인 추가 (확정된 라인, 또는 새로 열린 라이브 라인)
     Line(String),
-    /// 가장 최근에 추가된 라인의 내용 교체 (라이브 진행바 갱신).
-    /// PTY(unix) 경로에서만 생성된다 — Windows(pipe)는 Line만 방출.
-    #[cfg_attr(windows, allow(dead_code))]
+    /// 가장 최근에 추가된 라인의 내용 교체 (라이브 진행바 갱신)
     Replace(String),
 }
 
@@ -60,6 +58,9 @@ const MAX_STORED_LINE_BYTES: usize = 64 * 1024;
 /// 잘린 줄 끝에 붙는 마커.
 const TRUNCATED_MARKER: &str = "…[truncated]";
 
+/// stdin 제출 이력의 보관 상한. 초과 시 가장 오래된 항목부터 제거한다.
+const STDIN_HISTORY_MAX: usize = 50;
+
 /// 세그먼트들의 텍스트 바이트 길이 합 (바이트 예산 계산용).
 fn segments_bytes(segments: &[TextSegment]) -> usize {
     segments.iter().map(|s| s.text.len()).sum()
@@ -70,6 +71,35 @@ fn segments_bytes(segments: &[TextSegment]) -> usize {
 /// 매칭 결과·강조 위치가 이 근사를 따른다(실용상 ASCII·한글 등에서 정확).
 fn lower_char(c: char) -> char {
     c.to_lowercase().next().unwrap_or(c)
+}
+
+/// 라인 세그먼트들을 하나의 문자열로 join한다 (검색 매칭의 원문 텍스트).
+fn line_text(segments: &[TextSegment]) -> String {
+    segments.iter().map(|seg| seg.text.as_str()).collect()
+}
+
+/// 한 라인에 대한 정규식 매치를 char 인덱스 범위로 `out`에 추가한다. 빈 매치는
+/// 강조 대상이 아니라 제외하고, 정규식의 byte offset은 char 인덱스로 변환한다.
+/// (전체 재스캔과 증분 갱신이 공유하는 단일 구현 — 결과 등가성의 근거.)
+fn append_regex_matches(
+    out: &mut Vec<SearchMatch>,
+    line_idx: usize,
+    segments: &[TextSegment],
+    re: &regex::Regex,
+) {
+    let text = line_text(segments);
+    for m in re.find_iter(&text) {
+        if m.start() == m.end() {
+            continue;
+        }
+        let start = text[..m.start()].chars().count();
+        let end = text[..m.end()].chars().count();
+        out.push(SearchMatch {
+            line_idx,
+            start,
+            end,
+        });
+    }
 }
 
 /// 라인 chars에서 `needle`(미리 소문자화된 char들)의 겹치지 않는 모든 출현을 char 범위로
@@ -179,6 +209,16 @@ pub struct RunSession {
     /// stdin 입력바 드래프트. `Some`이면 바가 열려 있음 (`search`와 동일 컨벤션).
     /// 프로세스 종료/rerun에도 생존한다 — 타이핑 중이던 내용을 잃지 않기 위함.
     pub stdin_input: Option<String>,
+    /// stdin 제출 이력 (0=가장 오래됨, 마지막=최신). 빈 라인과 직전 항목의 연속
+    /// 중복은 저장하지 않으며 `STDIN_HISTORY_MAX` 초과 시 앞에서 제거한다.
+    /// 드래프트와 마찬가지로 rerun에도 생존한다.
+    pub stdin_history: Vec<String>,
+    /// 히스토리 탐색 커서. `Some(i)`면 `stdin_history[i]` 열람 중, `None`이면 라이브
+    /// 드래프트 편집 중. 제출/수동 편집/바 닫기가 리셋한다.
+    stdin_history_cursor: Option<usize>,
+    /// 탐색 진입(커서 None에서의 첫 ↑) 시 보관한 라이브 드래프트 — ↓로 최신 항목을
+    /// 지나치면 복원된다.
+    stdin_saved_draft: Option<String>,
     /// 마지막으로 관측된 터미널 뷰포트 (cols, rows). rerun의 초기 PTY 크기와
     /// `ProcessStarted` 직후 재푸시에 쓴다 (신규 pane은 첫 프레임 publish가 채움).
     pub pty_viewport: Option<(u16, u16)>,
@@ -233,20 +273,178 @@ impl RunSession {
             search: None,
             scroll_target: None,
             stdin_input: None,
+            stdin_history: Vec::new(),
+            stdin_history_cursor: None,
+            stdin_saved_draft: None,
             pty_viewport: None,
             controls_menu_open: false,
             max_output_lines: DEFAULT_MAX_OUTPUT_LINES,
         }
     }
 
+    /// stdin 제출 라인을 이력에 추가한다. 빈 라인은 저장하지 않고(전송 자체는 호출측
+    /// 책임 — 빈 Enter도 프로세스엔 보낸다), 직전 항목과 동일하면 스킵한다(연속 중복
+    /// 제거). 상한 초과 시 가장 오래된 항목을 제거한다. 제출은 항상 탐색 모드를 끝낸다.
+    pub fn push_stdin_history(&mut self, line: &str) {
+        self.reset_stdin_history_navigation();
+        if line.is_empty() || self.stdin_history.last().is_some_and(|last| last == line) {
+            return;
+        }
+        self.stdin_history.push(line.to_string());
+        if self.stdin_history.len() > STDIN_HISTORY_MAX {
+            self.stdin_history.remove(0);
+        }
+    }
+
+    /// 히스토리 탐색 상태만 리셋한다(드래프트 텍스트와 이력 자체는 유지). 수동 편집·
+    /// 바 닫기·제출이 호출한다 — 이후 첫 ↑는 그 시점의 드래프트를 새로 보관한다.
+    pub fn reset_stdin_history_navigation(&mut self) {
+        self.stdin_history_cursor = None;
+        self.stdin_saved_draft = None;
+    }
+
+    /// 히스토리 탐색 한 스텝(`older`=↑ / `!older`=↓). 드래프트(`stdin_input`)를 이력
+    /// 항목으로 교체하고, 탐색 진입 시 라이브 드래프트를 보관했다가 최신 항목을 지나
+    /// 내려오면 복원한다(bash 동작). 드래프트가 바뀌면 true — 호출측이 캐럿 끝 이동
+    /// op를 발행한다. 바가 닫혀 있거나 이력이 비면 no-op.
+    pub fn navigate_stdin_history(&mut self, older: bool) -> bool {
+        let Some(draft) = self.stdin_input.as_mut() else {
+            return false;
+        };
+        if self.stdin_history.is_empty() {
+            return false;
+        }
+        match (self.stdin_history_cursor, older) {
+            // 첫 ↑: 라이브 드래프트를 보관하고 최신 항목을 연다.
+            (None, true) => {
+                self.stdin_saved_draft = Some(std::mem::take(draft));
+                let idx = self.stdin_history.len() - 1;
+                *draft = self.stdin_history[idx].clone();
+                self.stdin_history_cursor = Some(idx);
+                true
+            }
+            // 라이브 드래프트에서의 ↓는 갈 곳이 없다.
+            (None, false) => false,
+            // 가장 오래된 항목에서 ↑는 정지.
+            (Some(0), true) => false,
+            (Some(i), true) => {
+                *draft = self.stdin_history[i - 1].clone();
+                self.stdin_history_cursor = Some(i - 1);
+                true
+            }
+            (Some(i), false) => {
+                if i + 1 < self.stdin_history.len() {
+                    *draft = self.stdin_history[i + 1].clone();
+                    self.stdin_history_cursor = Some(i + 1);
+                } else {
+                    // 최신 항목을 지나 내려오면 보관한 드래프트를 복원하고 탐색 종료.
+                    *draft = self.stdin_saved_draft.take().unwrap_or_default();
+                    self.stdin_history_cursor = None;
+                }
+                true
+            }
+        }
+    }
+
     /// 검색 매치 캐시(`search.matches`)를 현재 출력/검색어로 갱신하고 `current`를
-    /// 범위 내로 클램프한다. 출력 추가/검색어 변경 등 상태 변화 시 `update()`에서
-    /// 호출한다. 검색바가 닫혀 있으면(`search` None) no-op.
+    /// 범위 내로 클램프한다. 검색어/모드 변경·출력 클리어 등 상태 변화 시 `update()`에서
+    /// 호출한다. 스트리밍 출력 배치에는 `refresh_search_matches_incremental`을 쓴다.
+    /// 검색바가 닫혀 있으면(`search` None) no-op.
     pub fn refresh_search_matches(&mut self) {
         let Some((query, regex)) = self.search.as_ref().map(|s| (s.query.clone(), s.regex)) else {
             return;
         };
         let matches = self.search_matches(&query, regex);
+        if let Some(search) = self.search.as_mut() {
+            let len = matches.len();
+            search.matches = matches;
+            search.current = if len == 0 {
+                0
+            } else {
+                search.current.min(len - 1)
+            };
+        }
+    }
+
+    /// 검색 매치 캐시를 출력 배치 1회 적용분만큼 **증분** 갱신한다 — 결과는
+    /// `refresh_search_matches`(전체 재스캔)와 필드 단위로 동일해야 하며 등가성
+    /// 테스트가 이를 게이트한다. 폭주 출력에서 배치당 O(버퍼) 전체 스캔이
+    /// O(evict+신규+캐시 조정)으로 줄어든다.
+    ///
+    /// `anchor`는 배치 적용 **직전**의 `(front line_id, last line_id)`(빈 버퍼면
+    /// None). 산술의 근거 불변식: `next_line_id`는 저장 라인당 정확히 +1이고
+    /// (`add_output_line`의 개행 분할 포함), `Replace`는 id를 재사용하며, eviction은
+    /// `pop_front`뿐 → 버퍼는 항상 연속 오름차순 id 구간이라
+    /// `output_lines[i].0 == front_id + i`.
+    /// - 앞에서 evict된 수 = 새 front_id − 옛 front_id → 캐시 드랍/시프트
+    /// - 재스캔 구간 = 옛 마지막 줄부터 끝까지 (`Replace`로 변했을 수 있는 유일한
+    ///   기존 줄 + 추가분). 옛 마지막 줄 자체가 evict된 경우에도 산술이 자동 성립
+    ///   (남은 캐시가 전부 드랍되고 전 구간 재스캔이 된다).
+    ///
+    /// 경계에서는 전체 재스캔/클리어로 폴백한다: anchor 없음(배치 전 빈 버퍼),
+    /// 배치 후 빈 버퍼(프로덕션 캡에선 불가 — 테스트의 극소 캡 방어), front id
+    /// 역행(불변식 위반 흔적 — 미래의 id 리셋 등에 대한 보험).
+    pub fn refresh_search_matches_incremental(&mut self, anchor: Option<(usize, usize)>) {
+        let Some((query, regex)) = self.search.as_ref().map(|s| (s.query.clone(), s.regex)) else {
+            return;
+        };
+        let Some((old_front_id, old_last_id)) = anchor else {
+            self.refresh_search_matches();
+            return;
+        };
+        let Some(new_front_id) = self.output_lines.front().map(|(id, _)| *id) else {
+            if let Some(search) = self.search.as_mut() {
+                search.matches.clear();
+                search.current = 0;
+            }
+            return;
+        };
+        let Some(shift) = new_front_id.checked_sub(old_front_id) else {
+            self.refresh_search_matches();
+            return;
+        };
+        // 옛 마지막 줄의 현재 위치 인덱스. evict됐으면 0 — 전 구간 재스캔과 동치.
+        let rescan_from = old_last_id.saturating_sub(new_front_id);
+
+        let mut matches = self
+            .search
+            .as_mut()
+            .map(|s| std::mem::take(&mut s.matches))
+            .unwrap_or_default();
+        // evict된 라인의 매치 드랍 + 나머지 시프트 (정렬 보존: 균일 감산).
+        matches.retain(|m| m.line_idx >= shift);
+        for m in &mut matches {
+            m.line_idx -= shift;
+        }
+        // 재스캔 구간의 기존 매치는 꼬리 — 잘라내고 다시 스캔한다.
+        let keep = matches.partition_point(|m| m.line_idx < rescan_from);
+        matches.truncate(keep);
+
+        if query.is_empty() {
+            matches.clear();
+        } else if regex {
+            // 잘못된 패턴은 전체 스캔과 동일하게 "매치 없음" (쿼리/모드 변경은 항상
+            // 전체 refresh를 타므로 여기 도달 시 캐시도 이미 그 상태다).
+            if let Ok(re) = regex::RegexBuilder::new(&query)
+                .case_insensitive(true)
+                .build()
+            {
+                for (offset, (_, segments)) in
+                    self.output_lines.iter().skip(rescan_from).enumerate()
+                {
+                    append_regex_matches(&mut matches, rescan_from + offset, segments, &re);
+                }
+            } else {
+                matches.clear();
+            }
+        } else {
+            let needle: Vec<char> = query.chars().map(lower_char).collect();
+            for (offset, (_, segments)) in self.output_lines.iter().skip(rescan_from).enumerate() {
+                let chars: Vec<char> = line_text(segments).chars().collect();
+                append_substring_matches(&mut matches, rescan_from + offset, &chars, &needle);
+            }
+        }
+
         if let Some(search) = self.search.as_mut() {
             let len = matches.len();
             search.matches = matches;
@@ -269,9 +467,6 @@ impl RunSession {
             return Vec::new();
         }
 
-        let line_text = |segments: &[TextSegment]| -> String {
-            segments.iter().map(|seg| seg.text.as_str()).collect()
-        };
         let mut out = Vec::new();
 
         if regex {
@@ -283,20 +478,7 @@ impl RunSession {
                 return Vec::new();
             };
             for (line_idx, (_, segments)) in self.output_lines.iter().enumerate() {
-                let text = line_text(segments);
-                for m in re.find_iter(&text) {
-                    if m.start() == m.end() {
-                        continue; // 빈 매치는 강조 대상 아님
-                    }
-                    // 정규식은 byte offset을 주므로 char 인덱스로 변환한다.
-                    let start = text[..m.start()].chars().count();
-                    let end = text[..m.end()].chars().count();
-                    out.push(SearchMatch {
-                        line_idx,
-                        start,
-                        end,
-                    });
-                }
+                append_regex_matches(&mut out, line_idx, segments, &re);
             }
         } else {
             let needle: Vec<char> = query.chars().map(lower_char).collect();
@@ -926,5 +1108,294 @@ mod tests {
         assert_eq!(format_duration(Duration::from_millis(820)), "820ms");
         assert_eq!(format_duration(Duration::from_millis(1200)), "1.2s");
         assert_eq!(format_duration(Duration::from_secs(75)), "1m 15s");
+    }
+
+    // ---- stdin 히스토리 ----
+
+    #[test]
+    fn stdin_history_dedupes_consecutive_and_caps() {
+        let mut session = RunSession::new("x".to_string());
+        session.push_stdin_history("a");
+        session.push_stdin_history("a"); // 연속 중복 → 스킵
+        session.push_stdin_history("b");
+        session.push_stdin_history("a"); // 비연속 재등장은 허용
+        assert_eq!(session.stdin_history, vec!["a", "b", "a"]);
+
+        // 상한 초과 시 가장 오래된 항목부터 제거된다.
+        for i in 0..STDIN_HISTORY_MAX + 10 {
+            session.push_stdin_history(&format!("line {i}"));
+        }
+        assert_eq!(session.stdin_history.len(), STDIN_HISTORY_MAX);
+        assert_eq!(
+            session.stdin_history.last().map(String::as_str),
+            Some(format!("line {}", STDIN_HISTORY_MAX + 9).as_str())
+        );
+        assert!(!session.stdin_history.iter().any(|l| l == "a"));
+    }
+
+    #[test]
+    fn stdin_history_skips_empty_lines() {
+        let mut session = RunSession::new("x".to_string());
+        session.push_stdin_history("");
+        assert!(session.stdin_history.is_empty());
+        session.push_stdin_history("a");
+        session.push_stdin_history("");
+        assert_eq!(session.stdin_history, vec!["a"]);
+    }
+
+    #[test]
+    fn stdin_history_navigation_walks_and_restores_draft() {
+        let mut session = RunSession::new("x".to_string());
+        // 바 닫힘 → no-op.
+        assert!(!session.navigate_stdin_history(true));
+        // 바 열림 + 이력 없음 → no-op.
+        session.stdin_input = Some(String::from("typing"));
+        assert!(!session.navigate_stdin_history(true));
+
+        session.push_stdin_history("a");
+        session.push_stdin_history("b");
+        session.stdin_input = Some(String::from("typing"));
+
+        // 라이브 드래프트에서 ↓는 갈 곳이 없다.
+        assert!(!session.navigate_stdin_history(false));
+        // ↑: 드래프트 보관 + 최신("b").
+        assert!(session.navigate_stdin_history(true));
+        assert_eq!(session.stdin_input.as_deref(), Some("b"));
+        // ↑: "a".
+        assert!(session.navigate_stdin_history(true));
+        assert_eq!(session.stdin_input.as_deref(), Some("a"));
+        // 가장 오래된 항목에서 ↑ 정지.
+        assert!(!session.navigate_stdin_history(true));
+        assert_eq!(session.stdin_input.as_deref(), Some("a"));
+        // ↓: "b" → ↓: 보관 드래프트 복원.
+        assert!(session.navigate_stdin_history(false));
+        assert_eq!(session.stdin_input.as_deref(), Some("b"));
+        assert!(session.navigate_stdin_history(false));
+        assert_eq!(session.stdin_input.as_deref(), Some("typing"));
+        // 복원 후 ↓는 다시 no-op.
+        assert!(!session.navigate_stdin_history(false));
+    }
+
+    // ---- 검색 증분 갱신 (등가성 게이트) ----
+
+    /// 결정적 xorshift64 — rand 의존성 없이 등가성 테스트용 의사난수.
+    struct XorShift(u64);
+    impl XorShift {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    /// `handle_output_received`가 캡처하는 앵커와 동일한 형태.
+    fn capture_anchor(session: &RunSession) -> Option<(usize, usize)> {
+        session
+            .output_lines
+            .front()
+            .map(|(id, _)| *id)
+            .zip(session.output_lines.back().map(|(id, _)| *id))
+    }
+
+    #[test]
+    fn incremental_search_equals_full_rescan_randomized() {
+        // 증분 갱신은 전체 재스캔과 필드 단위로 동일해야 한다 — Line(개행 분할·초대형
+        // 절단 포함)/Replace 혼합 배치를 극소 캡(공격적 eviction)에서 수백 회 적용하며
+        // 비교한다. 쿼리는 substring/대문자/regex/절단 마커/무매치/잘못된 regex 전부.
+        let words = ["error", "ok", "가나error다", "plain", "err123"];
+        let queries: [(&str, bool); 6] = [
+            ("error", false),
+            ("ERROR", false),
+            (r"err\w*", true),
+            ("e", false), // 라인당 다수 매치 (반복 라인에서 캐시 조정 스트레스)
+            ("zzz-nomatch", false),
+            ("[", true), // 잘못된 패턴 → 항상 매치 없음
+        ];
+        for (query, regex) in queries {
+            for cap in [1usize, 3, 8] {
+                let mut session = RunSession::new("x".to_string());
+                session.max_output_lines = cap;
+                session.search = Some(SearchState {
+                    query: query.to_string(),
+                    regex,
+                    ..Default::default()
+                });
+                session.refresh_search_matches();
+                let mut rng = XorShift(0x9E37_79B9_7F4A_7C15 ^ (cap as u64) << 8 ^ regex as u64);
+                for _ in 0..300 {
+                    let anchor = capture_anchor(&session);
+                    for _ in 0..1 + rng.below(6) {
+                        let word = words[rng.below(words.len() as u64) as usize];
+                        match rng.below(8) {
+                            0 | 1 => session
+                                .apply_output_event(&OutputEvent::Replace(format!("{word} r"))),
+                            2 => {
+                                // 매치 다수 유발용 중간 크기 라인 (절단 케이스는 산술과
+                                // 직교라 아래 고정 테스트가 별도 커버 — 여기선 속도 우선).
+                                let mid = word.repeat(40);
+                                session.apply_output_event(&OutputEvent::Line(mid));
+                            }
+                            3 | 4 => session.apply_output_event(&OutputEvent::Line(format!(
+                                "{word}\nsecond {word}"
+                            ))),
+                            _ => session.apply_output_event(&OutputEvent::Line(word.to_string())),
+                        }
+                    }
+                    let prior_current = session.search.as_ref().unwrap().current;
+                    session.refresh_search_matches_incremental(anchor);
+
+                    let full = session.search_matches(query, regex);
+                    let search = session.search.as_ref().unwrap();
+                    assert_eq!(
+                        search.matches, full,
+                        "divergence: query={query:?} regex={regex} cap={cap}"
+                    );
+                    let expected_current = if full.is_empty() {
+                        0
+                    } else {
+                        prior_current.min(full.len() - 1)
+                    };
+                    assert_eq!(search.current, expected_current);
+                    // 사용자 탐색을 흉내내 current를 무작위로 옮겨 클램프 경로를 흔든다.
+                    if !full.is_empty() {
+                        let c = rng.below(full.len() as u64) as usize;
+                        session.search.as_mut().unwrap().current = c;
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn incremental_search_handles_eviction_and_replace_edges() {
+        // (a) 옛 마지막 줄 자체가 한 배치에서 evict — 캐시 전량 드랍 후 전 구간
+        // 재스캔과 동치여야 한다.
+        let mut session = RunSession::new("x".to_string());
+        session.max_output_lines = 2;
+        session.search = Some(SearchState {
+            query: String::from("m"),
+            ..Default::default()
+        });
+        session.add_output_line("m1");
+        session.add_output_line("m2");
+        session.refresh_search_matches();
+        let anchor = capture_anchor(&session);
+        session.apply_output_event(&OutputEvent::Line(String::from("m3\nm4\nm5")));
+        session.refresh_search_matches_incremental(anchor);
+        assert_eq!(
+            session.search.as_ref().unwrap().matches,
+            session.search_matches("m", false)
+        );
+        assert_eq!(session.search.as_ref().unwrap().matches.len(), 2); // cap=2
+
+        // (b) 배치 전 빈 버퍼 → anchor None → 전체 재스캔 폴백. 빈 버퍼 Replace는
+        // add 폴백으로 새 id를 받는 케이스이기도 하다.
+        let mut session = RunSession::new("x".to_string());
+        session.search = Some(SearchState {
+            query: String::from("m"),
+            ..Default::default()
+        });
+        let anchor = capture_anchor(&session);
+        assert!(anchor.is_none());
+        session.apply_output_event(&OutputEvent::Replace(String::from("m-first")));
+        session.refresh_search_matches_incremental(anchor);
+        assert_eq!(
+            session.search.as_ref().unwrap().matches,
+            session.search_matches("m", false)
+        );
+        assert_eq!(session.search.as_ref().unwrap().matches.len(), 1);
+
+        // Replace가 옛 마지막 줄의 매치를 바꾸는 케이스 — 캐시 꼬리 재스캔 검증.
+        let mut session = RunSession::new("x".to_string());
+        session.search = Some(SearchState {
+            query: String::from("hit"),
+            ..Default::default()
+        });
+        session.add_output_line("hit a");
+        session.add_output_line("miss");
+        session.refresh_search_matches();
+        assert_eq!(session.search.as_ref().unwrap().matches.len(), 1);
+        let anchor = capture_anchor(&session);
+        session.apply_output_event(&OutputEvent::Replace(String::from("hit b")));
+        session.refresh_search_matches_incremental(anchor);
+        assert_eq!(
+            session.search.as_ref().unwrap().matches,
+            session.search_matches("hit", false)
+        );
+        assert_eq!(session.search.as_ref().unwrap().matches.len(), 2);
+
+        // MAX_STORED_LINE_BYTES 절단 라인 — 마커("…[truncated]")를 쿼리로 매칭해도
+        // 증분과 전체가 동일해야 한다 (양쪽 다 저장된 세그먼트를 스캔하므로).
+        let mut session = RunSession::new("x".to_string());
+        session.search = Some(SearchState {
+            query: String::from("truncated"),
+            ..Default::default()
+        });
+        session.add_output_line("plain");
+        session.refresh_search_matches();
+        let anchor = capture_anchor(&session);
+        let big = "e".repeat(70 * 1024);
+        session.apply_output_event(&OutputEvent::Line(big));
+        session.refresh_search_matches_incremental(anchor);
+        assert_eq!(
+            session.search.as_ref().unwrap().matches,
+            session.search_matches("truncated", false)
+        );
+        assert_eq!(session.search.as_ref().unwrap().matches.len(), 1);
+
+        // 방어 분기: anchor는 Some인데 배치 후 버퍼가 빈 경우 — 클리어로 폴백.
+        // (프로덕션 캡은 최소 1000이라 도달 불가; 캡 완화/테스트 직설정 대비 회귀 게이트.)
+        let mut session = RunSession::new("x".to_string());
+        session.max_output_lines = 3;
+        session.search = Some(SearchState {
+            query: String::from("m"),
+            ..Default::default()
+        });
+        session.add_output_line("m1");
+        session.refresh_search_matches();
+        session.search.as_mut().unwrap().current = 0;
+        let anchor = capture_anchor(&session);
+        assert!(anchor.is_some());
+        session.max_output_lines = 0;
+        session.apply_output_event(&OutputEvent::Line(String::from("m2")));
+        assert!(session.output_lines.is_empty());
+        session.refresh_search_matches_incremental(anchor);
+        let search = session.search.as_ref().unwrap();
+        assert!(search.matches.is_empty());
+        assert_eq!(search.current, 0);
+
+        // 검색 닫힘 → no-op (panic 없이).
+        let mut session = RunSession::new("x".to_string());
+        session.add_output_line("m");
+        let anchor = capture_anchor(&session);
+        session.add_output_line("m2");
+        session.refresh_search_matches_incremental(anchor);
+        assert!(session.search.is_none());
+    }
+
+    #[test]
+    fn stdin_history_edit_resets_navigation() {
+        let mut session = RunSession::new("x".to_string());
+        session.push_stdin_history("a");
+        session.push_stdin_history("b");
+        session.stdin_input = Some(String::from("draft"));
+        assert!(session.navigate_stdin_history(true));
+        assert_eq!(session.stdin_input.as_deref(), Some("b"));
+
+        // 수동 편집 시뮬레이션 (app 핸들러와 동일 순서: 대입 후 탐색 리셋).
+        session.stdin_input = Some(String::from("bx"));
+        session.reset_stdin_history_navigation();
+
+        // 다음 ↑는 편집본("bx")을 새로 보관하고 최신부터 다시 연다.
+        assert!(session.navigate_stdin_history(true));
+        assert_eq!(session.stdin_input.as_deref(), Some("b"));
+        assert!(session.navigate_stdin_history(false));
+        assert_eq!(session.stdin_input.as_deref(), Some("bx"));
     }
 }

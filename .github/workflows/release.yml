@@ -112,6 +112,37 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+  # Windows 품질 게이트: ConPTY 전송(cfg(windows) 경로)을 실 러너에서 테스트한다.
+  # 빌드 매트릭스와 병렬로 돌고 publish만 막는다 — 릴리스는 windows 테스트 그린
+  # 없이 발행될 수 없다.
+  quality-windows:
+    name: Check and Test (Windows)
+    needs: validate
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+
+      - name: Check
+        run: cargo check --locked --all-targets
+
+      - name: Test (pty/assembler scope)
+        timeout-minutes: 10
+        # --nocapture: libtest 캡처는 스폰 스레드에 상속되어 행 진단(워치독/스테이지)
+        # 출력을 삼킨다 — 실시간 스트리밍으로 마지막 스테이지가 로그에 남게 한다.
+        run: cargo test --locked -- --nocapture pty_loop conpty_integration assembler ansi
+
   build:
     name: Build ${{ matrix.name }}
     needs: [validate, quality]
@@ -237,7 +268,7 @@ jobs:
   publish:
     name: Publish GitHub Release
     runs-on: ubuntu-latest
-    needs: [validate, build]
+    needs: [validate, build, quality-windows]
     permissions:
       contents: write
     steps:

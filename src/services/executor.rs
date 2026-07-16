@@ -68,7 +68,7 @@ fn signal_process_group(pid: u32, signal: i32) {
 }
 
 /// PID로 프로세스 트리를 강제 종료 (비동기 컨텍스트 밖에서도 호출 가능).
-fn force_kill_process_tree(pid: u32) {
+pub fn force_kill_process_tree(pid: u32) {
     #[cfg(unix)]
     {
         // 그룹 리더 전제(process_group(0)/setsid) 하에 그룹 전체 SIGKILL — 가드 포함.
@@ -97,21 +97,34 @@ fn force_kill_process_tree(pid: u32) {
 /// 세션 stdin으로 쓸 수 있는 핸들. PTY는 blocking `Write`(spawn_blocking에서 사용),
 /// Windows pipe는 tokio `ChildStdin`(AsyncWrite) — 통합 blocking 타입이 불가능해 분기.
 enum SessionWriter {
-    /// PTY master writer — 라인 디시플린이 에코를 담당한다 (앱 에코 금지).
-    /// Windows에서는 PTY 경로가 없어 미구성 (cfg 대신 allow — 타입/매치 팔은 공유).
-    #[cfg_attr(windows, allow(dead_code))]
+    /// PTY master writer (unix PTY / Windows ConPTY) — 터미널이 에코를 담당한다
+    /// (앱 에코 금지).
     Pty(Arc<Mutex<Box<dyn std::io::Write + Send>>>),
-    /// Windows pipe stdin — 에코가 없으므로 제출 시 앱이 로컬 에코한다.
+    /// Windows pipe stdin (<1809 ConPTY 부재 폴백) — 에코가 없으므로 제출 시
+    /// 앱이 로컬 에코한다.
     #[cfg(windows)]
     Pipe(Arc<tokio::sync::Mutex<tokio::process::ChildStdin>>),
 }
 
 /// 세션 하나의 프로세스 I/O 핸들 묶음.
 struct SessionIo {
-    /// PTY master (resize용). pipe 세션은 None.
+    /// PTY master. pipe 세션은 None. unix에선 resize에 읽고, windows에선 읽지
+    /// 않지만 **보유 자체가 하중이다** — drop이 ClosePseudoConsole을 트리거하는
+    /// 유일한 teardown 경로(리더 EOF의 근원)라 필드 제거 금지.
+    #[cfg_attr(windows, allow(dead_code))]
     master: Option<Box<dyn portable_pty::MasterPty + Send>>,
     /// stdin writer. unix pipe 폴백(출력 전용)은 None.
     writer: Option<SessionWriter>,
+    /// 마지막으로 적용된 PTY 크기 — 동일 크기 재요청을 no-op으로 만든다 (unix
+    /// 라이브 리사이즈 전용; windows는 라이브 리사이즈 자체를 전파하지 않는다).
+    #[cfg_attr(windows, allow(dead_code))]
+    last_pty_size: Option<(u16, u16)>,
+    /// ConPTY INHERIT_CURSOR 핸드셰이크(DSR 응답) 완료 여부. 사용자 stdin 쓰기는
+    /// 이게 서기 전엔 잠시 대기한다 — 핸드셰이크 전의 대량 write가 stdin 파이프
+    /// (유한 버퍼)를 채운 채 writer mutex를 쥐면, 리더의 DSR 응답이 같은 mutex에
+    /// 막히고 자식은 응답 전엔 stdin을 안 읽어 3자 교착이 된다.
+    #[cfg(windows)]
+    dsr_ready: Arc<std::sync::atomic::AtomicBool>,
 }
 
 static SESSION_IO: LazyLock<Mutex<HashMap<Uuid, SessionIo>>> =
@@ -124,9 +137,15 @@ fn register_session_io(session_id: Uuid, io: SessionIo) {
 }
 
 fn unregister_session_io(session_id: Uuid) {
-    if let Ok(mut map) = SESSION_IO.lock() {
-        map.remove(&session_id);
-    }
+    // 엔트리를 꺼낸 뒤 **락 밖에서** drop한다: Windows에서 master drop은
+    // ClosePseudoConsole이고, 이는 미소비 출력이 남아 있으면 드레인될 때까지
+    // 블록할 수 있다 — 전역 레지스트리 락을 문 채 블록하면 다른 모든 세션의
+    // resize/stdin/등록이 함께 멈춘다. (unix에선 drop 시점이 ~ns 뒤로 갈 뿐.)
+    let io = SESSION_IO
+        .lock()
+        .ok()
+        .and_then(|mut map| map.remove(&session_id));
+    drop(io);
 }
 
 /// Stop 버튼의 즉시 신호 경로: 스트림의 협조적 취소(50ms poll → SIGTERM → 2s → SIGKILL)를
@@ -140,18 +159,57 @@ pub fn terminate_session_process(pid: u32) {
     force_kill_process_tree(pid);
 }
 
-/// 세션 PTY의 화면 크기를 갱신한다. pipe 세션/미등록 세션은 no-op.
+/// 시그널 기반 인터럽트 폴백 — 신호를 실제로 보냈으면 true. PTY writer가 없는
+/// 세션(unix pipe 폴백)이나 ETX 쓰기가 `Broken`으로 끝난 경우에 쓴다.
+///
+/// unix: 그룹 SIGINT (`terminate_session_process`의 SIGTERM과 같은 그룹 신호 경로,
+/// 자기 그룹 가드 포함). Windows: GUI 프로세스는 다른 콘솔의 자식에 Ctrl+C 이벤트를
+/// 만들 수 없어 false — 호출측이 상태 메시지로 안내한다(강제 종료는 Stop의 몫).
+pub fn interrupt_session_process(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        signal_process_group(pid, libc::SIGINT);
+        true
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+/// 세션 PTY의 화면 크기를 갱신한다. pipe 세션/미등록 세션/동일 크기는 no-op.
+///
+/// **Windows는 라이브 리사이즈를 전파하지 않는다**: ConPTY(RESIZE_QUIRK)는
+/// ResizePseudoConsole마다 보이는 화면 전체를 다시 내보내는데, 위치 제어를 버리는
+/// 라인 스크롤백에서는 그 재방출이 열린 프롬프트에 이어붙고("namename") 뷰포트
+/// 높이만큼의 행 블록이 리사이즈마다 스크롤백에 쌓인다(실기 QA 실증). 크기는
+/// 스폰 시점(최근 관측 pane 크기)에 고정되고, 새 크기는 세션의 pty_viewport로
+/// 추적되어 다음 실행(rerun)에 반영된다.
 pub fn resize_session_pty(session_id: Uuid, cols: u16, rows: u16) {
-    if let Ok(map) = SESSION_IO.lock()
-        && let Some(io) = map.get(&session_id)
+    #[cfg(windows)]
+    {
+        let _ = (session_id, cols, rows);
+    }
+    #[cfg(not(windows))]
+    if let Ok(mut map) = SESSION_IO.lock()
+        && let Some(io) = map.get_mut(&session_id)
         && let Some(master) = &io.master
     {
-        let _ = master.resize(portable_pty::PtySize {
-            rows,
-            cols,
-            pixel_width: 0,
-            pixel_height: 0,
-        });
+        if io.last_pty_size == Some((cols, rows)) {
+            return;
+        }
+        if master
+            .resize(portable_pty::PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .is_ok()
+        {
+            io.last_pty_size = Some((cols, rows));
+        }
     }
 }
 
@@ -160,26 +218,162 @@ pub fn resize_session_pty(session_id: Uuid, cols: u16, rows: u16) {
 /// 순서를 보존하므로 재제출 없이 그대로 두면 중복도 없다).
 const STDIN_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// 세션 stdin에 한 줄을 쓴다 (`\n` 자동 부가).
+/// 세션 stdin에 한 줄을 쓴다 (줄 종결자 자동 부가 — 전송별: unix PTY `\n`,
+/// Windows ConPTY `\r`, 폴백 pipe `\n`).
 ///
-/// 에코 규칙("에코는 전송의 책임"): PTY는 라인 디시플린이 에코를 만들어 출력 스트림에
-/// 나타나므로 앱이 다시 표시하면 중복이다. Windows pipe는 에코가 없으므로 반환값
-/// `Ok(true)`(로컬 에코 필요)로 호출 측이 세션 로그에 직접 표시한다.
+/// 에코 규칙("에코는 전송의 책임"): PTY(unix)/ConPTY(Windows)는 터미널이 에코를
+/// 만들어 출력 스트림에 나타나므로 앱이 다시 표시하면 중복이다. Windows <1809의
+/// 폴백 pipe만 에코가 없어 반환값 `Ok(true)`(로컬 에코 필요)로 호출 측이 세션
+/// 로그에 직접 표시한다.
 ///
 /// unix pipe 폴백(writer 없음)·미등록 세션은 `Broken`으로 즉시 실패한다.
 pub async fn write_session_stdin(
     session_id: Uuid,
     line: String,
 ) -> Result<bool, crate::models::StdinWriteError> {
+    let writer = acquire_session_writer(session_id).await?;
+
+    // 줄 종결자는 전송별로 다르다 — writer가 판별된 뒤 각 arm에서 붙인다.
+    // ConPTY(WIN32_INPUT_MODE): Enter는 CR 한 개. '\n' 단독은 cooked 콘솔 앱
+    // (ReadConsole 라인 모드)에 제출되지 않고, '\r\n'은 CR+LF 두 키 입력으로
+    // 번역될 수 있어(raw 리더에 빈 Enter 중복) 단일 '\r'을 쓴다 — 터미널
+    // 에뮬레이터의 Enter와 동일. unix PTY는 기존대로 '\n'.
+    #[cfg(windows)]
+    const PTY_STDIN_EOL: char = '\r';
+    #[cfg(not(windows))]
+    const PTY_STDIN_EOL: char = '\n';
+
+    let mut payload = line;
+
+    match writer {
+        WriterHandle::Pty(w) => {
+            payload.push(PTY_STDIN_EOL);
+            write_pty_payload(w, payload.into_bytes())
+                .await
+                .map(|()| false) // PTY 에코 — 로컬 에코 불필요
+        }
+        #[cfg(windows)]
+        WriterHandle::Pipe(w) => {
+            use crate::models::StdinWriteError;
+            use tokio::io::AsyncWriteExt;
+            payload.push('\n'); // pipe stdin(<1809 폴백)은 기존대로 LF
+            let write = async {
+                let mut writer = w.lock().await;
+                writer
+                    .write_all(payload.as_bytes())
+                    .await
+                    .map_err(|e| e.to_string())?;
+                writer.flush().await.map_err(|e| e.to_string())
+            };
+            match tokio::time::timeout(STDIN_WRITE_TIMEOUT, write).await {
+                Ok(result) => result.map_err(StdinWriteError::Broken).map(|()| true), // 폴백 pipe — 로컬 에코 필요
+                Err(_) => Err(StdinWriteError::Timeout),
+            }
+        }
+    }
+}
+
+/// 실행 중인 세션 프로세스에 인터럽트(ETX `0x03`)를 보낸다 — 줄 종결자 없음.
+///
+/// - unix PTY: portable-pty의 openpty는 slave termios를 커널 기본값(cooked —
+///   `ISIG` 활성)으로 두므로, 라인 디시플린이 0x03을 fg 프로세스 그룹의 SIGINT로
+///   번역한다. `sh -l -c`는 비대화형(잡 컨트롤 없음)이라 sh와 자식이 같은 그룹.
+/// - Windows ConPTY: conhost가 입력 파이프의 ETX를 CTRL_C_EVENT로 번역해 콘솔
+///   자식들에 전달한다 (터미널 에뮬레이터의 Ctrl+C와 동일 경로).
+/// - 레거시 pipe 폴백(<1809)은 콘솔이 없어 전달 경로 자체가 없다 → `Broken`.
+///   미등록 세션(unix pipe 폴백 포함)도 `Broken` — 호출측(app)이 pid 기반
+///   `interrupt_session_process` 폴백/상태 메시지를 결정한다.
+pub async fn interrupt_session(session_id: Uuid) -> Result<(), crate::models::StdinWriteError> {
+    let writer = acquire_session_writer(session_id).await?;
+    match writer {
+        WriterHandle::Pty(w) => write_pty_payload(w, vec![0x03]).await,
+        #[cfg(windows)]
+        WriterHandle::Pipe(_) => Err(crate::models::StdinWriteError::Broken(String::from(
+            "interrupt is not supported on the legacy pipe fallback",
+        ))),
+    }
+}
+
+/// 실행 중인 세션 stdin에 EOF를 보낸다 (Ctrl+D).
+///
+/// - unix PTY: VEOF(`0x04`) — cooked tty의 라인 디시플린이 줄 시작의 0x04를
+///   read()=0(EOF)으로 번역한다. 줄 중간이면 부분 입력만 플러시된다 — 실제
+///   터미널의 Ctrl+D와 동일하며, 입력바의 미제출 드래프트는 전송되지 않는다.
+/// - Windows ConPTY: cooked 콘솔의 EOF 시퀀스 = Ctrl+Z + Enter(`0x1A 0x0D`) —
+///   줄 시작의 ^Z 제출을 콘솔 read가 0으로 번역한다.
+/// - Windows 레거시 pipe 폴백(<1809): stdin 핸들을 drop하는 것이 진짜 EOF다 —
+///   레지스트리에서 writer를 꺼내(take) **락 밖에서** 버린다. 이후 쓰기는 기존
+///   "not available" `Broken`으로 자연 귀결된다. 진행 중이던 쓰기가 Arc 클론을
+///   쥐고 있으면 그 쓰기가 끝날 때까지 실제 close가 늦어질 수 있다(유계).
+/// - 미등록/종료 세션은 `Broken` — EOF엔 시그널 폴백이 없어 호출측은 안내만 한다.
+pub async fn eof_session(session_id: Uuid) -> Result<(), crate::models::StdinWriteError> {
+    #[cfg(windows)]
+    {
+        // pipe 폴백은 acquire(Arc 복제) 대신 레지스트리에서 직접 take해야 close가
+        // 성립한다. Pty 세션이면 take하지 않고 아래 공용 경로로 내려간다.
+        let taken = {
+            let mut map = SESSION_IO.lock().map_err(|_| {
+                crate::models::StdinWriteError::Broken(String::from("session io registry poisoned"))
+            })?;
+            match map.get_mut(&session_id) {
+                Some(io) if matches!(io.writer, Some(SessionWriter::Pipe(_))) => io.writer.take(),
+                _ => None,
+            }
+        };
+        if let Some(writer) = taken {
+            drop(writer);
+            return Ok(());
+        }
+    }
+
+    let writer = acquire_session_writer(session_id).await?;
+    match writer {
+        WriterHandle::Pty(w) => {
+            #[cfg(windows)]
+            const EOF_PAYLOAD: &[u8] = b"\x1a\r";
+            #[cfg(not(windows))]
+            const EOF_PAYLOAD: &[u8] = b"\x04";
+            write_pty_payload(w, EOF_PAYLOAD.to_vec()).await
+        }
+        #[cfg(windows)]
+        WriterHandle::Pipe(_) => {
+            // 위 take 블록이 Pipe를 처리하므로 정상 흐름에선 도달하지 않는다 —
+            // 등록 경합 등 비정상 상태의 방어적 실패 처리.
+            Err(crate::models::StdinWriteError::Broken(String::from(
+                "process input is not available for this session",
+            )))
+        }
+    }
+}
+
+/// 레지스트리에서 세션 writer 핸들을 복제해 꺼낸다. 락은 조회에만 쓰고 Arc를 복제해
+/// 나온다 — 느린 세션 하나가 레지스트리(다른 세션의 조회/등록)를 막지 않게 한다.
+///
+/// windows: ConPTY DSR 핸드셰이크가 끝나기 전의 쓰기는 잠시 대기한다(fail-open
+/// ~500ms). 핸드셰이크 전의 대량 write가 유한 stdin 파이프를 채운 채 writer
+/// mutex를 쥐면, 리더의 DSR 응답이 같은 mutex에 막히고 자식은 응답 전엔 stdin을
+/// 읽지 않아 세션 전체가 교착한다. ready 이후 리더는 이 mutex를 다시 잡지 않는다.
+async fn acquire_session_writer(
+    session_id: Uuid,
+) -> Result<WriterHandle, crate::models::StdinWriteError> {
     use crate::models::StdinWriteError;
 
-    // 레지스트리 락은 조회에만 사용하고 Arc를 복제해 나온다 — 느린 세션 하나가
-    // 레지스트리(다른 세션의 조회/등록)를 막지 않게 한다.
+    #[cfg(windows)]
+    let dsr_ready;
     let writer = {
         let map = SESSION_IO
             .lock()
             .map_err(|_| StdinWriteError::Broken(String::from("session io registry poisoned")))?;
-        match map.get(&session_id).and_then(|io| io.writer.as_ref()) {
+        let Some(io) = map.get(&session_id) else {
+            return Err(StdinWriteError::Broken(String::from(
+                "process input is not available for this session",
+            )));
+        };
+        #[cfg(windows)]
+        {
+            dsr_ready = Arc::clone(&io.dsr_ready);
+        }
+        match io.writer.as_ref() {
             Some(SessionWriter::Pty(w)) => WriterHandle::Pty(Arc::clone(w)),
             #[cfg(windows)]
             Some(SessionWriter::Pipe(w)) => WriterHandle::Pipe(Arc::clone(w)),
@@ -191,49 +385,45 @@ pub async fn write_session_stdin(
         }
     };
 
-    let mut payload = line;
-    payload.push('\n');
+    #[cfg(windows)]
+    for _ in 0..100 {
+        if dsr_ready.load(std::sync::atomic::Ordering::Acquire) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
 
-    match writer {
-        WriterHandle::Pty(w) => {
-            let write = tokio::task::spawn_blocking(move || {
-                use std::io::Write;
-                let mut writer = w
-                    .lock()
-                    .map_err(|_| String::from("stdin writer poisoned"))?;
-                writer
-                    .write_all(payload.as_bytes())
-                    .and_then(|()| writer.flush())
-                    .map_err(|e| e.to_string())
-            });
-            match tokio::time::timeout(STDIN_WRITE_TIMEOUT, write).await {
-                Ok(joined) => joined
-                    .map_err(|e| StdinWriteError::Broken(format!("stdin task failed: {e}")))?
-                    .map_err(StdinWriteError::Broken)
-                    .map(|()| false), // PTY 에코 — 로컬 에코 불필요
-                Err(_) => Err(StdinWriteError::Timeout),
-            }
-        }
-        #[cfg(windows)]
-        WriterHandle::Pipe(w) => {
-            use tokio::io::AsyncWriteExt;
-            let write = async {
-                let mut writer = w.lock().await;
-                writer
-                    .write_all(payload.as_bytes())
-                    .await
-                    .map_err(|e| e.to_string())?;
-                writer.flush().await.map_err(|e| e.to_string())
-            };
-            match tokio::time::timeout(STDIN_WRITE_TIMEOUT, write).await {
-                Ok(result) => result.map_err(StdinWriteError::Broken).map(|()| true), // pipe — 로컬 에코 필요
-                Err(_) => Err(StdinWriteError::Timeout),
-            }
-        }
+    Ok(writer)
+}
+
+/// PTY writer에 바이트를 그대로 쓴다 — spawn_blocking에서 write_all+flush,
+/// `STDIN_WRITE_TIMEOUT` 적용. 줄 종결자 등 페이로드 구성은 호출측 책임.
+async fn write_pty_payload(
+    writer: Arc<Mutex<Box<dyn std::io::Write + Send>>>,
+    payload: Vec<u8>,
+) -> Result<(), crate::models::StdinWriteError> {
+    use crate::models::StdinWriteError;
+
+    let write = tokio::task::spawn_blocking(move || {
+        use std::io::Write;
+        let mut writer = writer
+            .lock()
+            .map_err(|_| String::from("stdin writer poisoned"))?;
+        writer
+            .write_all(&payload)
+            .and_then(|()| writer.flush())
+            .map_err(|e| e.to_string())
+    });
+    match tokio::time::timeout(STDIN_WRITE_TIMEOUT, write).await {
+        Ok(joined) => joined
+            .map_err(|e| StdinWriteError::Broken(format!("stdin task failed: {e}")))?
+            .map_err(StdinWriteError::Broken),
+        Err(_) => Err(StdinWriteError::Timeout),
     }
 }
 
-/// `write_session_stdin` 내부 전용 — 레지스트리 락 밖으로 복제해 나온 writer 핸들.
+/// `write_session_stdin`/`interrupt_session` 내부 전용 — 레지스트리 락 밖으로
+/// 복제해 나온 writer 핸들.
 enum WriterHandle {
     Pty(Arc<Mutex<Box<dyn std::io::Write + Send>>>),
     #[cfg(windows)]
@@ -290,7 +480,30 @@ impl Drop for CompletionGuard {
         // 세션 I/O 핸들(PTY master/stdin writer)은 스트림 수명과 함께 무조건 정리한다
         // (armed 여부 무관 — 정상 종료·취소·패닉 전 경로). master drop이 PTY를 닫아
         // 아직 살아 있는 reader 스레드도 EOF로 풀려난다.
+        #[cfg(not(windows))]
         unregister_session_io(self.session_id);
+        // Windows: master drop = ClosePseudoConsole은 잔여 출력이 드레인될 때까지
+        // 블록할 수 있다. 이 Drop은 tokio 워커에서 돌므로(취소/패닉 경로), 엔트리를
+        // 여기서 꺼내되 실제 drop은 블로킹 풀로 분리 투하한다 — 느린/wedge된 conhost가
+        // 고정 워커를 점유하지 못하게. 런타임 밖이면(이론상) 인라인 drop 폴백.
+        // 셧다운 경합(tokio 1.x 확인): 셧다운 중 spawn_blocking은 panic하지 않고
+        // 클로저를 호출 스레드에서 동기 실행(cancel_task)한다 → try_current 폴백과
+        // 동일한 인라인 drop으로 수렴. 이 가정은 tokio 메이저 업그레이드 시 재확인.
+        #[cfg(windows)]
+        {
+            let session_id = self.session_id;
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                let io = SESSION_IO
+                    .lock()
+                    .ok()
+                    .and_then(|mut map| map.remove(&session_id));
+                if io.is_some() {
+                    handle.spawn_blocking(move || drop(io));
+                }
+            } else {
+                unregister_session_io(session_id);
+            }
+        }
         if self.armed {
             let _ = self.output.try_send(Message::RunCompleted(
                 self.session_id,
@@ -310,8 +523,8 @@ pub fn run_configuration_stream(
     stream::channel(
         100,
         move |mut output: iced::futures::channel::mpsc::Sender<Message>| async move {
-            // pipe 전용 플랫폼(Windows)에서는 초기 뷰포트를 쓸 곳이 없다 (PTY 전용).
-            #[cfg(not(unix))]
+            // PTY가 없는 기타 플랫폼에서는 초기 뷰포트를 쓸 곳이 없다.
+            #[cfg(not(any(unix, windows)))]
             let _ = initial_viewport;
             // 종료 보장 가드: 정상 경로의 끝에서 disarm한다.
             let mut completion = CompletionGuard::new(output.clone(), session_id);
@@ -327,10 +540,11 @@ pub fn run_configuration_stream(
             )
             .await;
 
-            // unix 기본 경로: PTY — isatty=true로 색·진행바·프롬프트가 살아난다.
-            // openpty 실패(fd 고갈 등 희귀)만 pipe로 폴백하고, spawn 실패는 명령 문제라
-            // 폴백 없이 그대로 보고한다. Windows는 pipe 경로 고정(ConPTY는 후속).
-            #[cfg(unix)]
+            // 기본 경로: PTY(unix)/ConPTY(Windows 10 1809+) — 진짜 터미널로 색·진행바·
+            // 프롬프트가 살아난다. PtyUnavailable(unix: openpty 실패, windows: ConPTY
+            // 부재/openpty 실패)만 pipe로 폴백하고, spawn 실패는 명령 문제라 폴백 없이
+            // 그대로 보고한다.
+            #[cfg(any(unix, windows))]
             {
                 // 초기 크기: 마지막 관측 뷰포트(rerun/재사용 pane) 또는 기본 120×40.
                 // 신규 pane은 첫 프레임의 SessionViewportResized가 실측값으로 보정한다.
@@ -347,15 +561,24 @@ pub fn run_configuration_stream(
                         return;
                     }
                     Err(PtySpawnError::PtyUnavailable(e)) => {
-                        // 출력 전용 pipe 폴백 — stdin/라이브 진행바 없음(문서화된 한계).
+                        // pipe 폴백. 문구가 플랫폼별로 다른 이유: unix 폴백은 stdin을
+                        // 배선하지 않지만(출력 전용), windows 폴백은 stdin pipe + 로컬
+                        // 에코가 배선된다 — unix 문구를 공용하면 windows에서 거짓이 된다.
+                        #[cfg(unix)]
+                        let banner = format!(
+                            "[pty unavailable ({e}); falling back to pipes — \
+                             stdin input is disabled for this run]"
+                        );
+                        #[cfg(windows)]
+                        let banner = format!(
+                            "[conpty unavailable ({e}); falling back to pipes — \
+                             no colors/progress bars, stdin input echoes locally]"
+                        );
                         use iced::futures::SinkExt;
                         let _ = output
                             .send(Message::OutputReceived(
                                 session_id,
-                                vec![OutputEvent::Line(format!(
-                                    "[pty unavailable ({e}); falling back to pipes — \
-                                     stdin input is disabled for this run]"
-                                ))],
+                                vec![OutputEvent::Line(banner)],
                             ))
                             .await;
                     }
@@ -534,7 +757,30 @@ fn create_process_command(
     cmd
 }
 
-// ---- PTY 스폰 (unix 기본 경로) --------------------------------------------------
+// ---- PTY 스폰 (unix PTY / Windows ConPTY 기본 경로) -----------------------------
+
+/// ConPTY 지원 여부 (Windows 10 1809+). portable-pty의 openpty는 미지원 OS에서
+/// Err가 아니라 **lazy_static 초기화 panic**을 일으키므로(psuedocon.rs load_conpty의
+/// expect), openpty 호출 전에 반드시 이걸로 선확인한다. kernel32는 모든 Windows
+/// 타깃에 기본 링크되고 두 심볼은 ABI 불변이라 의존성 추가 없이 수기 FFI로 조회한다.
+#[cfg(windows)]
+fn conpty_available() -> bool {
+    static AVAILABLE: LazyLock<bool> = LazyLock::new(|| {
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetModuleHandleA(name: *const u8) -> *mut core::ffi::c_void;
+            fn GetProcAddress(
+                module: *mut core::ffi::c_void,
+                name: *const u8,
+            ) -> *mut core::ffi::c_void;
+        }
+        unsafe {
+            let k32 = GetModuleHandleA(c"kernel32.dll".as_ptr().cast());
+            !k32.is_null() && !GetProcAddress(k32, c"CreatePseudoConsole".as_ptr().cast()).is_null()
+        }
+    });
+    *AVAILABLE
+}
 
 /// PTY에서 돌릴 명령을 구성한다. pipe 경로와 동일한 셸 래핑(sh -l -c) + 환경변수
 /// 직접 주입 불변식에, 진짜 터미널임을 알리는 TERM을 더한다.
@@ -557,13 +803,46 @@ fn create_pty_command(
     cmd
 }
 
+/// ConPTY에서 돌릴 명령을 구성한다 — pipe 경로(create_process_command)와 동일한
+/// PowerShell 래핑(pwsh/powershell 캐시 탐지 + UTF-8 프리앰블 + legacy 체이닝 재작성).
+/// TERM은 설정하지 않는다: Windows 콘솔 앱은 kernel32 콘솔 모드로 판별하고, ConPTY
+/// 호스트가 VT 에뮬레이터다. CREATE_NO_WINDOW도 불필요 — pseudoconsole 스폰은 창을
+/// 만들지 않는다.
+#[cfg(windows)]
+fn create_pty_command(
+    config: &RunConfiguration,
+    command_str: &str,
+    extra_env: &[(String, String)],
+) -> portable_pty::CommandBuilder {
+    let exe = windows_powershell_exe();
+    let adapted = if exe == "pwsh" {
+        command_str.to_string()
+    } else {
+        rewrite_chaining_for_legacy_powershell(command_str)
+    };
+    let mut cmd = portable_pty::CommandBuilder::new(exe);
+    cmd.args([
+        "-NoProfile",
+        "-Command",
+        &format!("[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; {adapted}"),
+    ]);
+    cmd.cwd(&config.working_directory);
+    for (key, value) in &config.environment_variables {
+        cmd.env(key, value);
+    }
+    for (key, value) in extra_env {
+        cmd.env(key, value);
+    }
+    cmd
+}
+
 /// PTY 스폰 결과 — 스트림 태스크가 소비할 채널들과 kill용 pid.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 struct PtyProcess {
     pid: Option<u32>,
     chunks_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
     exit_rx: tokio::sync::oneshot::Receiver<Result<i32, String>>,
-    // 프로덕션은 스레드를 join하지 않는다(자체 회수) — 회수 회귀 테스트 전용 핸들.
+    // 프로덕션은 스레드를 join하지 않는다(자체 회수/EOF 귀결) — 회수 회귀 테스트 전용 핸들.
     #[cfg_attr(not(test), allow(dead_code))]
     reader_thread: Option<std::thread::JoinHandle<()>>,
 }
@@ -624,18 +903,116 @@ fn pty_reader_thread(fd: std::os::fd::OwnedFd, tx: tokio::sync::mpsc::Sender<Vec
     }
 }
 
+/// ConPTY reader 스레드: blocking read → bounded 채널. unix 트윈과 달리 poll이 없다 —
+/// try_clone_reader는 raw HANDLE을 노출하지 않는 `Box<dyn Read>`라 대기 이탈 수단이
+/// 없고, EOF는 자식 종료가 아니라 **ClosePseudoConsole(master drop) 이후에만** 온다.
+///
+/// 핵심 불변식 — **drain-discard**: 수신측이 사라지면(`blocking_send` Err) 전달을
+/// 단방향으로 끄고 EOF까지 계속 읽어 버린다. ClosePseudoConsole은 미소비 출력이
+/// 남아 있으면 드롭 스레드를 블록하는데, 이 드레인이 그 블록을 보증 해제한다.
+/// 수신측 소멸 후에만 버리므로 관측자가 없어 순서 역전도 없다.
+/// 종료: Ok(0) 또는 Err(BrokenPipe 등) — Windows 익명 파이프는 EOF를 어느 쪽으로도
+/// 표현할 수 있어 Interrupted 외 모든 Err를 EOF 등가로 취급한다.
+///
+/// **DSR(커서 위치) 핸드셰이크 — 자식 기동의 전제조건**: portable-pty는
+/// CreatePseudoConsole에 `PSEUDOCONSOLE_INHERIT_CURSOR`를 하드코딩하는데, 이 모드의
+/// conhost는 기동 직후 터미널에 `ESC[6n`(커서 위치 질의)을 내보내고 **응답이 입력
+/// 파이프로 올 때까지 자식의 콘솔 초기화를 블록**한다. 진짜 터미널(wezterm 등)은
+/// 이에 응답하지만 우리는 터미널 에뮬레이터가 아니므로, 여기서 질의를 감지해
+/// `ESC[1;1R`(1행 1열)로 대신 응답한다 — 안 하면 자식이 명령 실행조차 시작하지
+/// 못한 채 영원히 대기한다 (CI에서 실증). 질의는 청크 경계에 걸릴 수 있어 직전
+/// 꼬리 3바이트를 이월해 검색한다.
+#[cfg(windows)]
+fn pty_reader_thread(
+    mut reader: Box<dyn std::io::Read + Send>,
+    tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    dsr_writer: Arc<Mutex<Box<dyn std::io::Write + Send>>>,
+    dsr_ready: Arc<std::sync::atomic::AtomicBool>,
+) {
+    const DSR_REQUEST: &[u8] = b"\x1b[6n";
+
+    // 진단용 원시 덤프 (환경변수 게이트): `RCM_PTY_DUMP=1`이면 conhost가 내보내는
+    // 바이트를 escape_debug 텍스트로 %TEMP%\rcm-pty-dump-<thread>.txt에 기록한다.
+    // ConPTY 렌더 시퀀스는 conhost 버전마다 달라 실기기 관찰이 유일한 근거다.
+    let mut dump = std::env::var_os("RCM_PTY_DUMP").map(|_| {
+        let path = std::env::temp_dir().join(format!(
+            "rcm-pty-dump-{}.txt",
+            std::thread::current()
+                .name()
+                .unwrap_or("pty")
+                .replace(':', "_")
+        ));
+        std::fs::File::create(path).ok()
+    });
+
+    let mut buf = [0u8; 8192];
+    let mut forwarding = true;
+    let mut dsr_answered = false;
+    let mut dsr_tail: Vec<u8> = Vec::new();
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                if let Some(Some(f)) = dump.as_mut() {
+                    use std::io::Write;
+                    let _ = writeln!(
+                        f,
+                        "[chunk {n}B] {}",
+                        String::from_utf8_lossy(&buf[..n]).escape_debug()
+                    );
+                    let _ = f.flush();
+                }
+                if !dsr_answered {
+                    // 직전 꼬리 + 이번 청크에서 질의 검색 (경계 걸침 대응).
+                    let mut window = std::mem::take(&mut dsr_tail);
+                    window.extend_from_slice(&buf[..n]);
+                    if window.windows(DSR_REQUEST.len()).any(|w| w == DSR_REQUEST) {
+                        // 성공했을 때만 answered — 실패를 성공으로 오기록하면 재시도
+                        // 기회를 영영 잃고 자식이 콘솔 초기화에서 멈춘다.
+                        match dsr_writer.lock() {
+                            Ok(mut w) => {
+                                dsr_answered =
+                                    w.write_all(b"\x1b[1;1R").and_then(|()| w.flush()).is_ok();
+                                if dsr_answered {
+                                    dsr_ready.store(true, std::sync::atomic::Ordering::Release);
+                                } else {
+                                    eprintln!(
+                                        "[pty] DSR reply write failed; child console init may hang"
+                                    );
+                                }
+                            }
+                            Err(_) => eprintln!(
+                                "[pty] DSR writer mutex poisoned; child console init may hang"
+                            ),
+                        }
+                    }
+                    if !dsr_answered {
+                        let keep = window.len().min(DSR_REQUEST.len() - 1);
+                        dsr_tail = window[window.len() - keep..].to_vec();
+                    }
+                }
+                if forwarding && tx.blocking_send(buf[..n].to_vec()).is_err() {
+                    forwarding = false;
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+}
+
 /// PTY를 열고 명령을 스폰한다. 성공 시 세션 I/O(마스터·writer)를 레지스트리에 등록하고
 /// reader 스레드·waiter(blocking wait 소유)를 기동한다.
 ///
-/// 에러 구분: `openpty` 실패는 `Err(PtyUnavailable)`로 돌려 pipe 폴백을 허용하고,
-/// spawn 실패는 명령 문제이므로 폴백 없이 사용자에게 그대로 보고한다.
-#[cfg(unix)]
+/// 에러 구분: `openpty` 실패/ConPTY 부재는 `Err(PtyUnavailable)`로 돌려 pipe 폴백을
+/// 허용하고, spawn 실패는 명령 문제이므로 폴백 없이 사용자에게 그대로 보고한다.
+#[cfg(any(unix, windows))]
 enum PtySpawnError {
     PtyUnavailable(String),
     Spawn(String),
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn spawn_in_pty(
     config: &RunConfiguration,
     command_str: &str,
@@ -644,6 +1021,15 @@ fn spawn_in_pty(
     viewport: (u16, u16),
 ) -> Result<PtyProcess, PtySpawnError> {
     use portable_pty::{PtySize, native_pty_system};
+
+    // ConPTY 부재(<1809)면 openpty가 Err가 아니라 panic이다 — 반드시 여기서 걸러
+    // pipe 폴백으로 보낸다.
+    #[cfg(windows)]
+    if !conpty_available() {
+        return Err(PtySpawnError::PtyUnavailable(String::from(
+            "ConPTY not supported (Windows 10 1809+ required)",
+        )));
+    }
 
     let pair = native_pty_system()
         .openpty(PtySize {
@@ -659,15 +1045,18 @@ fn spawn_in_pty(
         .slave
         .spawn_command(cmd)
         .map_err(|e| PtySpawnError::Spawn(format!("Failed to spawn process: {e}")))?;
-    // slave를 부모에서 즉시 닫아야 자식 종료 시 master reader가 EOF를 받는다.
+    // unix: slave fd를 부모에서 즉시 닫아야 자식 종료 시 master reader가 EOF를 받는다.
+    // windows: master와 같은 Arc<Inner>의 참조 하나를 줄일 뿐(무해) — 이후 레지스트리의
+    // master가 Inner의 유일 소유자가 되어, unregister가 단일 teardown 트리거가 된다.
     drop(pair.slave);
 
     let pid = child.process_id();
 
-    // 리더용 fd는 try_clone_reader(Box<dyn Read> — raw fd 접근 불가) 대신 직접 dup한다:
-    // pty_reader_thread가 poll하려면 raw fd가 필요하다. F_DUPFD_CLOEXEC로 복제해
-    // 이후 스폰되는 다른 세션 자식에게 새지 않게 한다(try_clone_reader 내부와 동일 방식).
-    let reader_fd = {
+    // 리더 소스 — unix: poll이 필요해 raw fd를 직접 dup(F_DUPFD_CLOEXEC — 타 세션
+    // 자식에 누출 방지, try_clone_reader 내부와 동일 방식). windows: raw HANDLE
+    // 접근이 불가하므로 try_clone_reader(DuplicateHandle — Inner 수명과 독립)를 쓴다.
+    #[cfg(unix)]
+    let reader_src = {
         use std::os::fd::{FromRawFd, OwnedFd};
 
         let raw = pair
@@ -683,24 +1072,46 @@ fn spawn_in_pty(
         }
         unsafe { OwnedFd::from_raw_fd(dup) }
     };
+    #[cfg(windows)]
+    let reader_src = pair
+        .master
+        .try_clone_reader()
+        .map_err(|e| PtySpawnError::Spawn(format!("Failed to clone pty reader: {e}")))?;
+
     let writer = pair
         .master
         .take_writer()
         .map_err(|e| PtySpawnError::Spawn(format!("Failed to open pty writer: {e}")))?;
+    let writer = Arc::new(Mutex::new(writer));
+    // windows: 리더 스레드가 conhost의 INHERIT_CURSOR 질의(ESC[6n)에 응답할 수 있게
+    // stdin writer를 공유한다 (응답 없이는 자식이 콘솔 초기화에서 영원히 대기).
+    #[cfg(windows)]
+    let dsr_writer = Arc::clone(&writer);
+    #[cfg(windows)]
+    let dsr_ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     // ProcessStarted 발송 전에 등록 — 첫 프레임의 resize가 핸들을 찾을 수 있게.
     register_session_io(
         session_id,
         SessionIo {
             master: Some(pair.master),
-            writer: Some(SessionWriter::Pty(Arc::new(Mutex::new(writer)))),
+            writer: Some(SessionWriter::Pty(writer)),
+            last_pty_size: Some(viewport),
+            #[cfg(windows)]
+            dsr_ready: Arc::clone(&dsr_ready),
         },
     );
 
     let (chunks_tx, chunks_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+    #[cfg(unix)]
     let reader_thread = std::thread::Builder::new()
         .name(format!("pty-read-{session_id}"))
-        .spawn(move || pty_reader_thread(reader_fd, chunks_tx))
+        .spawn(move || pty_reader_thread(reader_src, chunks_tx))
+        .ok();
+    #[cfg(windows)]
+    let reader_thread = std::thread::Builder::new()
+        .name(format!("pty-read-{session_id}"))
+        .spawn(move || pty_reader_thread(reader_src, chunks_tx, dsr_writer, dsr_ready))
         .ok();
 
     // waiter가 child를 소유하고 blocking wait로 reap한다 (좀비 방지, 스트림 패닉과 무관).
@@ -768,7 +1179,9 @@ async fn send_command_info(
 }
 
 /// PTY 세션 파이프라인: ProcessStarted → 조립 루프 → (취소 시 종료 처리) → RunCompleted.
-#[cfg(unix)]
+/// 플랫폼 차이는 동명 트윈(pty_output_loop/terminate_and_reap_pty) 안에 있고
+/// 이 파이프라인 자체는 공유된다.
+#[cfg(any(unix, windows))]
 async fn handle_pty_process(
     output: &mut iced::futures::channel::mpsc::Sender<Message>,
     session_id: Uuid,
@@ -790,8 +1203,8 @@ async fn handle_pty_process(
     )
     .await
     {
-        PtyLoopEnd::Cancelled => {
-            terminate_and_reap_pty(pty.pid, &mut pty.exit_rx).await;
+        PtyLoopEnd::Cancelled { exit_taken } => {
+            terminate_and_reap_pty(pty.pid, &mut pty.exit_rx, exit_taken).await;
             send_run_result(
                 output,
                 session_id,
@@ -806,9 +1219,15 @@ async fn handle_pty_process(
 }
 
 /// PTY 조립 루프의 종료 사유.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 enum PtyLoopEnd {
-    Cancelled,
+    /// 취소. `exit_taken`은 취소 시점에 exit 팔이 **이미 소비한** 종료 상태 —
+    /// tokio oneshot은 완료 후 재폴링하면 panic하므로("called after complete"),
+    /// 소비 여부를 운반해 terminate_and_reap_pty가 재await를 건너뛰게 한다.
+    /// (자식은 exit했는데 손자가 pty를 쥐고 있어 드레인 중 Stop이 오는 시나리오.)
+    Cancelled {
+        exit_taken: Option<Result<i32, String>>,
+    },
     Completed(Result<i32, String>),
 }
 
@@ -839,7 +1258,9 @@ async fn pty_output_loop(
                 // 같은 종류의 트레이드오프(창이 조금 더 클 뿐).
                 assembler.emit_partial(&mut batch);
                 flush_event_batch(output, session_id, &mut batch).await;
-                return PtyLoopEnd::Cancelled;
+                return PtyLoopEnd::Cancelled {
+                    exit_taken: exit_status.take(),
+                };
             }
 
             () = wait_flush_deadline(flush_at), if !batch.is_empty() || assembler.has_pending() => {
@@ -867,7 +1288,10 @@ async fn pty_output_loop(
                         // EOF인데 자식이 아직 안 끝남(드묾): 종료 또는 취소 대기.
                         tokio::select! {
                             biased;
-                            () = wait_for_cancel(cancel_flag) => return PtyLoopEnd::Cancelled,
+                            () = wait_for_cancel(cancel_flag) => {
+                                // 이 분기는 exit_status가 None일 때만 도달 (EOF 후 대기 중).
+                                return PtyLoopEnd::Cancelled { exit_taken: None };
+                            }
                             status = &mut *exit_rx => {
                                 return PtyLoopEnd::Completed(status.unwrap_or_else(|_| {
                                     Err(String::from("Process exit status unavailable"))
@@ -897,14 +1321,154 @@ async fn pty_output_loop(
     }
 }
 
+/// ConPTY 종료 상태기계 상수 — exit 후 "마지막 청크로부터"의 quiet 유예. conhost의
+/// 최종 flush(<50ms 통상)와 CI VM 지터를 덮되 체감 지연은 없앤다. 청크가 올 때마다
+/// 갱신되는 quiet 타이머라 계속 말하는 손자 스트림은 끊지 않는다.
+#[cfg(windows)]
+const CONPTY_EXIT_QUIET_GRACE: Duration = Duration::from_millis(300);
+/// teardown(ClosePseudoConsole) 착수 후 EOF 하드 실링 — conhost가 비정상 wedge돼도
+/// 세션이 is_running에 고착되지 않게 Completed로 강제 귀결한다. 트립 시 리더/블로킹풀
+/// 스레드는 EOF가 실제로 올 때까지 남는다(유계 누수, 문서화된 트레이드오프).
+#[cfg(windows)]
+const CONPTY_EOF_FAILSAFE: Duration = Duration::from_secs(5);
+
+/// ConPTY 출력 조립 루프 — unix 트윈과 같은 배관(cancel/flush/청크/exit)에 **종료
+/// 상태기계**가 추가된다. ConPTY는 자식이 exit해도 EOF를 주지 않는다(EOF는 오직
+/// ClosePseudoConsole 이후). unix처럼 "exit 후 EOF까지 드레인"만 하면 EOF←master
+/// drop←루프 종료←EOF의 순환 대기가 되므로: exit 기록 → 마지막 청크 기준 quiet-grace
+/// (300ms, 청크마다 갱신 — 수다스런 손자는 안 끊김) → **블로킹 풀에서** unregister
+/// (ClosePseudoConsole; 루프는 계속 소비해 정상 배관으로 꼬리를 드레인 — 루프 태스크
+/// 인라인 unregister는 [Close 블록 ↔ 리더 blocking_send ↔ 수신 없는 루프] 3자 교착)
+/// → 리더 EOF → 기존 EOF 분기로 Completed. failsafe(5s, teardown 착수 시점 무장 +
+/// **청크 도착마다 rolling 갱신**)는 wedge된 conhost — 청크가 아예 안 오는 상태 —
+/// 에서만 세션 고착을 방지하고, 정상적으로 흐르는 드레인은 절대 절단하지 않는다.
+///
+/// 상태 전이(가드가 핵심): teardown 팔 `teardown_at.is_some() && !teardown_started`
+/// (없으면 과거 시각으로 매 반복 spawn_blocking 스핀), failsafe는 teardown 착수
+/// 시점에만 무장(exit 시점 기준이면 5s 넘게 말하는 손자를 조기 절단), biased 순서
+/// cancel→flush→청크→exit→teardown→failsafe (동시 준비 시 청크가 grace를 먼저 갱신;
+/// failsafe는 청크가 흐르는 동안 굶는데 그게 정확한 의미 — 진행 중엔 실링 불필요).
+#[cfg(windows)]
+async fn pty_output_loop(
+    output: &mut iced::futures::channel::mpsc::Sender<Message>,
+    session_id: Uuid,
+    chunks_rx: &mut tokio::sync::mpsc::Receiver<Vec<u8>>,
+    exit_rx: &mut tokio::sync::oneshot::Receiver<Result<i32, String>>,
+    cancel_flag: &Arc<AtomicBool>,
+) -> PtyLoopEnd {
+    let mut assembler = LineAssembler::new();
+    let mut batch = EventBatch::default();
+    let mut flush_at: Option<Instant> = None;
+    let mut exit_status: Option<Result<i32, String>> = None;
+    let mut teardown_at: Option<Instant> = None;
+    let mut teardown_started = false;
+    let mut failsafe_at: Option<Instant> = None;
+
+    loop {
+        tokio::select! {
+            biased;
+
+            () = wait_for_cancel(cancel_flag) => {
+                // Stop은 즉시성이 우선: 버퍼된 청크는 버린다 (unix 트윈과 동일).
+                assembler.emit_partial(&mut batch);
+                flush_event_batch(output, session_id, &mut batch).await;
+                return PtyLoopEnd::Cancelled {
+                    exit_taken: exit_status.take(),
+                };
+            }
+
+            () = wait_flush_deadline(flush_at), if !batch.is_empty() || assembler.has_pending() => {
+                assembler.emit_partial(&mut batch);
+                flush_event_batch(output, session_id, &mut batch).await;
+                flush_at = None;
+            }
+
+            chunk = chunks_rx.recv() => {
+                match chunk {
+                    Some(bytes) => {
+                        let was_empty = batch.is_empty() && !assembler.has_pending();
+                        assembler.push_bytes(&bytes, &mut batch);
+                        if was_empty && (!batch.is_empty() || assembler.has_pending()) {
+                            flush_at = Some(Instant::now() + OUTPUT_FLUSH_INTERVAL);
+                        }
+                        // quiet 타이머 갱신: exit 후에도 출력이 흐르는 동안은 살려 둔다.
+                        if exit_status.is_some() && !teardown_started {
+                            teardown_at = Some(Instant::now() + CONPTY_EXIT_QUIET_GRACE);
+                        }
+                        // failsafe도 rolling: teardown 후 드레인이 정상적으로 흐르는
+                        // 동안은 절단하지 않는다 — 실링은 "청크가 아예 안 오는 wedge"
+                        // 에만 걸린다. 고정 시각이면 5s를 넘는 건강한 대용량 드레인을
+                        // 조기 절단한다 (리뷰에서 재현 실증된 결함).
+                        if teardown_started {
+                            failsafe_at = Some(Instant::now() + CONPTY_EOF_FAILSAFE);
+                        }
+                    }
+                    // EOF: ClosePseudoConsole 이후에만 도달한다 (teardown 정상 귀결
+                    // 또는 conhost 사망).
+                    None => {
+                        assembler.finalize(&mut batch);
+                        flush_event_batch(output, session_id, &mut batch).await;
+                        if let Some(status) = exit_status.take() {
+                            return PtyLoopEnd::Completed(status);
+                        }
+                        // exit 전 EOF(conhost 비정상 사망): 종료 또는 취소 대기.
+                        tokio::select! {
+                            biased;
+                            () = wait_for_cancel(cancel_flag) => {
+                                return PtyLoopEnd::Cancelled { exit_taken: None };
+                            }
+                            status = &mut *exit_rx => {
+                                return PtyLoopEnd::Completed(status.unwrap_or_else(|_| {
+                                    Err(String::from("Process exit status unavailable"))
+                                }));
+                            }
+                        }
+                    }
+                }
+            }
+
+            status = &mut *exit_rx, if exit_status.is_none() => {
+                exit_status = Some(status.unwrap_or_else(|_| {
+                    Err(String::from("Process exit status unavailable"))
+                }));
+                // 종료 상태기계 무장: 마지막 청크로부터 quiet-grace 후 teardown.
+                teardown_at = Some(Instant::now() + CONPTY_EXIT_QUIET_GRACE);
+            }
+
+            () = wait_flush_deadline(teardown_at), if teardown_at.is_some() && !teardown_started => {
+                teardown_started = true;
+                teardown_at = None;
+                failsafe_at = Some(Instant::now() + CONPTY_EOF_FAILSAFE);
+                // ClosePseudoConsole은 미소비 출력이 드레인될 때까지 블록할 수 있어
+                // 블로킹 풀로 보낸다 — 이 루프는 계속 소비하며 EOF로 자연 귀결된다.
+                tokio::task::spawn_blocking(move || unregister_session_io(session_id));
+            }
+
+            () = wait_flush_deadline(failsafe_at), if failsafe_at.is_some() => {
+                assembler.finalize(&mut batch);
+                flush_event_batch(output, session_id, &mut batch).await;
+                return PtyLoopEnd::Completed(exit_status.take().unwrap_or_else(|| {
+                    Err(String::from("Process exit status unavailable"))
+                }));
+            }
+        }
+
+        // 크기 임계는 메모리 가드로만 — 페이싱은 16ms 마감이 담당 (unix 트윈 주석 참조).
+        if batch.len() >= PTY_FLUSH_MAX_EVENTS || batch.bytes >= PTY_FLUSH_MAX_BYTES {
+            flush_event_batch(output, session_id, &mut batch).await;
+            flush_at = None;
+        }
+    }
+}
+
 /// PTY 배치 메모리 가드 (pipe 경로의 64/16KiB와 별개 — 위 주석 참조).
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 const PTY_FLUSH_MAX_EVENTS: usize = 8192;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 const PTY_FLUSH_MAX_BYTES: usize = 256 * 1024;
 
 /// 이벤트 배치를 한 개의 `OutputReceived`로 전송. 비어 있으면 no-op.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 async fn flush_event_batch(
     output: &mut iced::futures::channel::mpsc::Sender<Message>,
     session_id: Uuid,
@@ -927,9 +1491,22 @@ async fn flush_event_batch(
 async fn terminate_and_reap_pty(
     pid: Option<u32>,
     exit_rx: &mut tokio::sync::oneshot::Receiver<Result<i32, String>>,
+    exit_taken: Option<Result<i32, String>>,
 ) {
+    // 그룹 시그널은 exit_taken과 **무관하게 항상** 보낸다 — 자식이 이미 exit했어도
+    // pty를 쥔 손자가 그룹에 남아 있을 수 있다(이 시나리오가 exit_taken의 존재 이유).
+    // 시그널을 게이트하면 Stop이 손자를 고아로 남긴다.
     if let Some(pid) = pid {
         signal_process_group(pid, libc::SIGTERM);
+    }
+    // exit_rx await만 게이트한다: 루프의 exit 팔이 이미 소비한 oneshot을 재폴링하면
+    // panic("called after complete")이다. 자식은 reap됐으므로 대기할 것이 없고,
+    // 손자는 wait 핸들이 없어 관측 불가 — SIGKILL 에스컬레이션만 즉시 걸어둔다.
+    if exit_taken.is_some() {
+        if let Some(pid) = pid {
+            signal_process_group(pid, libc::SIGKILL);
+        }
+        return;
     }
     if tokio::time::timeout(Duration::from_secs(2), &mut *exit_rx)
         .await
@@ -939,6 +1516,26 @@ async fn terminate_and_reap_pty(
             signal_process_group(pid, libc::SIGKILL);
         }
         let _ = (&mut *exit_rx).await;
+    }
+}
+
+/// ConPTY 자식 종료: taskkill /T /F(트리 — 크레이트의 WinChild::kill은 직계만이라
+/// 부적합) → waiter reap 대기. TerminateProcess는 대상이 거부할 수 없어 waiter 완료가
+/// 사실상 보장되지만, taskkill 실패 엣지(권한 등)에서 Stop이 스트림을 못 매달게 5s로
+/// 바운드한다. exit_taken이 Some이면 oneshot이 이미 소비됐으므로 await를 건너뛴다
+/// (재폴링은 panic). PTY teardown(ClosePseudoConsole)은 이후 CompletionGuard의
+/// unregister가 담당 — conhost는 우리 자식이라 taskkill /T에 걸리지 않는다.
+#[cfg(windows)]
+async fn terminate_and_reap_pty(
+    pid: Option<u32>,
+    exit_rx: &mut tokio::sync::oneshot::Receiver<Result<i32, String>>,
+    exit_taken: Option<Result<i32, String>>,
+) {
+    if let Some(pid) = pid {
+        force_kill_process_tree(pid);
+    }
+    if exit_taken.is_none() {
+        let _ = tokio::time::timeout(Duration::from_secs(5), &mut *exit_rx).await;
     }
 }
 
@@ -960,6 +1557,9 @@ async fn handle_spawned_process(
                 writer: Some(SessionWriter::Pipe(Arc::new(tokio::sync::Mutex::new(
                     stdin,
                 )))),
+                last_pty_size: None,
+                // pipe 경로엔 DSR 핸드셰이크가 없다 — 즉시 쓰기 가능.
+                dsr_ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             },
         );
     }
@@ -1205,17 +1805,12 @@ fn lines_to_events(payload: &str) -> Vec<OutputEvent> {
 /// flush 대기 중인 출력 이벤트 배치. 같은 논리 라인에 대한 연속 `Replace`는 직전
 /// 이벤트에 제자리 병합된다 — Replace는 항상 "직전에 방출된 라인"을 겨냥하므로 배치
 /// 안에서는 마지막 상태만 의미가 있다 ([Line a, Replace a', Replace a''] → [Line a'']).
-// EventBatch/LineAssembler는 PTY(unix) 경로에서만 구성된다. Windows에서 타입 자체를
-// cfg로 걷어내면 유닛 테스트도 함께 게이트해야 하므로, dead_code allow로 갈음한다
-// (windows CI는 check라 경고로만 보이지만, 게이트가 조여져도 깨지지 않게 선제 적용).
 #[derive(Default)]
-#[cfg_attr(windows, allow(dead_code))]
 struct EventBatch {
     events: Vec<OutputEvent>,
     bytes: usize,
 }
 
-#[cfg_attr(windows, allow(dead_code))]
 impl EventBatch {
     fn push(&mut self, event: OutputEvent) {
         if let OutputEvent::Replace(new_text) = &event
@@ -1257,7 +1852,6 @@ impl EventBatch {
 /// - 방출 텍스트에 `\r`은 절대 포함되지 않는다 (session측 collapse는 방어선)
 /// - UTF-8 경계: flush 방출은 유효 prefix까지만 표시하고 잔여 바이트는 보류
 ///   (멀티바이트 문자가 청크에 걸릴 때 U+FFFD 깜빡임 방지); 라인 확정 시엔 lossy 전체
-#[cfg_attr(windows, allow(dead_code))]
 struct LineAssembler {
     /// 현재 미완 논리 라인의 바이트 (\r 미포함).
     partial: Vec<u8>,
@@ -1269,7 +1863,6 @@ struct LineAssembler {
     dirty: bool,
 }
 
-#[cfg_attr(windows, allow(dead_code))]
 impl LineAssembler {
     fn new() -> Self {
         Self {
@@ -1281,8 +1874,10 @@ impl LineAssembler {
     }
 
     /// flush tick에서 미방출 변경이 있는지 (select 분기 가드용).
+    /// 라이브 라인이 BS로 빈 문자열까지 지워진 경우(shipped_open + partial 비움)도
+    /// `Replace("")`를 방출해야 하므로 pending이다 — 아니면 지워진 내용이 고스트로 남는다.
     fn has_pending(&self) -> bool {
-        self.dirty && !self.partial.is_empty()
+        self.dirty && (!self.partial.is_empty() || self.shipped_open)
     }
 
     fn push_bytes(&mut self, chunk: &[u8], batch: &mut EventBatch) {
@@ -1305,6 +1900,25 @@ impl LineAssembler {
                 b'\r' => {
                     self.pending_cr = true;
                 }
+                // BS: 마지막 스칼라 하나를 지운다 (readline 에코·rubout `\x08 \x08`·ConPTY
+                // 라인에딧이 다용). pending_cr 중엔 no-op — 커서가 이미 col0이라는 근사를
+                // 유지해 다음 텍스트 바이트의 되감기가 그대로 적용되게 한다. 확정된 라인
+                // 경계는 넘지 않는다(partial 비면 무시).
+                b'\x08' => {
+                    if !self.pending_cr && !self.partial.is_empty() {
+                        // UTF-8 경계 인지 pop: 연속 바이트(0x80..=0xBF)를 지나 리드까지.
+                        while let Some(b) = self.partial.pop() {
+                            if !(0x80..=0xBF).contains(&b) {
+                                break;
+                            }
+                        }
+                        self.dirty = true;
+                    }
+                }
+                // 주의: BEL(\x07)은 여기서 제거하면 안 된다 — OSC/DCS의 종결자라서
+                // 바이트 단계에서 걷어내면 ansi.rs의 OSC 파서가 "미종결 → 라인 끝까지
+                // 소비" 규칙으로 뒤따르는 실제 텍스트까지 삼킨다 (ConPTY 타이틀 OSC로
+                // CI에서 실증). bare BEL의 비표시는 문맥을 아는 ansi.rs가 담당한다.
                 _ => {
                     if self.pending_cr {
                         // 되감기 실행: 전체 라인 교체 근사.
@@ -1337,6 +1951,16 @@ impl LineAssembler {
         if !self.has_pending() {
             return;
         }
+        // BS로 빈 문자열까지 지워진 라이브 라인: Replace("")로 화면에서도 지운다.
+        // (아래 valid_len==0 조기 return은 "비지 않았지만 불완전 UTF-8 prefix뿐"인
+        // 보류 케이스 전용이라 이 케이스를 처리하지 못한다.)
+        if self.partial.is_empty() {
+            if self.shipped_open {
+                batch.push(OutputEvent::Replace(String::new()));
+                self.dirty = false;
+            }
+            return;
+        }
         // 청크에 걸린 멀티바이트 문자는 보류 — 유효 prefix만 표시.
         let valid_len = match std::str::from_utf8(&self.partial) {
             Ok(_) => self.partial.len(),
@@ -1361,6 +1985,13 @@ impl LineAssembler {
     /// EOF: 잔여 미완 라인을 최종 확정한다.
     fn finalize(&mut self, batch: &mut EventBatch) {
         if self.partial.is_empty() {
+            // emit_partial과 대칭: 라이브 라인이 BS로 지워진 채 EOF를 맞으면
+            // Replace("")로 확정해야 고스트가 남지 않는다.
+            if self.shipped_open && self.dirty {
+                batch.push(OutputEvent::Replace(String::new()));
+                self.shipped_open = false;
+                self.dirty = false;
+            }
             return;
         }
         let text = String::from_utf8_lossy(&self.partial).into_owned();
@@ -1876,6 +2507,79 @@ mod tests {
     }
 
     #[test]
+    fn assembler_backspace_pops_last_char() {
+        assert_eq!(assemble(&[b"abc\x08d\n"], false), vec![line("abd")]);
+    }
+
+    #[test]
+    fn assembler_backspace_is_utf8_boundary_aware() {
+        // 멀티바이트 스칼라는 통째로 하나가 지워져야 한다 (바이트 하나가 아니라).
+        let mut input = "가나".as_bytes().to_vec();
+        input.extend_from_slice(b"\x08\n");
+        assert_eq!(assemble(&[&input], false), vec![line("가")]);
+    }
+
+    #[test]
+    fn assembler_rubout_sequence_erases() {
+        // readline 지우기 관용구: BS + 공백 + BS → 문자 소거.
+        assert_eq!(assemble(&[b"x\x08 \x08\n"], false), vec![line("")]);
+    }
+
+    #[test]
+    fn assembler_backspace_at_line_start_is_ignored() {
+        // 확정된 라인 경계는 넘지 않는다.
+        assert_eq!(
+            assemble(&[b"a\n\x08b\n"], false),
+            vec![line("a"), line("b")]
+        );
+    }
+
+    #[test]
+    fn assembler_backspace_after_cr_is_noop() {
+        // pending_cr 중 BS는 no-op — 다음 텍스트 바이트의 전체 라인 되감기가 유지된다.
+        assert_eq!(assemble(&[b"ab\r\x08c\n"], false), vec![line("c")]);
+    }
+
+    #[test]
+    fn assembler_backspace_erasing_shipped_line_ships_empty_replace() {
+        // 라이브로 방출된 라인이 BS로 전부 지워지면 Replace("")가 나가야 화면에서도
+        // 지워진다 (flush 경로와 EOF(finalize) 경로 모두).
+        let events = assemble(&[b"abc", b"\x08\x08\x08"], true);
+        assert_eq!(events, vec![line("abc"), replace("")]);
+
+        // finalize 경로: flush 없이 지워진 채 EOF. 같은 배치라 Replace("")가 직전
+        // Line("ab")에 제자리 병합되어 Line("")로 확정된다 (EventBatch 병합 규칙).
+        let mut assembler = LineAssembler::new();
+        let mut batch = EventBatch::default();
+        assembler.push_bytes(b"ab", &mut batch);
+        assembler.emit_partial(&mut batch); // Line("ab") 방출 — 라이브 열림
+        assembler.push_bytes(b"\x08\x08", &mut batch);
+        assembler.finalize(&mut batch);
+        assert_eq!(batch.take(), vec![line("")]);
+    }
+
+    #[test]
+    fn assembler_preserves_bel_for_the_ansi_layer() {
+        // BEL은 OSC/DCS의 종결자다 — 조립 단계에서 제거하면 ansi.rs의 OSC 파서가
+        // 종결을 놓쳐 라인 끝까지 삼킨다 (ConPTY 타이틀 OSC 회귀). 그대로 통과시키고
+        // 비표시는 ansi.rs가 담당한다.
+        assert_eq!(assemble(&[b"do\x07ne\n"], false), vec![line("do\u{7}ne")]);
+    }
+
+    #[test]
+    fn assembler_prompt_echo_then_output_matches_real_terminal() {
+        // Windows 실기 덤프 그대로: input('name') 프롬프트(라이브) → conhost 에코
+        // "hello\r\n" → print 출력 "hello\r\n". 기대 렌더는 실제 터미널과 동일한
+        // ["namehello", "hello"] — 에코는 열린 프롬프트 라인에 이어붙고(Replace),
+        // print는 새 라인이다.
+        let events = assemble(&[b"name", b"hello\r\nhello\r\n"], true);
+        assert_eq!(
+            events,
+            vec![line("name"), replace("namehello"), line("hello")]
+        );
+    }
+
+    #[test]
     fn assembler_live_line_opens_then_replaces() {
         // flush tick마다: 첫 방출은 Line(라이브 열림), 이후 갱신은 Replace,
         // 개행 확정도 Replace(같은 논리 라인), 다음 텍스트는 새 Line.
@@ -1952,8 +2656,11 @@ mod tests {
     }
 
     // ---- pty_output_loop 직접 구동 (합성 채널 — 실프로세스 불필요) ----
+    // windows에서는 동명 트윈(종료 상태기계 포함)을 상대로 같은 시맨틱을 검증한다:
+    // EOF 시 exit_status.take()→Completed, exit-전-EOF의 내부 select 대기가 트윈에도
+    // 보존되어야 이 테스트들이 통과한다.
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     mod pty_loop {
         use super::*;
         use iced::futures::StreamExt;
@@ -1998,7 +2705,7 @@ mod tests {
             )
             .await
             .expect("loop timed out");
-            assert!(matches!(end, PtyLoopEnd::Cancelled));
+            assert!(matches!(end, PtyLoopEnd::Cancelled { exit_taken: None }));
 
             drop(tx);
             let mut messages = Vec::new();
@@ -2094,6 +2801,128 @@ mod tests {
                 "exit 후 도착한 출력도 보존: {events:?}"
             );
         }
+
+        /// 회귀 방지(windows 종료 상태기계, 리뷰 실증 결함): teardown 착수 후에도
+        /// 청크가 정상적으로 계속 흐르면 failsafe는 rolling 갱신되어 절단하지 않아야
+        /// 한다 — 고정 시각 failsafe는 5s를 넘는 건강한 드레인의 꼬리를 버렸다.
+        /// 가상 시간(start_paused)으로 8초 넘는 드레인을 ms 단위에 검증한다.
+        #[cfg(windows)]
+        #[tokio::test(start_paused = true)]
+        async fn failsafe_rolls_while_teardown_drain_flows() {
+            let (mut tx, mut rx) = iced::futures::channel::mpsc::channel::<Message>(1000);
+            let cancel = Arc::new(AtomicBool::new(false));
+            let (chunks_tx, mut chunks_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+            let (exit_tx, mut exit_rx) = tokio::sync::oneshot::channel::<Result<i32, String>>();
+
+            exit_tx.send(Ok(0)).unwrap();
+            let feeder = tokio::spawn(async move {
+                // exit 소비 + quiet-grace(300ms) 경과로 teardown이 착수된 뒤,
+                // failsafe(5s)를 훌쩍 넘는 가상 8초 동안 1초 간격으로 계속 출력.
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                for i in 0..8 {
+                    chunks_tx
+                        .send(format!("tail-{i}\n").into_bytes())
+                        .await
+                        .unwrap();
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+                chunks_tx.send(b"final-marker\n".to_vec()).await.unwrap();
+                // drop(chunks_tx) → EOF
+            });
+
+            let end = tokio::time::timeout(
+                Duration::from_secs(60),
+                pty_output_loop(
+                    &mut tx,
+                    Uuid::new_v4(),
+                    &mut chunks_rx,
+                    &mut exit_rx,
+                    &cancel,
+                ),
+            )
+            .await
+            .expect("loop timed out");
+            feeder.await.unwrap();
+            assert!(
+                matches!(end, PtyLoopEnd::Completed(Ok(0))),
+                "정상 드레인은 EOF까지 완주해야 함"
+            );
+
+            drop(tx);
+            let mut messages = Vec::new();
+            while let Some(msg) = rx.next().await {
+                messages.push(msg);
+            }
+            let events = collect_events(&messages);
+            assert!(
+                events.contains(&OutputEvent::Line(String::from("final-marker"))),
+                "failsafe가 흐르는 드레인을 절단하면 안 됨: {events:?}"
+            );
+        }
+
+        /// 회귀 방지: exit 팔이 oneshot을 소비한 뒤 Stop → 과거엔 terminate_and_reap_pty가
+        /// 소비된 exit_rx를 재폴링해 panic("called after complete")했다 (CompletionGuard가
+        /// "Run interrupted unexpectedly"로 은폐). Cancelled{exit_taken}이 재await를 건너뛴다.
+        #[tokio::test]
+        async fn cancel_after_exit_does_not_repoll_consumed_oneshot() {
+            let (mut tx, _rx) = iced::futures::channel::mpsc::channel::<Message>(100);
+            let cancel = Arc::new(AtomicBool::new(false));
+            let (_chunks_tx, mut chunks_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+            let (exit_tx, mut exit_rx) = tokio::sync::oneshot::channel::<Result<i32, String>>();
+
+            exit_tx.send(Ok(7)).unwrap();
+            // 루프가 exit 팔을 소비하도록 한 턴 준 뒤(손자가 pty를 쥔 드레인 상태) Stop.
+            let cancel_setter = cancel.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                cancel_setter.store(true, std::sync::atomic::Ordering::SeqCst);
+            });
+
+            let end = tokio::time::timeout(
+                Duration::from_secs(5),
+                pty_output_loop(
+                    &mut tx,
+                    Uuid::new_v4(),
+                    &mut chunks_rx,
+                    &mut exit_rx,
+                    &cancel,
+                ),
+            )
+            .await
+            .expect("loop timed out");
+            let PtyLoopEnd::Cancelled { exit_taken } = end else {
+                panic!("expected Cancelled, got Completed");
+            };
+            assert_eq!(exit_taken, Some(Ok(7)), "exit 팔이 소비한 상태 운반");
+
+            // 핵심 단언: 소비된 oneshot과 함께 호출해도 panic 없이 완료 (pid None → 무신호).
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                terminate_and_reap_pty(None, &mut exit_rx, exit_taken),
+            )
+            .await
+            .expect("reap must not hang");
+        }
+    }
+
+    #[tokio::test]
+    async fn interrupt_session_unregistered_session_is_broken() {
+        // 미등록 세션(unix pipe 폴백 포함)은 Broken — app이 pid 폴백을 판단할 근거.
+        let result = interrupt_session(Uuid::new_v4()).await;
+        assert!(matches!(
+            result,
+            Err(crate::models::StdinWriteError::Broken(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn eof_session_unregistered_session_is_broken() {
+        // EOF엔 시그널 폴백이 없다 — 미등록 세션은 Broken으로 즉시 안내 대상.
+        let result = eof_session(Uuid::new_v4()).await;
+        assert!(matches!(
+            result,
+            Err(crate::models::StdinWriteError::Broken(_))
+        ));
     }
 
     // ---- PTY 통합 (unix 실프로세스; openpty 불가 환경은 self-skip) ----
@@ -2232,6 +3061,128 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn pty_eof_ends_stdin_reader() {
+            // eof_session의 VEOF(0x04)가 cooked tty에서 read()=0(EOF)으로 번역되는지
+            // 종단 확인 — cat은 stdin EOF에서 종료한다. 미전달이면 10s 타임아웃 실패.
+            let config = test_config("/tmp");
+            let session_id = Uuid::new_v4();
+            let pty = match spawn_in_pty(&config, "cat", &[], session_id, (80, 24)) {
+                Ok(p) => p,
+                Err(PtySpawnError::PtyUnavailable(_)) => {
+                    eprintln!("[skip] pty unavailable in this environment");
+                    return;
+                }
+                Err(PtySpawnError::Spawn(e)) => panic!("spawn failed: {e}"),
+            };
+            // 한 줄 먼저 흘려 cat이 실제로 stdin을 읽고 있음을 확인한 뒤 EOF를 쏜다.
+            {
+                let map = SESSION_IO.lock().unwrap();
+                let io = map.get(&session_id).expect("registered");
+                match io.writer.as_ref().expect("pty writer") {
+                    SessionWriter::Pty(w) => {
+                        use std::io::Write;
+                        let mut w = w.lock().unwrap();
+                        w.write_all(b"hello\n").unwrap();
+                        w.flush().unwrap();
+                    }
+                    #[cfg(windows)]
+                    _ => unreachable!(),
+                }
+            }
+            let mut chunks_rx = pty.chunks_rx;
+            let mut collected = Vec::new();
+            // tty 에코 + cat 출력 = "hello" 2회가 보일 때까지 대기.
+            while String::from_utf8_lossy(&collected).matches("hello").count() < 2 {
+                let chunk = tokio::time::timeout(Duration::from_secs(10), chunks_rx.recv())
+                    .await
+                    .expect("echo+cat output within 10s")
+                    .expect("stream open");
+                collected.extend_from_slice(&chunk);
+            }
+
+            eof_session(session_id).await.expect("eof write");
+
+            let exited = tokio::time::timeout(Duration::from_secs(10), async {
+                while let Some(bytes) = chunks_rx.recv().await {
+                    collected.extend_from_slice(&bytes);
+                }
+                pty.exit_rx.await
+            })
+            .await;
+            unregister_session_io(session_id);
+            let status = exited
+                .expect("cat must exit promptly after EOF")
+                .unwrap_or(Err(String::from("no status")));
+            assert_eq!(status, Ok(0), "clean EOF exit expected");
+        }
+
+        #[tokio::test]
+        async fn pty_interrupt_stops_foreground_child() {
+            // interrupt_session의 ETX(0x03)가 slave 라인 디시플린(cooked, ISIG)을
+            // 거쳐 fg 프로세스 그룹에 SIGINT로 **전달**되는지 종단 확인. 자식은
+            // SIGINT 처분을 SIG_DFL로 명시 복원하는 python3를 쓴다 — GitHub Actions
+            // 러너는 스텝 프로세스에 SIGINT를 SIG_IGN으로 물려주는데(실측: `sleep`
+            // 자식이 ^C 에코 후에도 생존), POSIX 셸은 "진입 시 무시된 시그널"을
+            // trap으로도 되살릴 수 없어 기본 처분 의존 자식은 러너에서 검증이
+            // 불가하다. 임의 프로그램은 핸들러 설치가 가능하므로 python이 전달
+            // 여부만 정확히 검증한다. (프로덕션은 무관 — exec는 '핸들러'를 SIG_DFL로
+            // 리셋하고 SIG_IGN만 상속되는데, 앱은 SIGINT 핸들러를 설치하므로 세션
+            // 자식은 항상 SIG_DFL로 시작한다.)
+            let config = test_config("/tmp");
+            let session_id = Uuid::new_v4();
+            let command = "command -v python3 >/dev/null 2>&1 || { echo no-python3; exit 0; }; \
+                 python3 -u -c 'import signal, time; \
+signal.signal(signal.SIGINT, signal.SIG_DFL); \
+print(\"ready\"); \
+time.sleep(30)'";
+            let pty = match spawn_in_pty(&config, command, &[], session_id, (80, 24)) {
+                Ok(p) => p,
+                Err(PtySpawnError::PtyUnavailable(_)) => {
+                    eprintln!("[skip] pty unavailable in this environment");
+                    return;
+                }
+                Err(PtySpawnError::Spawn(e)) => panic!("spawn failed: {e}"),
+            };
+            let mut chunks_rx = pty.chunks_rx;
+            // 자식이 실제로 돌기 시작한 것을 "ready"로 확인한 뒤 인터럽트를 쏜다.
+            let mut collected = Vec::new();
+            loop {
+                let chunk = tokio::time::timeout(Duration::from_secs(10), chunks_rx.recv())
+                    .await
+                    .expect("initial output within 10s")
+                    .expect("stream open before ready marker");
+                collected.extend_from_slice(&chunk);
+                let text = String::from_utf8_lossy(&collected);
+                if text.contains("no-python3") {
+                    eprintln!("[skip] python3 unavailable — interrupt delivery not verifiable");
+                    unregister_session_io(session_id);
+                    return;
+                }
+                if text.contains("ready") {
+                    break;
+                }
+            }
+
+            interrupt_session(session_id)
+                .await
+                .expect("interrupt write must succeed on a live pty");
+
+            let exited = tokio::time::timeout(Duration::from_secs(10), async {
+                while let Some(bytes) = chunks_rx.recv().await {
+                    collected.extend_from_slice(&bytes);
+                }
+                pty.exit_rx.await
+            })
+            .await;
+            unregister_session_io(session_id);
+            assert!(
+                exited.is_ok(),
+                "child must exit promptly after interrupt; output: {:?}",
+                String::from_utf8_lossy(&collected)
+            );
+        }
+
+        #[tokio::test]
         async fn pty_reader_thread_reclaims_after_receiver_drop() {
             // 데몬화한 손자가 slave를 계속 쥐면 EOF가 오지 않는다. 그 상태에서 세션이
             // 정리되면(수신측 drop) 리더 스레드가 poll 타임아웃 틱에서 스스로 종료해야
@@ -2267,6 +3218,637 @@ mod tests {
             assert!(
                 reclaimed,
                 "reader thread must self-reclaim within poll interval after receiver drop"
+            );
+        }
+    }
+
+    // ---- ConPTY 통합 (windows 실프로세스; ConPTY 부재 환경은 self-skip) ----
+    // windows-latest 러너(Server 2022)는 ConPTY를 지원하므로 CI에서 실제로 돈다.
+    // ConPTY 프라이밍이 커서/클리어 시퀀스와 80컬럼 하드랩을 섞으므로 단언은 전부
+    // 짧은 마커의 contains 기반, 모든 await는 10s timeout으로 감싼다(행 = 잡 6h 방지).
+
+    #[cfg(windows)]
+    mod conpty_integration {
+        use super::*;
+
+        const T: Duration = Duration::from_secs(10);
+
+        /// 행 진단 워치독. libtest는 멈춘 테스트를 선점하지 못해 잡 timeout(30m)까지
+        /// 끌려가고, 테스트 스레드의 출력은 캡처돼 사라진다 — 워치독은 **비테스트
+        /// 스레드**라 stderr가 그대로 보이므로, 90초(실시간) 내 해제가 안 되면 마지막
+        /// 스테이지를 찍고 프로세스를 끝내 CI가 빠르고 귀속 가능한 실패를 내게 한다.
+        /// publish 게이트 잡이라 상시 유지한다.
+        struct HangWatchdog {
+            test: &'static str,
+            stage: Arc<Mutex<String>>,
+            disarmed: Arc<AtomicBool>,
+        }
+
+        impl HangWatchdog {
+            fn arm(test: &'static str) -> Self {
+                let stage = Arc::new(Mutex::new(String::from("start")));
+                let disarmed = Arc::new(AtomicBool::new(false));
+                let (s, d) = (Arc::clone(&stage), Arc::clone(&disarmed));
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_secs(90));
+                    if !d.load(std::sync::atomic::Ordering::Relaxed) {
+                        let last = s.lock().map(|g| g.clone()).unwrap_or_default();
+                        // 주의: libtest 캡처는 스폰된 스레드에도 상속된다 — 이 출력은
+                        // CI에서 --nocapture일 때만 보인다. abort()는 CRT exit 경로를
+                        // 우회하는 즉사라 어떤 wedge 상태에서도 프로세스를 확실히 끝낸다.
+                        eprintln!("[watchdog] {test} wedged at stage: {last}");
+                        std::process::abort();
+                    }
+                });
+                Self {
+                    test,
+                    stage,
+                    disarmed,
+                }
+            }
+
+            fn mark(&self, s: &str) {
+                // --nocapture 실행에서 실시간 스트리밍되도록 즉시 찍는다 — 행이 나도
+                // 마지막 스테이지가 로그에 남는 것이 핵심 진단 신호다.
+                eprintln!("[stage] {}: {s}", self.test);
+                if let Ok(mut g) = self.stage.lock() {
+                    s.clone_into(&mut g);
+                }
+            }
+        }
+
+        impl Drop for HangWatchdog {
+            fn drop(&mut self) {
+                // 패닉 unwind 중에는 해제하지 않는다 — 패닉 후 teardown(런타임 drop이
+                // 살아 있는 자식의 waiter를 기다리는 등)이 wedge되면 워치독이 마지막
+                // 안전망으로 abort한다.
+                if std::thread::panicking() {
+                    return;
+                }
+                self.disarmed
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+
+        fn test_config() -> RunConfiguration {
+            RunConfiguration {
+                working_directory: std::env::temp_dir().to_string_lossy().into_owned(),
+                ..RunConfiguration::default()
+            }
+        }
+
+        /// ConPTY 스폰 → EOF까지 수집 → (합쳐진 출력, exit 결과).
+        ///
+        /// teardown은 프로덕션과 동형으로 구동한다: unregister(=ClosePseudoConsole,
+        /// 미소비 출력이 있으면 블록 가능)를 블로킹 풀로 보내고 **동시에** 드레인을
+        /// 계속한다 — 런타임 스레드에서 동기로 부르면 [Close 블록 ↔ 리더 ↔ 수신 없는
+        /// 테스트] 교착이 재현된다.
+        async fn run_conpty(
+            wd: &HangWatchdog,
+            command: &str,
+        ) -> Option<(String, Result<i32, String>)> {
+            let config = test_config();
+            let session_id = Uuid::new_v4();
+            wd.mark("spawn_in_pty (powershell probe + openpty + CreateProcess)");
+            let pty = match spawn_in_pty(&config, command, &[], session_id, (80, 24)) {
+                Ok(p) => p,
+                Err(PtySpawnError::PtyUnavailable(e)) => {
+                    eprintln!("[skip] conpty unavailable: {e}");
+                    return None;
+                }
+                Err(PtySpawnError::Spawn(e)) => panic!("spawn failed: {e}"),
+            };
+            let pty_pid = pty.pid;
+            let mut chunks_rx = pty.chunks_rx;
+            let mut exit_rx = pty.exit_rx;
+
+            // 자식 exit까지: 출력을 소비하면서 대기 (ConPTY는 exit로 EOF가 안 온다).
+            wd.mark("awaiting child exit (consuming output)");
+            let mut collected = Vec::new();
+            let status = match tokio::time::timeout(T, async {
+                loop {
+                    tokio::select! {
+                        chunk = chunks_rx.recv() => {
+                            if let Some(bytes) = chunk { collected.extend_from_slice(&bytes); }
+                        }
+                        status = &mut exit_rx => {
+                            return status.unwrap_or(Err(String::from("no status")));
+                        }
+                    }
+                }
+            })
+            .await
+            {
+                Ok(status) => status,
+                Err(_) => {
+                    // 살아 있는 자식을 남기면 waiter(child.wait)가 계속 블록해 tokio
+                    // 런타임 drop이 영원히 기다린다 — 트리를 죽여 풀고, 수집분을 담아
+                    // 패닉(무엇이 왔는지가 곧 진단이다).
+                    if let Some(pid) = pty_pid {
+                        force_kill_process_tree(pid);
+                    }
+                    panic!(
+                        "child did not exit in time; collected: {:?}",
+                        String::from_utf8_lossy(&collected)
+                    );
+                }
+            };
+
+            wd.mark("teardown: unregister on blocking pool + drain to EOF");
+            let close = tokio::task::spawn_blocking(move || unregister_session_io(session_id));
+            tokio::time::timeout(T, async {
+                while let Some(bytes) = chunks_rx.recv().await {
+                    collected.extend_from_slice(&bytes);
+                }
+            })
+            .await
+            .expect("reader did not reach EOF after unregister");
+            let _ = tokio::time::timeout(T, close).await;
+
+            wd.mark("done");
+            Some((String::from_utf8_lossy(&collected).into_owned(), status))
+        }
+
+        /// run_conpty + 스폰 직후 stdin으로 `input` 바이트를 기록 (레지스트리 writer 사용
+        /// — 슬라이스4 write 경로의 원형). 나머지 수집/teardown 동형.
+        async fn run_conpty_stdin(
+            wd: &HangWatchdog,
+            command: &str,
+            input: &[u8],
+        ) -> Option<(String, Result<i32, String>)> {
+            let config = test_config();
+            let session_id = Uuid::new_v4();
+            wd.mark("spawn_in_pty (powershell probe + openpty + CreateProcess)");
+            let pty = match spawn_in_pty(&config, command, &[], session_id, (80, 24)) {
+                Ok(p) => p,
+                Err(PtySpawnError::PtyUnavailable(e)) => {
+                    eprintln!("[skip] conpty unavailable: {e}");
+                    return None;
+                }
+                Err(PtySpawnError::Spawn(e)) => panic!("spawn failed: {e}"),
+            };
+            let pty_pid = pty.pid;
+            let mut chunks_rx = pty.chunks_rx;
+            let mut exit_rx = pty.exit_rx;
+            let mut collected = Vec::new();
+
+            // 자식 콘솔 초기화(DSR 핸드셰이크) 이후에 입력을 넣는다 — 초기화 전
+            // 입력은 conhost의 DSR 응답 스캔과 섞일 수 있다. 첫 출력 청크(프롬프트
+            // 렌더)가 초기화 완료 신호다.
+            wd.mark("waiting first output before stdin write");
+            let first = tokio::time::timeout(T, chunks_rx.recv())
+                .await
+                .expect("no initial output from conpty child")
+                .expect("stream closed before any output");
+            collected.extend_from_slice(&first);
+
+            wd.mark("writing stdin bytes");
+            {
+                let map = SESSION_IO.lock().unwrap();
+                let io = map.get(&session_id).expect("registered");
+                match io.writer.as_ref().expect("conpty writer") {
+                    SessionWriter::Pty(w) => {
+                        use std::io::Write;
+                        let mut w = w.lock().unwrap();
+                        w.write_all(input).unwrap();
+                        w.flush().unwrap();
+                    }
+                    SessionWriter::Pipe(_) => unreachable!("conpty session uses Pty writer"),
+                }
+            }
+            wd.mark("awaiting child exit after stdin write");
+            let status = match tokio::time::timeout(T, async {
+                loop {
+                    tokio::select! {
+                        chunk = chunks_rx.recv() => {
+                            if let Some(bytes) = chunk { collected.extend_from_slice(&bytes); }
+                        }
+                        status = &mut exit_rx => {
+                            return status.unwrap_or(Err(String::from("no status")));
+                        }
+                    }
+                }
+            })
+            .await
+            {
+                Ok(status) => status,
+                Err(_) => {
+                    if let Some(pid) = pty_pid {
+                        force_kill_process_tree(pid);
+                    }
+                    panic!(
+                        "child did not exit after stdin write; collected: {:?}",
+                        String::from_utf8_lossy(&collected)
+                    );
+                }
+            };
+            wd.mark("teardown: unregister on blocking pool + drain to EOF");
+            let close = tokio::task::spawn_blocking(move || unregister_session_io(session_id));
+            tokio::time::timeout(T, async {
+                while let Some(bytes) = chunks_rx.recv().await {
+                    collected.extend_from_slice(&bytes);
+                }
+            })
+            .await
+            .expect("reader did not reach EOF after unregister");
+            let _ = tokio::time::timeout(T, close).await;
+            wd.mark("done");
+            Some((String::from_utf8_lossy(&collected).into_owned(), status))
+        }
+
+        #[tokio::test]
+        async fn conpty_child_sees_a_console_with_pty_size() {
+            // IsOutputRedirected=False = ConPTY-vs-pipe 판별자; WindowWidth=80은
+            // openpty 뷰포트가 자식에게 도달했음을 증명한다.
+            let wd = HangWatchdog::arm("conpty_child_sees_a_console_with_pty_size");
+            let Some((out, status)) = run_conpty(
+                &wd,
+                "if ([Console]::IsOutputRedirected) { 'redirected' } \
+                 else { 'ok-console w=' + [Console]::WindowWidth }",
+            )
+            .await
+            else {
+                return;
+            };
+            assert!(
+                out.contains("ok-console"),
+                "child must see a console: {out:?}"
+            );
+            assert!(out.contains("w=80"), "pty size must reach child: {out:?}");
+            assert!(
+                !out.contains("redirected"),
+                "must not be pipe-redirected: {out:?}"
+            );
+            assert_eq!(status, Ok(0));
+        }
+
+        #[tokio::test]
+        async fn conpty_passes_sgr_color_through() {
+            let wd = HangWatchdog::arm("conpty_passes_sgr_color_through");
+            let Some((out, _)) =
+                run_conpty(&wd, "Write-Host -ForegroundColor Green 'SGR-MARK'").await
+            else {
+                return;
+            };
+            assert!(out.contains("SGR-MARK"), "text must pass through: {out:?}");
+            assert!(
+                out.contains('\u{1b}'),
+                "conpty output must carry VT sequences (SGR): {out:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn conpty_stdin_cr_submits_and_echoes() {
+            // \r 제출 증명: Read-Host가 라인을 받고, conhost 에코가 출력에 나타난다.
+            let wd = HangWatchdog::arm("conpty_stdin_cr_submits_and_echoes");
+            let Some((out, status)) = run_conpty_stdin(
+                &wd,
+                "$x = Read-Host; Write-Output ('got:' + $x)",
+                b"hello\r",
+            )
+            .await
+            else {
+                return;
+            };
+            assert_eq!(status, Ok(0));
+            assert!(
+                out.contains("got:hello"),
+                "child must receive stdin: {out:?}"
+            );
+            assert!(
+                out.matches("hello").count() >= 2,
+                "conhost echo + child print expected: {out:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn conpty_cjk_stdin_roundtrip() {
+            // WIN32_INPUT_MODE 하에서 raw UTF-8 텍스트가 그대로 통과하는지 — 최대
+            // 미검증 가정의 상시 회귀 게이트. 실패하면 win32-input-mode 키 인코딩이
+            // 필요하다는 판정이다.
+            let wd = HangWatchdog::arm("conpty_cjk_stdin_roundtrip");
+            let Some((out, status)) = run_conpty_stdin(
+                &wd,
+                "$x = Read-Host; Write-Output ('cjk:' + $x)",
+                "한글\r".as_bytes(),
+            )
+            .await
+            else {
+                return;
+            };
+            assert_eq!(status, Ok(0));
+            assert!(
+                out.contains("cjk:한글"),
+                "raw UTF-8 must pass through conpty input: {out:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn conpty_cr_progress_collapses_in_assembler() {
+            // conhost가 라인 내 \r를 보존하는지의 카나리아 — CHA(ESC[G) 재인코딩으로
+            // 바뀌면 여기서 잡힌다 (그 경우 CHA→되감기 매핑이 후속 과제).
+            // [char]13 사용: 임베디드 이중따옴표+백틱은 ArgvQuote(OS)와 PowerShell
+            // 토크나이저의 이중 인용 레이어를 겹쳐 지나는 가장 취약한 형태라 회피.
+            let wd = HangWatchdog::arm("conpty_cr_progress_collapses_in_assembler");
+            let Some((raw, status)) =
+                run_conpty(&wd, "Write-Host ('a' + [char]13 + 'b' + [char]13 + 'c')").await
+            else {
+                return;
+            };
+            assert_eq!(status, Ok(0));
+            let mut session = crate::models::RunSession::new(String::from("t"));
+            let mut assembler = LineAssembler::new();
+            let mut batch = EventBatch::default();
+            assembler.push_bytes(raw.as_bytes(), &mut batch);
+            assembler.finalize(&mut batch);
+            for event in batch.take() {
+                session.apply_output_event(&event);
+            }
+            let lines: Vec<String> = session
+                .output_lines
+                .iter()
+                .map(|(_, segs)| {
+                    segs.iter()
+                        .map(|s| s.text.as_str())
+                        .collect::<String>()
+                        .trim_end()
+                        .to_string()
+                })
+                .collect();
+            assert!(
+                lines.iter().any(|l| l == "c"),
+                "final CR state must be 'c': {lines:?}\nraw: {raw:?}"
+            );
+            assert!(
+                !lines.iter().any(|l| l.contains("abc")),
+                "CR must not concatenate (CHA re-encoding suspected): {lines:?}\nraw: {raw:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn conpty_reader_eofs_after_unregister() {
+            // 종료 상태기계의 하중 지지점 회귀: unregister(=ClosePseudoConsole)만이
+            // EOF를 만들고, 그 EOF로 리더 스레드가 회수된다.
+            let wd = HangWatchdog::arm("conpty_reader_eofs_after_unregister");
+            let config = test_config();
+            let session_id = Uuid::new_v4();
+            wd.mark("spawn_in_pty (powershell probe + openpty + CreateProcess)");
+            let pty = match spawn_in_pty(&config, "Write-Output done", &[], session_id, (80, 24)) {
+                Ok(p) => p,
+                Err(PtySpawnError::PtyUnavailable(e)) => {
+                    eprintln!("[skip] conpty unavailable: {e}");
+                    return;
+                }
+                Err(PtySpawnError::Spawn(e)) => panic!("spawn failed: {e}"),
+            };
+            let pty_pid = pty.pid;
+            let mut chunks_rx = pty.chunks_rx;
+            let mut exit_rx = pty.exit_rx;
+            wd.mark("awaiting child exit");
+            let status = match tokio::time::timeout(T, async {
+                loop {
+                    tokio::select! {
+                        chunk = chunks_rx.recv() => { let _ = chunk; }
+                        status = &mut exit_rx => {
+                            return status.unwrap_or(Err(String::from("no status")));
+                        }
+                    }
+                }
+            })
+            .await
+            {
+                Ok(status) => status,
+                Err(_) => {
+                    if let Some(pid) = pty_pid {
+                        force_kill_process_tree(pid);
+                    }
+                    panic!("child did not exit");
+                }
+            };
+            assert_eq!(status, Ok(0));
+
+            wd.mark("unregister on blocking pool + drain to EOF");
+            let close = tokio::task::spawn_blocking(move || unregister_session_io(session_id));
+            let eof =
+                tokio::time::timeout(T, async { while chunks_rx.recv().await.is_some() {} }).await;
+            assert!(eof.is_ok(), "EOF must arrive after ClosePseudoConsole");
+            let _ = tokio::time::timeout(T, close).await;
+            wd.mark("joining reader thread");
+
+            let handle = pty.reader_thread.expect("reader thread must spawn");
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = handle.join();
+                let _ = done_tx.send(());
+            });
+            assert!(
+                done_rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+                "reader thread must exit at EOF"
+            );
+        }
+
+        #[tokio::test]
+        async fn conpty_interrupt_stops_running_child() {
+            // interrupt_session의 ETX(0x03)가 conhost에서 CTRL_C_EVENT로 번역돼
+            // 실행 중인 파이프라인을 끊는지 종단 확인 — v0.6.1의 유일한
+            // macOS-검증-불가 가정을 CI 상시 게이트로 만든다. 전달이 안 되면
+            // Start-Sleep 30이 T(10s)를 뚫고, 끊겼다면 "done"은 출력되지 않는다.
+            // 종료 코드는 미단언(STATUS_CONTROL_C_EXIT는 i32 포화 등 변형이 많다).
+            let wd = HangWatchdog::arm("conpty_interrupt_stops_running_child");
+            let config = test_config();
+            let session_id = Uuid::new_v4();
+            wd.mark("spawn_in_pty (powershell probe + openpty + CreateProcess)");
+            let pty = match spawn_in_pty(
+                &config,
+                "Write-Output ready; Start-Sleep -Seconds 30; Write-Output done",
+                &[],
+                session_id,
+                (80, 24),
+            ) {
+                Ok(p) => p,
+                Err(PtySpawnError::PtyUnavailable(e)) => {
+                    eprintln!("[skip] conpty unavailable: {e}");
+                    return;
+                }
+                Err(PtySpawnError::Spawn(e)) => panic!("spawn failed: {e}"),
+            };
+            let pty_pid = pty.pid;
+            let mut chunks_rx = pty.chunks_rx;
+            let mut exit_rx = pty.exit_rx;
+            let mut collected = Vec::new();
+
+            // 자식이 실제로 돌기 시작한 것을 "ready" 렌더로 확인한 뒤 쏜다 —
+            // 첫 청크는 콘솔 초기화 출력일 수 있어 마커까지 누적 대기한다.
+            wd.mark("waiting for ready marker before interrupt");
+            while !String::from_utf8_lossy(&collected).contains("ready") {
+                match tokio::time::timeout(T, chunks_rx.recv()).await {
+                    Ok(Some(bytes)) => collected.extend_from_slice(&bytes),
+                    Ok(None) | Err(_) => {
+                        if let Some(pid) = pty_pid {
+                            force_kill_process_tree(pid);
+                        }
+                        panic!(
+                            "no ready marker from conpty child; collected: {:?}",
+                            String::from_utf8_lossy(&collected)
+                        );
+                    }
+                }
+            }
+
+            wd.mark("sending interrupt (ETX)");
+            interrupt_session(session_id)
+                .await
+                .expect("interrupt write must succeed on a live conpty");
+
+            wd.mark("awaiting child exit after interrupt");
+            let exited = tokio::time::timeout(T, async {
+                loop {
+                    tokio::select! {
+                        chunk = chunks_rx.recv() => {
+                            if let Some(bytes) = chunk { collected.extend_from_slice(&bytes); }
+                        }
+                        status = &mut exit_rx => {
+                            let _ = status;
+                            return;
+                        }
+                    }
+                }
+            })
+            .await;
+            if exited.is_err() {
+                if let Some(pid) = pty_pid {
+                    force_kill_process_tree(pid);
+                }
+                panic!(
+                    "child did not exit after interrupt; collected: {:?}",
+                    String::from_utf8_lossy(&collected)
+                );
+            }
+
+            wd.mark("teardown: unregister on blocking pool + drain to EOF");
+            let close = tokio::task::spawn_blocking(move || unregister_session_io(session_id));
+            tokio::time::timeout(T, async {
+                while let Some(bytes) = chunks_rx.recv().await {
+                    collected.extend_from_slice(&bytes);
+                }
+            })
+            .await
+            .expect("reader did not reach EOF after unregister");
+            let _ = tokio::time::timeout(T, close).await;
+            wd.mark("done");
+
+            let out = String::from_utf8_lossy(&collected);
+            assert!(
+                !out.contains("done"),
+                "pipeline must be cut before the post-sleep output: {out:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn conpty_eof_ends_stdin_reader() {
+            // eof_session의 0x1A 0x0D(Ctrl+Z+Enter)가 cooked 콘솔 입력에서 EOF로
+            // 번역되는지 종단 확인 — ReadToEnd는 콘솔 read가 0을 반환해야 끝난다.
+            // v0.6.2의 유일한 macOS-검증-불가 가정을 CI 상시 게이트로 만든다.
+            let wd = HangWatchdog::arm("conpty_eof_ends_stdin_reader");
+            let config = test_config();
+            let session_id = Uuid::new_v4();
+            wd.mark("spawn_in_pty (powershell probe + openpty + CreateProcess)");
+            let pty = match spawn_in_pty(
+                &config,
+                "Write-Output ready; \
+                 $in = [Console]::In.ReadToEnd(); \
+                 Write-Output ('got:' + $in.Trim())",
+                &[],
+                session_id,
+                (80, 24),
+            ) {
+                Ok(p) => p,
+                Err(PtySpawnError::PtyUnavailable(e)) => {
+                    eprintln!("[skip] conpty unavailable: {e}");
+                    return;
+                }
+                Err(PtySpawnError::Spawn(e)) => panic!("spawn failed: {e}"),
+            };
+            let pty_pid = pty.pid;
+            let mut chunks_rx = pty.chunks_rx;
+            let mut exit_rx = pty.exit_rx;
+            let mut collected = Vec::new();
+
+            wd.mark("waiting for ready marker before stdin write");
+            while !String::from_utf8_lossy(&collected).contains("ready") {
+                match tokio::time::timeout(T, chunks_rx.recv()).await {
+                    Ok(Some(bytes)) => collected.extend_from_slice(&bytes),
+                    Ok(None) | Err(_) => {
+                        if let Some(pid) = pty_pid {
+                            force_kill_process_tree(pid);
+                        }
+                        panic!(
+                            "no ready marker from conpty child; collected: {:?}",
+                            String::from_utf8_lossy(&collected)
+                        );
+                    }
+                }
+            }
+
+            wd.mark("writing hello then eof");
+            {
+                let map = SESSION_IO.lock().unwrap();
+                let io = map.get(&session_id).expect("registered");
+                match io.writer.as_ref().expect("conpty writer") {
+                    SessionWriter::Pty(w) => {
+                        use std::io::Write;
+                        let mut w = w.lock().unwrap();
+                        w.write_all(b"hello\r").unwrap();
+                        w.flush().unwrap();
+                    }
+                    SessionWriter::Pipe(_) => unreachable!("conpty session uses Pty writer"),
+                }
+            }
+            eof_session(session_id)
+                .await
+                .expect("eof write must succeed on a live conpty");
+
+            wd.mark("awaiting child exit after eof");
+            let exited = tokio::time::timeout(T, async {
+                loop {
+                    tokio::select! {
+                        chunk = chunks_rx.recv() => {
+                            if let Some(bytes) = chunk { collected.extend_from_slice(&bytes); }
+                        }
+                        status = &mut exit_rx => {
+                            let _ = status;
+                            return;
+                        }
+                    }
+                }
+            })
+            .await;
+            if exited.is_err() {
+                if let Some(pid) = pty_pid {
+                    force_kill_process_tree(pid);
+                }
+                panic!(
+                    "child did not exit after eof; collected: {:?}",
+                    String::from_utf8_lossy(&collected)
+                );
+            }
+
+            wd.mark("teardown: unregister on blocking pool + drain to EOF");
+            let close = tokio::task::spawn_blocking(move || unregister_session_io(session_id));
+            tokio::time::timeout(T, async {
+                while let Some(bytes) = chunks_rx.recv().await {
+                    collected.extend_from_slice(&bytes);
+                }
+            })
+            .await
+            .expect("reader did not reach EOF after unregister");
+            let _ = tokio::time::timeout(T, close).await;
+            wd.mark("done");
+
+            let out = String::from_utf8_lossy(&collected);
+            assert!(
+                out.contains("got:hello"),
+                "child must see the line then EOF: {out:?}"
             );
         }
     }
@@ -2638,6 +4220,16 @@ mod tests {
             script_text: String::from("echo hi"),
         };
         assert_eq!(build_shell_script_command(&mode), "echo hi");
+
+        // 멀티라인 스크립트도 그대로 — 단일 argv로 sh -c / powershell -Command에
+        // 전달되므로 개행이 구문 구분자로 살아 있어야 한다 (v0.6.2 멀티라인 에디터).
+        let multi = ExecuteMode::ScriptText {
+            script_text: String::from("echo a\nif true; then\n  echo b\nfi"),
+        };
+        assert_eq!(
+            build_shell_script_command(&multi),
+            "echo a\nif true; then\n  echo b\nfi"
+        );
     }
 
     #[cfg(target_os = "windows")]

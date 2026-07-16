@@ -3,8 +3,10 @@
 //! 상태바 업데이트 버튼은 즉시 설치하는 대신 이 모달을 띄운다 — 설치가 성공하면
 //! 앱이 곧바로 재시작되므로, 원클릭 오조작으로 작업 흐름이 끊기는 것을 막는다.
 //! 확정 시 기존 설치 경로(`handle_install_update`)를 재사용한다.
-//! 인앱 설치가 불가하거나(구 릴리스) 이전 설치가 실패한 경우에는 모달 없이
-//! 릴리스 페이지 폴백을 그대로 탄다 (브라우저 열기는 확인이 필요 없는 조작).
+//! 인앱 설치가 불가하거나(구 릴리스) 이전 설치가 실패한 경우에도 모달을 거친다
+//! (수동 모드 — 확정 시 릴리스 페이지를 브라우저로 연다). 예전의 "확인 없는 즉시
+//! 브라우저 오픈"은 배지가 버전 라벨처럼 보여 오클릭할 때마다 페이지가 떠
+//! "앱이 멋대로 띄운다"로 읽혔다(사용자 실측 피드백).
 
 use super::RunConfigManager;
 use crate::messages::Message;
@@ -18,13 +20,16 @@ pub struct ConfirmUpdateModalState {
     /// 주기적 재확인을 도입하면 표시 문구가 한 박자 늦을 수 있음을 전제한다.
     /// (실행 중 세션 경고/버튼 비활성은 뷰가 매 프레임 라이브로 계산 — 상태에 없음.)
     pub latest: String,
+    /// true = 인앱 설치 불가(자산/서명 없음)·직전 실패 상태에서 열림 — 확정은
+    /// 설치 대신 릴리스 페이지를 브라우저로 연다 (수동 설치 안내 모드).
+    pub manual: bool,
 }
 
 impl RunConfigManager {
-    /// 상태바 업데이트 버튼 → 확인 모달 열기.
-    /// 인앱 설치 불가/실패면 릴리스 페이지로 즉시 폴백한다. 실행 중 세션이 있어도
-    /// 모달은 열되 Update를 비활성화하고 사유를 표시한다 — 조용한 상태바 거부는
-    /// "버튼을 눌러도 반응이 없다"로 읽혔다(사용자 실측 피드백).
+    /// 상태바 업데이트 버튼 → 확인 모달 열기 (인앱/수동 공통 — 브라우저 열기도
+    /// 확정 후에만). 실행 중 세션이 있어도 모달은 열되 Update를 비활성화하고
+    /// 사유를 표시한다 — 조용한 상태바 거부는 "버튼을 눌러도 반응이 없다"로
+    /// 읽혔다(사용자 실측 피드백).
     pub(super) fn handle_request_install_update(&mut self) -> Task<Message> {
         if self.is_updating {
             return Task::none();
@@ -32,25 +37,31 @@ impl RunConfigManager {
         let Some(update) = &self.update_available else {
             return Task::none();
         };
-        // 인앱 설치 불가/실패 → 브라우저 폴백 (기존 수동 설치 경로, 확인 불필요).
-        if update.download.is_none() || self.update_install_failed {
-            let url = update.url.clone();
-            return self.handle_open_url(&url);
-        }
+        let manual = update.download.is_none() || self.update_install_failed;
         let latest = update.latest.clone();
         // 한 번에 하나의 모달만 (계약과 근거는 close_all_modals 참고).
         self.close_all_modals();
-        self.confirm_update_modal = Some(ConfirmUpdateModalState { latest });
+        self.confirm_update_modal = Some(ConfirmUpdateModalState { latest, manual });
         Task::none()
     }
 
-    /// 모달의 Update 확정 → 실제 설치 시작 (기존 설치 경로 재사용).
-    /// 열림 이후 세션이 시작됐을 수도 있으므로 여기서도 재검사한다 — 그 사이 생긴
-    /// 세션이 있으면 시작하지 않고 모달을 닫으며 사유를 남긴다 (설치 경로의
-    /// `handle_install_update`에도 동일 가드가 있어 삼중 방어).
+    /// 모달의 확정 처리.
+    /// - 수동 모드: 릴리스 페이지를 브라우저로 연다 — 앱 재시작이 없으므로 실행 중
+    ///   세션 가드가 필요 없다. URL은 확정 시점의 `update_available`에서 다시 읽는다.
+    /// - 인앱 모드: 실제 설치 시작 (기존 설치 경로 재사용). 열림 이후 세션이
+    ///   시작됐을 수도 있으므로 여기서도 재검사한다 — 그 사이 생긴 세션이 있으면
+    ///   시작하지 않고 모달을 닫으며 사유를 남긴다 (설치 경로의
+    ///   `handle_install_update`에도 동일 가드가 있어 삼중 방어).
     pub(super) fn handle_confirm_install_update(&mut self) -> Task<Message> {
-        if self.confirm_update_modal.take().is_none() {
+        let Some(state) = self.confirm_update_modal.take() else {
             return Task::none();
+        };
+        if state.manual {
+            let Some(update) = &self.update_available else {
+                return Task::none();
+            };
+            let url = update.url.clone();
+            return self.handle_open_url(&url);
         }
         if self.sessions.iter().any(|session| session.is_running) {
             self.status_message = String::from("Stop running sessions before updating");
@@ -147,11 +158,44 @@ mod tests {
     }
 
     #[test]
-    fn request_without_download_falls_back_to_release_page() {
+    fn request_without_download_opens_manual_modal_not_browser() {
+        // 오클릭 방지: 즉시 브라우저를 열지 않고 수동 설치 모달을 띄운다.
         let mut app = manager_with_update(false);
         let _ = app.handle_request_install_update();
-        // 브라우저 폴백 경로 — 모달을 띄우지 않는다 (상태 메시지는 open 결과에 따름).
+        let modal = app.confirm_update_modal.as_ref().expect("manual modal");
+        assert!(modal.manual);
+        assert!(!app.is_updating);
+        assert!(
+            !app.status_message.contains("Opening URL"),
+            "browser must not open before confirm"
+        );
+    }
+
+    #[test]
+    fn request_after_failed_install_opens_manual_modal() {
+        // 인앱 설치가 한 번 실패하면 이후 클릭도 모달(수동 모드)을 거친다.
+        let mut app = manager_with_update(true);
+        app.update_install_failed = true;
+        let _ = app.handle_request_install_update();
+        assert!(app.confirm_update_modal.as_ref().is_some_and(|m| m.manual));
+    }
+
+    #[test]
+    fn manual_confirm_opens_release_page_even_while_sessions_running() {
+        // 수동 모드 확정은 브라우저만 연다 — 앱 재시작이 없으므로 실행 중 세션
+        // 가드를 타지 않는다. (테스트 빌드의 handle_open_url은 실제로 열지 않고
+        // 상태 메시지 계약만 수행한다.)
+        let mut app = manager_with_update(false);
+        app.sessions.push(RunSession::new("x".to_string()));
+        let _ = app.handle_request_install_update();
+        let _ = app.handle_confirm_install_update();
         assert!(app.confirm_update_modal.is_none());
         assert!(!app.is_updating);
+        assert!(
+            app.status_message.contains("Opening URL"),
+            "confirm must route to the release page: {:?}",
+            app.status_message
+        );
+        assert!(app.status_message.contains("releases/tag/v9.9.9"));
     }
 }

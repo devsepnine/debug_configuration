@@ -1,13 +1,13 @@
-use crate::messages::{ConfigurationDropPosition, Message, ViewMode};
+use crate::messages::{ConfigurationDropPosition, Message, StdinBarKey, ViewMode};
 use crate::models::{
     ConfigTypeData, ConfigurationType, ExecuteMode, ExecuteModeType, KotlinLaunchMode,
     KotlinLaunchModeType, LayoutId, PackageManager, RunConfiguration, RunSession, SearchState,
     SessionStatusKind, WorkspaceTab,
 };
 use crate::services::{
-    AppSettings, UpdateOutcome, check_latest_release, export_text, load_or_migrate_store,
-    load_settings, register_running_pid, run_configuration_stream, save_settings, save_to_store,
-    terminate_session_process, unregister_running_pid,
+    AppSettings, UpdateOutcome, check_latest_release, export_text, force_kill_process_tree,
+    load_or_migrate_store, load_settings, register_running_pid, run_configuration_stream,
+    save_settings, save_to_store, terminate_session_process, unregister_running_pid,
 };
 use crate::utils::{DIALOG_CANCELLED, ICON_DELETE, ICON_PLAY, ICON_REFRESH, ICON_STOP};
 use crate::views::shared::icon_tooltip;
@@ -114,6 +114,14 @@ struct TabUiState {
 #[derive(Default)]
 struct ConfigurationUiState {
     editor_focus_area_active: bool,
+    /// ScriptText 멀티라인 에디터의 위젯 버퍼 (iced text_editor는 상태 보유형 —
+    /// 모델의 `script_text: String`과 별도로 앱 상태에 산다).
+    script_editor: iced::widget::text_editor::Content,
+    /// `script_editor`가 마지막으로 반영한 (구성 id, 정확한 모델 텍스트). 모델이
+    /// 에디터 밖에서 바뀌면(선택 전환·임포트·모드 전환·로드 등) 이 캐시와 어긋나
+    /// `sync_script_editor`가 Content를 재구축한다 — 변이 지점 열거에 기대지 않는
+    /// 구조적 방어(누락 시 stale 텍스트가 모델을 덮어쓰는 사고 차단).
+    script_editor_synced: Option<(Uuid, String)>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -432,6 +440,9 @@ pub struct RunConfigManager {
     sessions: Vec<RunSession>,
     /// 세션 리스트에서 hover 중인 항목 (표시용 인덱스)
     hovered_session_index: Option<usize>,
+    /// 가장 최근 관측된 터미널 pane 뷰포트 (cols, rows) — 신규 세션 PTY의 초기
+    /// 크기로 사용해 시작 직후 리사이즈(ConPTY 전체 리페인트)를 피한다.
+    last_seen_viewport: Option<(u16, u16)>,
 
     /// 워크스페이스 탭 목록 (각 탭은 독립적인 `pane_grid` 레이아웃을 가짐)
     workspace_tabs: Vec<WorkspaceTab>,
@@ -528,6 +539,7 @@ impl RunConfigManager {
             available_jdks: vec![("Default (system)".to_string(), "java".to_string())],
             sessions: vec![],
             hovered_session_index: None,
+            last_seen_viewport: None,
             workspace_tabs: vec![WorkspaceTab::empty(String::from("Workspace 1"))],
             selected_tab_index: 0,
             configuration_layout: pane_grid::State::with_configuration(
@@ -615,6 +627,7 @@ impl RunConfigManager {
     pub fn update(&mut self, message: Message) -> Task<Message> {
         let task = self.dispatch_message(message);
         self.ensure_selected_env_bulk_input();
+        self.sync_script_editor();
         task
     }
 
@@ -681,7 +694,7 @@ impl RunConfigManager {
             | Message::BrowseInterpreterPath
             | Message::InterpreterPathSelected(_)
             | Message::InterpreterOptionsChanged(_)
-            | Message::ScriptTextChanged(_)
+            | Message::ScriptTextEdited(_)
             | Message::BrowseProjectDirectory
             | Message::ProjectDirectorySelected(_)
             | Message::PackageJsonsScanned(_, _, _)
@@ -757,6 +770,12 @@ impl RunConfigManager {
             | Message::SessionStdinSubmitted(_)
             | Message::SessionStdinWriteCompleted(_, _, _)
             | Message::OpenStdinInActivePane
+            | Message::StdinBarKeyPressed(_)
+            | Message::StdinBarKeyResolved(_, _)
+            | Message::SessionInterruptRequested(_)
+            | Message::SessionInterruptCompleted(_, _)
+            | Message::SessionEofRequested(_)
+            | Message::SessionEofCompleted(_, _)
             | Message::SearchNextInActivePane
             | Message::SearchPrevInActivePane
             | Message::ClearSessionOutput(_)
@@ -845,7 +864,7 @@ impl RunConfigManager {
             Message::InterpreterOptionsChanged(value) => {
                 self.handle_interpreter_options_changed(value)
             }
-            Message::ScriptTextChanged(value) => self.handle_script_text_changed(value),
+            Message::ScriptTextEdited(action) => self.handle_script_text_edited(action),
             Message::BrowseProjectDirectory => self.handle_browse_project_directory(),
             Message::ProjectDirectorySelected(result) => {
                 self.handle_project_directory_selected(result)
@@ -995,6 +1014,22 @@ impl RunConfigManager {
                 Some(session_id) => self.handle_open_session_stdin(session_id),
                 None => Task::none(),
             },
+            Message::StdinBarKeyPressed(key) => self.handle_stdin_bar_key_pressed(key),
+            Message::StdinBarKeyResolved(key, focused) => {
+                self.handle_stdin_bar_key_resolved(key, focused)
+            }
+            Message::SessionInterruptRequested(session_id) => {
+                self.handle_session_interrupt_requested(session_id)
+            }
+            Message::SessionInterruptCompleted(session_id, result) => {
+                self.handle_session_interrupt_completed(session_id, result)
+            }
+            Message::SessionEofRequested(session_id) => {
+                self.handle_session_eof_requested(session_id)
+            }
+            Message::SessionEofCompleted(session_id, result) => {
+                self.handle_session_eof_completed(session_id, result)
+            }
             Message::SearchNextInActivePane => match self.search_nav_target() {
                 Some(session_id) => self.handle_session_search_step(session_id, 1),
                 None => Task::none(),
@@ -1486,8 +1521,11 @@ impl RunConfigManager {
                     session_id,
                     cancel_flag,
                     self.show_environment_on_run,
-                    // 신규 세션 — 첫 프레임의 SessionViewportResized가 실측값을 채운다.
-                    None,
+                    // 신규 세션: 최근 관측된 pane 뷰포트로 스폰해 시작 직후의 리사이즈를
+                    // 없앤다 — Windows ConPTY는 리사이즈마다 전체 리페인트(빈 행 무더기)를
+                    // 내보내 첫 출력이 화면 아래로 밀린다. 실측과 다르면 첫 프레임의
+                    // SessionViewportResized가 보정한다.
+                    self.last_seen_viewport,
                 ),
                 |msg| msg,
             );
@@ -1556,7 +1594,8 @@ impl RunConfigManager {
                     session_id,
                     cancel_flag,
                     self.show_environment_on_run,
-                    None,
+                    // compound 멤버도 최근 pane 뷰포트로 스폰 (위 run 경로와 동일 근거).
+                    self.last_seen_viewport,
                 ),
                 |msg| msg,
             ));
@@ -1881,12 +1920,33 @@ impl RunConfigManager {
         Task::none()
     }
 
-    fn handle_script_text_changed(&mut self, value: String) -> Task<Message> {
+    /// ScriptText 멀티라인 에디터 액션 적용 + 모델 되쓰기. 편집 중엔 위젯 버퍼가
+    /// 단일 진실이고, 액션마다 전체 텍스트를 모델에 반영한다(스크립트는 작아
+    /// O(텍스트) 비용 무시 가능). 선택 전환 직후 도착한 stale 액션은 synced id
+    /// 가드로 버린다 — 다른 구성의 텍스트가 잘못 기록되는 것 방지.
+    fn handle_script_text_edited(
+        &mut self,
+        action: iced::widget::text_editor::Action,
+    ) -> Task<Message> {
+        let selected_id = self.get_selected_config().map(|config| config.id);
+        let synced_id = self
+            .configuration_ui
+            .script_editor_synced
+            .as_ref()
+            .map(|(id, _)| *id);
+        if selected_id.is_none() || selected_id != synced_id {
+            return Task::none();
+        }
+        self.configuration_ui.script_editor.perform(action);
+        let text = self.configuration_ui.script_editor.text();
         if let Some(script_text) = self
             .selected_type_data_mut()
             .and_then(ConfigTypeData::script_text_mut)
         {
-            *script_text = value;
+            *script_text = text.clone();
+            if let Some(synced) = &mut self.configuration_ui.script_editor_synced {
+                synced.1 = text;
+            }
         }
 
         Task::none()
@@ -2528,6 +2588,10 @@ impl RunConfigManager {
         cols: u16,
         rows: u16,
     ) -> Task<Message> {
+        // 신규 세션 스폰의 초기 크기 후보 — pane들은 대개 비슷한 크기라, 이 값으로
+        // 스폰하면 시작 직후의 리사이즈(ConPTY 전체 리페인트 유발)가 사라진다.
+        // 세션 존재 여부와 무관하게 기록한다(어느 pane이든 유효한 실측값).
+        self.last_seen_viewport = Some((cols, rows));
         if let Some(session) = self.session_by_id_mut(session_id) {
             if session.pty_viewport == Some((cols, rows)) {
                 return Task::none();
@@ -2553,6 +2617,15 @@ impl RunConfigManager {
             if session.cancel_flag.load(Ordering::Relaxed) {
                 return Task::none();
             }
+            // 배치 적용 전 앵커(front/last line_id) — 검색이 열려 있을 때만 캡처해
+            // 증분 매치 갱신에 쓴다.
+            let search_anchor = session.search.is_some().then(|| {
+                session
+                    .output_lines
+                    .front()
+                    .map(|(id, _)| *id)
+                    .zip(session.output_lines.back().map(|(id, _)| *id))
+            });
             // executor가 묶어 보낸 이벤트 배치 (process_output_loop의 coalescing —
             // UI 메시지 폭주 방지). Line=추가, Replace=마지막 라인 교체(라이브 진행바).
             for event in events {
@@ -2563,10 +2636,10 @@ impl RunConfigManager {
                 session.scroll_progress = 1.0;
             }
 
-            // 출력이 바뀌었으니 검색 매치 캐시 갱신 — 배치당 1회 (이벤트당 금지: 라이브
-            // 진행바는 초당 수십 배치라 O(버퍼) 스캔이 곱해진다). search 닫힘 시 no-op.
-            if session.search.is_some() {
-                session.refresh_search_matches();
+            // 검색 매치 캐시 증분 갱신 — 배치당 1회. 전체 재스캔은 O(버퍼)라 폭주
+            // (초당 수십 배치)에서 곱해졌다; 증분은 O(evict+신규+캐시 조정)로 유계.
+            if let Some(anchor) = search_anchor {
+                session.refresh_search_matches_incremental(anchor);
             }
         }
 
@@ -2626,7 +2699,14 @@ impl RunConfigManager {
     fn handle_open_url(&mut self, url: &str) -> Task<Message> {
         // 결과를 반영한다. Linux에 xdg-open(xdg-utils)이 없으면 Err가 나는데,
         // 무시하면 "Opening URL"만 표시되고 아무 일도 안 일어나 혼란을 준다.
-        self.status_message = match open::that(url) {
+        // 테스트 빌드는 실제로 열지 않는다 — 이 경로를 지나는 유닛 테스트가
+        // cargo test마다 개발 머신에 진짜 브라우저 탭(가짜 릴리스 페이지 404 등)을
+        // 띄우는 사고가 실제로 있었다. 상태 메시지 계약만 동일하게 유지한다.
+        #[cfg(test)]
+        let result: std::io::Result<()> = Ok(());
+        #[cfg(not(test))]
+        let result = open::that(url);
+        self.status_message = match result {
             Ok(()) => format!("Opening URL: {url}"),
             Err(error) => format!("Failed to open URL: {error}"),
         };
@@ -2848,6 +2928,8 @@ impl RunConfigManager {
     fn handle_close_session_stdin(&mut self, session_id: Uuid) -> Task<Message> {
         if let Some(session) = self.session_by_id_mut(session_id) {
             session.stdin_input = None;
+            // 드래프트가 죽었으므로 보관 드래프트가 다음 열기에서 부활하지 않게 리셋.
+            session.reset_stdin_history_navigation();
         }
         Task::none()
     }
@@ -2857,12 +2939,17 @@ impl RunConfigManager {
             && session.stdin_input.is_some()
         {
             session.stdin_input = Some(value);
+            // 수동 편집은 탐색을 끝낸다 — 편집된 텍스트가 새 라이브 드래프트가 되고,
+            // 다음 ↑가 그것을 보관한다. (히스토리 탐색의 드래프트 교체는 on_input을
+            // 거치지 않으므로 여기로 오지 않는다.)
+            session.reset_stdin_history_navigation();
         }
         Task::none()
     }
 
     /// stdin 제출: 드래프트를 낙관적으로 비우고 전송 Task를 띄운다.
-    /// 원문은 완료 메시지에 실어 보낸다 — 하드 실패 시 복원, pipe 성공 시 로컬 에코.
+    /// 원문은 완료 메시지에 실어 보낸다 — 하드 실패 시 복원, 폴백 pipe(<1809) 성공
+    /// 시 로컬 에코.
     fn handle_session_stdin_submitted(&mut self, session_id: Uuid) -> Task<Message> {
         let Some(session) = self.session_by_id_mut(session_id) else {
             return Task::none();
@@ -2874,6 +2961,9 @@ impl RunConfigManager {
             return Task::none();
         };
         let line = std::mem::take(draft);
+        // 이력은 제출 시점에 기록한다 — Timeout이어도 쓰기는 결국 전달되고(순서 보존),
+        // Broken 복원→재제출은 연속 중복 제거가 이중 등록을 막는다.
+        session.push_stdin_history(&line);
         let sent = line.clone();
         Task::perform(
             crate::services::write_session_stdin(session_id, line),
@@ -2882,8 +2972,9 @@ impl RunConfigManager {
     }
 
     /// stdin 쓰기 결과 처리.
-    /// - `Ok(true)`: pipe 경로 성공 — 에코가 없으므로 세션 로그에 로컬 에코.
-    /// - `Ok(false)`: PTY 성공 — 라인 디시플린 에코가 출력으로 돌아오므로 아무것도 안 함.
+    /// - `Ok(true)`: 폴백 pipe(Windows <1809) 성공 — 에코가 없으므로 세션 로그에 로컬 에코.
+    /// - `Ok(false)`: PTY(unix)/ConPTY(Windows) 성공 — 터미널 에코가 출력으로 돌아오므로
+    ///   아무것도 안 함.
     /// - `Timeout`: 조기 신호일 뿐(쓰기는 백그라운드에서 완료됨) — 복원 금지(복원 후
     ///   재제출 = 중복 입력), 상태 메시지만.
     /// - `Broken`: 하드 실패 — 사용자가 그 사이 새로 타이핑하지 않았다면 드래프트 복원.
@@ -2913,15 +3004,182 @@ impl RunConfigManager {
                     && session.stdin_input.as_deref() == Some("")
                 {
                     session.stdin_input = Some(line);
+                    // 방어적 리셋 — 현재는 제출 시점의 push가 탐색을 이미 끝냈지만,
+                    // 그 불변식에 기대지 않고 직접 대입엔 항상 리셋을 동반시킨다.
+                    session.reset_stdin_history_navigation();
                 }
             }
         }
         Task::none()
     }
 
-    /// Esc: 활성 바 하나만 닫는다. 우선순위 = 포커스 pane stdin → 포커스 pane 검색 →
-    /// 임의 stdin-open 세션 → 임의 search-open 세션 (LIFO 근사 — 나중에 연 표면 먼저).
+    /// stdin 바 키(↑/↓)의 공통 진입점: 실제 포커스된 위젯 Id를 조회해 해석 메시지로
+    /// 되돌린다. 구독 클로저는 self를 캡처할 수 없고, pane 포커스는 위젯 포커스와
+    /// 다를 수 있어(검색 입력 포커스 등) find_focused가 권위 판정이다. 포커스된
+    /// 위젯이 없으면 오퍼레이션이 Outcome::None으로 끝나 메시지가 발화되지 않는다.
+    fn handle_stdin_bar_key_pressed(&mut self, key: StdinBarKey) -> Task<Message> {
+        if !self.sessions.iter().any(|s| s.stdin_input.is_some()) {
+            return Task::none();
+        }
+        iced::advanced::widget::operate(
+            iced::advanced::widget::operation::focusable::find_focused(),
+        )
+        .map(move |focused| Message::StdinBarKeyResolved(key, focused))
+    }
+
+    /// find_focused 결과를 stdin 바로 라우팅한다. 포커스 Id가 stdin 바가 열린 어떤
+    /// 세션의 입력과도 일치하지 않으면(검색창/탭 이름 편집 등) no-op — 히스토리/
+    /// 인터럽트 키가 다른 입력의 복사·캐럿 조작과 충돌하지 않는 안전핀.
+    fn handle_stdin_bar_key_resolved(
+        &mut self,
+        key: StdinBarKey,
+        focused: iced::advanced::widget::Id,
+    ) -> Task<Message> {
+        let Some(session_id) = self
+            .sessions
+            .iter()
+            .filter(|s| s.stdin_input.is_some())
+            .map(|s| s.id)
+            .find(|id| crate::views::shared::session_stdin_input_id(*id) == focused)
+        else {
+            return Task::none();
+        };
+        match key {
+            StdinBarKey::HistoryOlder | StdinBarKey::HistoryNewer => {
+                let older = matches!(key, StdinBarKey::HistoryOlder);
+                let Some(session) = self.session_by_id_mut(session_id) else {
+                    return Task::none();
+                };
+                if session.navigate_stdin_history(older) {
+                    // 드래프트 교체 후 캐럿은 이전 오프셋에 남으므로 끝으로 보낸다.
+                    iced::widget::operation::move_cursor_to_end(
+                        crate::views::shared::session_stdin_input_id(session_id),
+                    )
+                } else {
+                    Task::none()
+                }
+            }
+            StdinBarKey::Interrupt => self.handle_session_interrupt_requested(session_id),
+            StdinBarKey::Eof => self.handle_session_eof_requested(session_id),
+        }
+    }
+
+    /// ^C 버튼/Ctrl+C 키 공통 진입점 — 실행 중이 아니면 no-op (버튼은 Inactive
+    /// 상태에서도 on_press가 발화하므로 여기서 가드한다).
+    fn handle_session_interrupt_requested(&mut self, session_id: Uuid) -> Task<Message> {
+        let running = self
+            .session_by_id_mut(session_id)
+            .is_some_and(|s| s.is_running);
+        if !running {
+            return Task::none();
+        }
+        Task::perform(
+            crate::services::interrupt_session(session_id),
+            move |result| Message::SessionInterruptCompleted(session_id, result),
+        )
+    }
+
+    /// 인터럽트 결과 처리. 성공은 침묵 — ^C 에코/KeyboardInterrupt 표시는 터미널과
+    /// 자식의 몫이다(에코는 전송의 책임). 실패 양쪽 모두 pid 그룹 SIGINT 폴백을
+    /// 시도한다:
+    /// - `Timeout`: 쓰기 경로가 막힌 상태(자식이 stdin을 안 읽어 이전 쓰기가 writer
+    ///   mutex를 문 채 블록 등) — 인터럽트가 가장 필요한 순간이므로 에스컬레이션한다.
+    ///   블록됐던 ETX가 뒤늦게 전달돼도 실제 터미널에서 ^C를 두 번 누른 것과
+    ///   동일(SIGINT 2회)이라 무해하다.
+    /// - `Broken`(PTY 경로 부재/파손 — unix pipe 폴백 세션 등).
+    ///
+    /// 폴백도 불가하면(windows <1809 폴백, pid 부재) 상태 메시지로 안내한다. 단,
+    /// 그 사이 Stop/Remove/자연 종료가 선행된 세션엔 침묵한다 — 인터럽트 결과가
+    /// 이미 무의미하고, 방금 표시된 "Session stopped" 류 메시지를 덮어쓰지 않는다.
+    fn handle_session_interrupt_completed(
+        &mut self,
+        session_id: Uuid,
+        result: Result<(), crate::models::StdinWriteError>,
+    ) -> Task<Message> {
+        use crate::models::StdinWriteError;
+        let Err(error) = result else {
+            return Task::none();
+        };
+        if !self
+            .sessions
+            .iter()
+            .any(|s| s.id == session_id && s.is_running)
+        {
+            return Task::none();
+        }
+        if !self.try_signal_interrupt(session_id) {
+            self.status_message = String::from(match error {
+                StdinWriteError::Timeout => {
+                    "Interrupt pending — the process is not reading stdin yet"
+                }
+                StdinWriteError::Broken(_) => "Interrupt is not available for this session",
+            });
+        }
+        Task::none()
+    }
+
+    /// ^D 버튼/Ctrl+D 키 공통 진입점 — 실행 중이 아니면 no-op (버튼은 Inactive
+    /// 상태에서도 on_press가 발화하므로 여기서 가드한다).
+    fn handle_session_eof_requested(&mut self, session_id: Uuid) -> Task<Message> {
+        let running = self
+            .session_by_id_mut(session_id)
+            .is_some_and(|s| s.is_running);
+        if !running {
+            return Task::none();
+        }
+        Task::perform(crate::services::eof_session(session_id), move |result| {
+            Message::SessionEofCompleted(session_id, result)
+        })
+    }
+
+    /// EOF 결과 처리. 성공은 침묵 — 자식의 반응(REPL 종료 등)은 출력으로 보인다.
+    /// EOF엔 시그널 폴백이 없어 실패는 안내만 하고, 그 사이 Stop/Remove/종료가
+    /// 선행됐으면 침묵한다(인터럽트 완료 처리와 동일한 이유).
+    fn handle_session_eof_completed(
+        &mut self,
+        session_id: Uuid,
+        result: Result<(), crate::models::StdinWriteError>,
+    ) -> Task<Message> {
+        use crate::models::StdinWriteError;
+        let Err(error) = result else {
+            return Task::none();
+        };
+        if !self
+            .sessions
+            .iter()
+            .any(|s| s.id == session_id && s.is_running)
+        {
+            return Task::none();
+        }
+        self.status_message = String::from(match error {
+            StdinWriteError::Timeout => "EOF pending — the process is not reading stdin yet",
+            StdinWriteError::Broken(_) => "EOF is not available for this session",
+        });
+        Task::none()
+    }
+
+    /// pid 그룹 SIGINT 폴백 — 실제로 신호를 보냈으면 true. Stop과 달리 pid를
+    /// take하지 않는다(인터럽트 후에도 세션은 계속 산다). `is_running` 재확인이
+    /// 종료 직후의 낡은 pid로 신호를 쏘는 것을 막는다.
+    fn try_signal_interrupt(&self, session_id: Uuid) -> bool {
+        self.sessions
+            .iter()
+            .find(|s| s.id == session_id && s.is_running)
+            .and_then(|s| s.process_pid)
+            .is_some_and(crate::services::interrupt_session_process)
+    }
+
+    /// Esc: 활성 표면 하나만 닫는다. 우선순위 = 오버플로 메뉴(⋯) → 포커스 pane
+    /// stdin → 포커스 pane 검색 → 임의 stdin-open 세션 → 임의 search-open 세션
+    /// (LIFO 근사 — 가장 일시적인 표면부터). 메뉴는 한 번에 하나만 열리지만
+    /// 전체를 닫아 토글 핸들러의 단일-열림 불변식과 일치시킨다.
     fn handle_close_active_bar(&mut self) -> Task<Message> {
+        if self.sessions.iter().any(|s| s.controls_menu_open) {
+            for session in &mut self.sessions {
+                session.controls_menu_open = false;
+            }
+            return Task::none();
+        }
         if let Some(session_id) = self.stdin_nav_target() {
             return self.handle_close_session_stdin(session_id);
         }
@@ -2944,18 +3202,23 @@ impl RunConfigManager {
         Task::none()
     }
 
-    /// 오버플로 메뉴를 닫아야 하는 상황을 한곳에서 처리한다.
-    /// - 메뉴 항목이 세션 액션을 실행하면 해당 세션의 메뉴를 닫는다(인라인 full
-    ///   컨트롤에서 온 동일 메시지엔 이미 닫혀 있어 무해). `TogglePaneMaximize`는
-    ///   메뉴에 maximize 항목이 있으므로 pane→세션을 거쳐 닫는다.
-    /// - 리사이즈로 레이아웃이 바뀌면 모든 메뉴를 닫는다. pane이 넓어져 full 컨트롤로
-    ///   돌아가면 `⋯`가 사라져 토글로 닫을 수 없게 되는 상태를 막기 위함이다.
+    /// 오버플로 메뉴를 닫아야 하는 상황을 한곳에서 처리한다. 메뉴는 `⋯` 토글로만
+    /// 여닫는 지속 표면이다 — 항목 클릭(rerun/stop/search/stdin/...)은 메뉴를 닫지
+    /// 않아 연속 조작이 가능하다(stop→rerun 등). 닫는 경우는 "`⋯`가 사라져 토글로
+    /// 닫을 수 없게 되는" 레이아웃 변화뿐:
+    /// - 리사이즈/드래그/pane·탭 닫기(Cmd+W 포함) → 모든 메뉴 닫기 (pane이
+    ///   넓어지면 full 컨트롤로 전환돼 `⋯` 자체가 사라지고, 탭/pane 닫기는 세션
+    ///   객체에 남은 열림 플래그가 재열기 시 고아 메뉴로 나타나는 것을 막는다)
+    /// - `TogglePaneMaximize` → 해당 pane 세션의 메뉴 닫기 (maximize로 넓어진 pane도
+    ///   full 컨트롤로 전환된다; 메뉴에 maximize 항목이 있어 pane→세션으로 해석)
     fn close_controls_menu_on_action(&mut self, message: &Message) {
         if matches!(
             message,
             Message::PaneGridResized(_)
                 | Message::WindowResized(_, _)
                 | Message::ClosePane(_)
+                | Message::CloseTab(_)
+                | Message::CloseFocusedPane
                 | Message::PaneGridDragged(_)
         ) {
             for session in &mut self.sessions {
@@ -2964,29 +3227,18 @@ impl RunConfigManager {
             return;
         }
 
-        let session_id = match message {
-            Message::RerunSession(id)
-            | Message::StopSession(id)
-            | Message::ToggleAutoScroll(id)
-            | Message::OpenSessionSearch(id)
-            | Message::OpenSessionStdin(id)
-            | Message::ClearSessionOutput(id)
-            | Message::ExportSessionOutput(id) => *id,
-            Message::TogglePaneMaximize(pane_id) => {
-                let Some(session_id) = self
-                    .workspace_tabs
-                    .get(self.selected_tab_index)
-                    .and_then(|tab| tab.pane_layout.get(*pane_id))
-                    .and_then(|pane| pane.session_id)
-                else {
-                    return;
-                };
-                session_id
+        if let Message::TogglePaneMaximize(pane_id) = message {
+            let Some(session_id) = self
+                .workspace_tabs
+                .get(self.selected_tab_index)
+                .and_then(|tab| tab.pane_layout.get(*pane_id))
+                .and_then(|pane| pane.session_id)
+            else {
+                return;
+            };
+            if let Some(session) = self.session_by_id_mut(session_id) {
+                session.controls_menu_open = false;
             }
-            _ => return,
-        };
-        if let Some(session) = self.session_by_id_mut(session_id) {
-            session.controls_menu_open = false;
         }
     }
 
@@ -3168,6 +3420,50 @@ impl RunConfigManager {
                     ',' => Some(Message::OpenSettingsModal),
                     _ => None,
                 }
+            }
+            _ => None,
+        }
+    }
+
+    /// stdin 바 전용 키 매칭 (구독 클로저는 fn 포인터 — 대상 해석은
+    /// `handle_stdin_bar_key_pressed`의 find_focused가 담당).
+    /// - Ctrl+C(인터럽트)/Ctrl+D(EOF): **status 게이트 없음** — win/linux의
+    ///   text_input은 포커스 중 Ctrl+C를 선택 유무와 무관하게 캡처하므로(복사 arm의
+    ///   capture가 무조건) Ignored 게이트를 두면 키가 영원히 도달하지 않는다
+    ///   (Ctrl+D는 캡처되지 않지만 일관성을 위해 동일 규칙). 판정은 **물리 키 또는
+    ///   logical 문자의 합집합** — 물리키는 한글 등 비라틴 레이아웃(logical이
+    ///   "ㅊ"/"ㅇ"; text_input의 복사 판정 to_latin도 비라틴에서만 물리키를 참조)을,
+    ///   logical은 Dvorak처럼 라틴 문자가 물리적으로 이동한 레이아웃(to_latin이
+    ///   logical을 신뢰)을 커버한다. macOS의 복사는 Cmd+C(logo)라 이 arm(control
+    ///   전용, logo 배제)과 겹치지 않는다.
+    /// - ↑/↓: 수식키 없음 + `Status::Ignored`만 — iced text_input은 수직 방향키를
+    ///   캡처하지 않아 포커스 중에도 Ignored로 도달하고, 게이트는 미래에 방향키를
+    ///   캡처하는 위젯이 생겨도 이중 발화를 막는 위생 장치다.
+    fn stdin_bar_key_message(
+        key: &keyboard::Key,
+        physical_key: keyboard::key::Physical,
+        modifiers: keyboard::Modifiers,
+        status: event::Status,
+    ) -> Option<Message> {
+        if modifiers.control() && !modifiers.shift() && !modifiers.alt() && !modifiers.logo() {
+            let is_key = |code: keyboard::key::Code, ch: &str| {
+                matches!(physical_key, keyboard::key::Physical::Code(c) if c == code)
+                    || matches!(key, keyboard::Key::Character(s) if s.as_str().eq_ignore_ascii_case(ch))
+            };
+            if is_key(keyboard::key::Code::KeyC, "c") {
+                return Some(Message::StdinBarKeyPressed(StdinBarKey::Interrupt));
+            }
+            if is_key(keyboard::key::Code::KeyD, "d") {
+                return Some(Message::StdinBarKeyPressed(StdinBarKey::Eof));
+            }
+        }
+        let arrow_eligible = modifiers.is_empty() && matches!(status, event::Status::Ignored);
+        match key {
+            keyboard::Key::Named(keyboard::key::Named::ArrowUp) if arrow_eligible => {
+                Some(Message::StdinBarKeyPressed(StdinBarKey::HistoryOlder))
+            }
+            keyboard::Key::Named(keyboard::key::Named::ArrowDown) if arrow_eligible => {
+                Some(Message::StdinBarKeyPressed(StdinBarKey::HistoryNewer))
             }
             _ => None,
         }
@@ -3862,6 +4158,41 @@ impl RunConfigManager {
             .or_insert_with(|| crate::env_string::serialize_env_map(&config.environment_variables));
     }
 
+    /// ScriptText 에디터 버퍼를 모델과 동기화한다 — `update()` 말미에 매 메시지 후
+    /// 호출되는 중앙 훅. 선택 구성이 ScriptText 모드일 때 (id, 텍스트)가 synced
+    /// 캐시와 다르면 Content를 재구축한다 — 선택 전환·임포트(같은 id로 내용 교체)·
+    /// 모드 전환(script_text 초기화)·전체 로드 등 에디터 밖의 모든 변이를 개별
+    /// 열거 없이 커버한다. 편집 액션 직후엔 모델==캐시라 재구축이 없어 커서가
+    /// 보존된다. 비교는 참조로만 하고 재구축이 필요할 때만 클론한다.
+    fn sync_script_editor(&mut self) {
+        let rebuild: Option<(Uuid, String)> = {
+            let current = self
+                .selected_config_index
+                .and_then(|idx| self.configurations.get(idx))
+                .and_then(|config| match &config.type_data {
+                    ConfigTypeData::ShellScript {
+                        execute_mode: ExecuteMode::ScriptText { script_text },
+                    } => Some((config.id, script_text)),
+                    _ => None,
+                });
+            let Some((id, text)) = current else {
+                // ScriptText가 아닌 선택 — 캐시만 무효화 (Content는 뷰가 읽지 않는다).
+                self.configuration_ui.script_editor_synced = None;
+                return;
+            };
+            self.configuration_ui
+                .script_editor_synced
+                .as_ref()
+                .is_none_or(|(sid, stext)| *sid != id || stext != text)
+                .then(|| (id, text.clone()))
+        };
+        if let Some((id, text)) = rebuild {
+            self.configuration_ui.script_editor =
+                iced::widget::text_editor::Content::with_text(&text);
+            self.configuration_ui.script_editor_synced = Some((id, text));
+        }
+    }
+
     fn sync_editor_select_state_for_selected_config(&mut self) {
         let (scripts, package_jsons) = self
             .selected_config_index
@@ -3940,8 +4271,8 @@ impl RunConfigManager {
         }
 
         let (label, on_press) = match &self.update_available {
-            // 인앱 설치 가능(자산+서명 존재, 미실패) → 클릭 시 확인 모달을 거쳐 설치.
-            // 불가/실패 시에는 RequestInstallUpdate가 릴리스 페이지 열기로 폴백한다.
+            // 클릭 시 확인 모달을 거쳐 설치. 인앱 설치 불가/실패 시에는 모달이
+            // 수동 모드로 열리고 확정 후에만 릴리스 페이지를 연다 (오클릭 방지).
             Some(update) => (
                 format!("v{current} → v{latest} ⬆", latest = update.latest),
                 Message::RequestInstallUpdate,
@@ -4524,6 +4855,7 @@ impl RunConfigManager {
                                     &self.editor_select_state,
                                     &self.available_node_runtimes,
                                     &self.available_jdks,
+                                    &self.configuration_ui.script_editor,
                                 ))
                                 .width(Length::Fill)
                                 .height(Length::Shrink),
@@ -4829,17 +5161,16 @@ impl RunConfigManager {
         } else {
             Subscription::none()
         };
-        // ESC = 검색 닫기. 실제로 검색바가 열려 있을 때만 활성화해 다른 ESC 용도와
-        // 충돌하지 않게 한다 (검색이 없으면 ESC를 가로채지 않음).
-        // Esc = 활성 바(stdin 우선 → 검색) 하나 닫기. 단일 구독·단일 메시지로 두고
-        // 우선순위는 핸들러(handle_close_active_bar)가 정한다 — 바 종류별 Esc 구독을
-        // 병렬로 두면 한 번의 Esc에 둘 다 닫히는 이중 발화가 생긴다.
+        // Esc = 활성 표면(⋯ 메뉴 → stdin → 검색) 하나 닫기. 실제로 열린 표면이 있을
+        // 때만 활성화해 다른 ESC 용도와 충돌하지 않게 한다. 단일 구독·단일 메시지로
+        // 두고 우선순위는 핸들러(handle_close_active_bar)가 정한다 — 표면 종류별
+        // Esc 구독을 병렬로 두면 한 번의 Esc에 여럿이 닫히는 이중 발화가 생긴다.
         // (의도적으로 status 게이트 없음 — 포커스된 input 안에서도 Esc가 동작해야 한다)
         let bar_close_subscription = if sessions_active
             && self
                 .sessions
                 .iter()
-                .any(|s| s.search.is_some() || s.stdin_input.is_some())
+                .any(|s| s.search.is_some() || s.stdin_input.is_some() || s.controls_menu_open)
         {
             event::listen_with(|event, _status, _id| match event {
                 Event::Keyboard(keyboard::Event::KeyPressed {
@@ -4872,6 +5203,24 @@ impl RunConfigManager {
                 }) if matches!(status, event::Status::Ignored) => {
                     Some(Self::search_nav_message(modifiers.shift()))
                 }
+                _ => None,
+            })
+        } else {
+            Subscription::none()
+        };
+
+        // stdin 바 키(↑/↓ 히스토리, Ctrl+C 인터럽트): 어떤 세션이든 stdin 바가 열려
+        // 있을 때만 활성. 어느 바가 대상인지는 핸들러의 find_focused 조회가 판정한다.
+        let stdin_bar_keys_active =
+            sessions_active && self.sessions.iter().any(|s| s.stdin_input.is_some());
+        let stdin_bar_key_subscription = if stdin_bar_keys_active {
+            event::listen_with(|event, status, _id| match event {
+                Event::Keyboard(keyboard::Event::KeyPressed {
+                    key,
+                    physical_key,
+                    modifiers,
+                    ..
+                }) => Self::stdin_bar_key_message(&key, physical_key, modifiers, status),
                 _ => None,
             })
         } else {
@@ -4922,6 +5271,7 @@ impl RunConfigManager {
             search_open_subscription,
             bar_close_subscription,
             search_nav_subscription,
+            stdin_bar_key_subscription,
             nav_shortcut_subscription,
             session_timer_subscription,
             update_spinner_subscription,
@@ -5018,6 +5368,7 @@ impl RunConfigManager {
                 // 열림 이후의 세션 변화도 반영되도록 매 프레임 현재 상태로 계산한다
                 // (열림 시점 스냅샷은 세션을 멈춰도 버튼이 계속 죽어 있게 된다).
                 running_sessions: self.sessions.iter().filter(|s| s.is_running).count(),
+                manual: modal.manual,
             };
             layers = layers.push(view_confirm_update_modal(props));
         }
@@ -5055,30 +5406,14 @@ impl Drop for RunConfigManager {
         // terminate_and_reap가 담당하고, 여기서는 종료 시 자식 누수 방지가 목적이다.
         for session in &running_sessions {
             if let Some(pid) = session.process_pid {
-                #[cfg(unix)]
-                unsafe {
-                    // Unix: 프로세스 그룹 전체에 SIGKILL
-                    libc::killpg(pid as i32, libc::SIGKILL);
-                    eprintln!(
-                        "[Shutdown] Sent SIGKILL to PID {} ({})",
-                        pid, session.config_name
-                    );
-                }
-
-                #[cfg(windows)]
-                {
-                    // Windows: /T /F로 프로세스 트리 강제 종료
-                    use std::os::windows::process::CommandExt;
-                    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-                    let _ = std::process::Command::new("taskkill")
-                        .args(["/PID", &pid.to_string(), "/T", "/F"])
-                        .creation_flags(CREATE_NO_WINDOW)
-                        .output();
-                    eprintln!(
-                        "[Shutdown] Force killed PID {} ({})",
-                        pid, session.config_name
-                    );
-                }
+                // executor의 공용 트리 킬로 위임 — 과거 인라인 killpg는 자기그룹
+                // 사살 가드(signal_process_group의 getpgid 검사)가 없어, pid==pgid
+                // 전제가 깨지면 종료 시 앱을 띄운 터미널 그룹까지 죽일 수 있었다.
+                force_kill_process_tree(pid);
+                eprintln!(
+                    "[Shutdown] Force killed PID {} ({})",
+                    pid, session.config_name
+                );
             }
         }
 
@@ -5380,6 +5715,375 @@ mod tests {
     }
 
     #[test]
+    fn stdin_submit_pushes_history() {
+        let (mut app, ids) = manager_with_open_panes(&["a"]);
+        let sid = ids[0];
+        app.session_by_id_mut(sid).unwrap().is_running = true;
+        let _ = app.handle_open_session_stdin(sid);
+
+        let _ = app.handle_session_stdin_changed(sid, String::from("foo"));
+        let _ = app.handle_session_stdin_submitted(sid);
+        // 빈 Enter는 전송되지만 이력에는 남지 않는다.
+        let _ = app.handle_session_stdin_submitted(sid);
+
+        let session = app.session_by_id_mut(sid).unwrap();
+        assert_eq!(session.stdin_history, vec!["foo"]);
+        assert_eq!(session.stdin_input.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn stdin_broken_restore_then_resubmit_does_not_duplicate_history() {
+        use crate::models::StdinWriteError;
+        let (mut app, ids) = manager_with_open_panes(&["a"]);
+        let sid = ids[0];
+        app.session_by_id_mut(sid).unwrap().is_running = true;
+        let _ = app.handle_open_session_stdin(sid);
+
+        let _ = app.handle_session_stdin_changed(sid, String::from("x"));
+        let _ = app.handle_session_stdin_submitted(sid);
+        let _ = app.handle_session_stdin_write_completed(
+            sid,
+            String::from("x"),
+            Err(StdinWriteError::Broken(String::from("EPIPE"))),
+        );
+        // 복원된 드래프트를 그대로 재제출 → 연속 중복 제거로 이력은 한 번만.
+        assert_eq!(
+            app.session_by_id_mut(sid).unwrap().stdin_input.as_deref(),
+            Some("x")
+        );
+        let _ = app.handle_session_stdin_submitted(sid);
+        assert_eq!(app.session_by_id_mut(sid).unwrap().stdin_history, vec!["x"]);
+    }
+
+    #[test]
+    fn stdin_history_survives_rerun() {
+        // rerun은 세션 객체를 재사용하며 stdin_history를 건드리지 않는다
+        // (`stdin_draft_survives_rerun`과 동형의 회귀 방지).
+        let (mut app, ids) = manager_with_open_panes(&["a"]);
+        let sid = ids[0];
+        app.session_by_id_mut(sid).unwrap().is_running = true;
+        let _ = app.handle_open_session_stdin(sid);
+        let _ = app.handle_session_stdin_changed(sid, String::from("cmd"));
+        let _ = app.handle_session_stdin_submitted(sid);
+
+        let _ = app.handle_rerun_session(sid);
+
+        let session = app
+            .sessions
+            .iter()
+            .find(|s| s.config_name == "a")
+            .expect("session survives rerun");
+        assert_eq!(session.stdin_history, vec!["cmd"]);
+    }
+
+    #[test]
+    fn stdin_bar_key_message_maps_arrows_only_when_ignored() {
+        use keyboard::key::{Code, Named, Physical};
+        let up = keyboard::Key::Named(Named::ArrowUp);
+        let down = keyboard::Key::Named(Named::ArrowDown);
+        let phys_up = Physical::Code(Code::ArrowUp);
+        let phys_down = Physical::Code(Code::ArrowDown);
+        assert!(matches!(
+            RunConfigManager::stdin_bar_key_message(
+                &up,
+                phys_up,
+                keyboard::Modifiers::empty(),
+                event::Status::Ignored
+            ),
+            Some(Message::StdinBarKeyPressed(StdinBarKey::HistoryOlder))
+        ));
+        assert!(matches!(
+            RunConfigManager::stdin_bar_key_message(
+                &down,
+                phys_down,
+                keyboard::Modifiers::empty(),
+                event::Status::Ignored
+            ),
+            Some(Message::StdinBarKeyPressed(StdinBarKey::HistoryNewer))
+        ));
+        // 위젯이 캡처한 방향키와 수식키 조합은 무시.
+        assert!(
+            RunConfigManager::stdin_bar_key_message(
+                &up,
+                phys_up,
+                keyboard::Modifiers::empty(),
+                event::Status::Captured
+            )
+            .is_none()
+        );
+        assert!(
+            RunConfigManager::stdin_bar_key_message(
+                &up,
+                phys_up,
+                keyboard::Modifiers::SHIFT,
+                event::Status::Ignored
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn stdin_bar_key_message_maps_ctrl_c_regardless_of_status() {
+        use keyboard::key::{Code, Physical};
+        let ctrl = keyboard::Modifiers::CTRL;
+        let phys_c = Physical::Code(Code::KeyC);
+        let key_c = keyboard::Key::Character("c".into());
+        // 캡처 상태에서도 발화해야 한다 — win/linux text_input은 포커스 중 Ctrl+C를
+        // 무조건 캡처하므로 Ignored 게이트가 있으면 이 키는 영원히 도달하지 않는다.
+        assert!(matches!(
+            RunConfigManager::stdin_bar_key_message(&key_c, phys_c, ctrl, event::Status::Captured),
+            Some(Message::StdinBarKeyPressed(StdinBarKey::Interrupt))
+        ));
+        // 한글 레이아웃: logical key가 "ㅊ"이어도 물리 KeyC로 판정한다.
+        let key_hangul = keyboard::Key::Character("ㅊ".into());
+        assert!(matches!(
+            RunConfigManager::stdin_bar_key_message(
+                &key_hangul,
+                phys_c,
+                ctrl,
+                event::Status::Ignored
+            ),
+            Some(Message::StdinBarKeyPressed(StdinBarKey::Interrupt))
+        ));
+        // Dvorak류: 라틴 문자가 물리적으로 이동한 레이아웃은 logical "c"로 판정한다
+        // (text_input의 복사도 같은 키에서 발화 — 물리 위치가 아닌 문자 기준).
+        let phys_j = Physical::Code(Code::KeyJ);
+        assert!(matches!(
+            RunConfigManager::stdin_bar_key_message(&key_c, phys_j, ctrl, event::Status::Ignored),
+            Some(Message::StdinBarKeyPressed(StdinBarKey::Interrupt))
+        ));
+        // 수식키 배제: Ctrl 없음 / +Shift / +Alt / +Logo(macOS Cmd+C 복사 보호).
+        for mods in [
+            keyboard::Modifiers::empty(),
+            ctrl | keyboard::Modifiers::SHIFT,
+            ctrl | keyboard::Modifiers::ALT,
+            ctrl | keyboard::Modifiers::LOGO,
+        ] {
+            assert!(
+                RunConfigManager::stdin_bar_key_message(
+                    &key_c,
+                    phys_c,
+                    mods,
+                    event::Status::Ignored
+                )
+                .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn stdin_bar_key_message_maps_ctrl_d_to_eof() {
+        use keyboard::key::{Code, Physical};
+        let ctrl = keyboard::Modifiers::CTRL;
+        let phys_d = Physical::Code(Code::KeyD);
+        let key_d = keyboard::Key::Character("d".into());
+        // Ctrl+C와 동일 규칙: 캡처 상태 무관, 물리키/logical 합집합.
+        assert!(matches!(
+            RunConfigManager::stdin_bar_key_message(&key_d, phys_d, ctrl, event::Status::Captured),
+            Some(Message::StdinBarKeyPressed(StdinBarKey::Eof))
+        ));
+        let key_hangul = keyboard::Key::Character("ㅇ".into());
+        assert!(matches!(
+            RunConfigManager::stdin_bar_key_message(
+                &key_hangul,
+                phys_d,
+                ctrl,
+                event::Status::Ignored
+            ),
+            Some(Message::StdinBarKeyPressed(StdinBarKey::Eof))
+        ));
+        // 수식키 배제.
+        assert!(
+            RunConfigManager::stdin_bar_key_message(
+                &key_d,
+                phys_d,
+                ctrl | keyboard::Modifiers::SHIFT,
+                event::Status::Ignored
+            )
+            .is_none()
+        );
+        assert!(
+            RunConfigManager::stdin_bar_key_message(
+                &key_d,
+                phys_d,
+                keyboard::Modifiers::empty(),
+                event::Status::Ignored
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn eof_completed_reports_only_while_running() {
+        use crate::models::StdinWriteError;
+        let (mut app, ids) = manager_with_open_panes(&["a"]);
+        let sid = ids[0];
+        app.session_by_id_mut(sid).unwrap().is_running = true;
+        let _ = app.handle_session_eof_completed(
+            sid,
+            Err(StdinWriteError::Broken(String::from("no writer"))),
+        );
+        assert!(
+            app.status_message.contains("EOF"),
+            "user must be told EOF could not be delivered: {:?}",
+            app.status_message
+        );
+
+        // Stop 선행 등으로 이미 종료된 세션엔 침묵 — 방금 뜬 메시지를 덮지 않는다.
+        app.status_message.clear();
+        app.session_by_id_mut(sid).unwrap().is_running = false;
+        let _ = app.handle_session_eof_completed(sid, Err(StdinWriteError::Timeout));
+        assert!(app.status_message.is_empty());
+    }
+
+    #[test]
+    fn stdin_history_resolved_walks_and_restores_draft() {
+        let (mut app, ids) = manager_with_open_panes(&["a"]);
+        let sid = ids[0];
+        app.session_by_id_mut(sid).unwrap().is_running = true;
+        let _ = app.handle_open_session_stdin(sid);
+        for line in ["a", "b"] {
+            let _ = app.handle_session_stdin_changed(sid, String::from(line));
+            let _ = app.handle_session_stdin_submitted(sid);
+        }
+        let _ = app.handle_session_stdin_changed(sid, String::from("typing"));
+
+        let input_id = crate::views::shared::session_stdin_input_id(sid);
+        let draft = |app: &mut RunConfigManager| {
+            app.session_by_id_mut(sid)
+                .unwrap()
+                .stdin_input
+                .clone()
+                .unwrap()
+        };
+
+        let _ = app.handle_stdin_bar_key_resolved(StdinBarKey::HistoryOlder, input_id.clone());
+        assert_eq!(draft(&mut app), "b");
+        let _ = app.handle_stdin_bar_key_resolved(StdinBarKey::HistoryOlder, input_id.clone());
+        assert_eq!(draft(&mut app), "a");
+        // 가장 오래된 항목에서 정지.
+        let _ = app.handle_stdin_bar_key_resolved(StdinBarKey::HistoryOlder, input_id.clone());
+        assert_eq!(draft(&mut app), "a");
+        let _ = app.handle_stdin_bar_key_resolved(StdinBarKey::HistoryNewer, input_id.clone());
+        assert_eq!(draft(&mut app), "b");
+        // 최신을 지나면 타이핑 중이던 드래프트 복원.
+        let _ = app.handle_stdin_bar_key_resolved(StdinBarKey::HistoryNewer, input_id);
+        assert_eq!(draft(&mut app), "typing");
+    }
+
+    #[test]
+    fn stdin_history_edit_resets_cursor_midway() {
+        let (mut app, ids) = manager_with_open_panes(&["a"]);
+        let sid = ids[0];
+        app.session_by_id_mut(sid).unwrap().is_running = true;
+        let _ = app.handle_open_session_stdin(sid);
+        for line in ["a", "b"] {
+            let _ = app.handle_session_stdin_changed(sid, String::from(line));
+            let _ = app.handle_session_stdin_submitted(sid);
+        }
+
+        let input_id = crate::views::shared::session_stdin_input_id(sid);
+        let _ = app.handle_stdin_bar_key_resolved(StdinBarKey::HistoryOlder, input_id.clone());
+        // 열람 중 수동 편집 → 탐색이 끝나고 편집본이 새 라이브 드래프트가 된다.
+        let _ = app.handle_session_stdin_changed(sid, String::from("bx"));
+        let _ = app.handle_stdin_bar_key_resolved(StdinBarKey::HistoryOlder, input_id.clone());
+        assert_eq!(
+            app.session_by_id_mut(sid).unwrap().stdin_input.as_deref(),
+            Some("b")
+        );
+        let _ = app.handle_stdin_bar_key_resolved(StdinBarKey::HistoryNewer, input_id);
+        assert_eq!(
+            app.session_by_id_mut(sid).unwrap().stdin_input.as_deref(),
+            Some("bx")
+        );
+    }
+
+    #[test]
+    fn controls_menu_persists_across_item_actions_but_closes_on_layout_change() {
+        let (mut app, ids) = manager_with_open_panes(&["a"]);
+        let sid = ids[0];
+        let _ = app.handle_toggle_session_controls_menu(sid);
+        assert!(app.session_by_id_mut(sid).unwrap().controls_menu_open);
+
+        // 항목 액션은 메뉴를 닫지 않는다 — 지속 표면(stop→rerun 연속 조작 등).
+        app.close_controls_menu_on_action(&Message::RerunSession(sid));
+        app.close_controls_menu_on_action(&Message::OpenSessionStdin(sid));
+        app.close_controls_menu_on_action(&Message::StopSession(sid));
+        assert!(
+            app.session_by_id_mut(sid).unwrap().controls_menu_open,
+            "menu must stay open across item actions"
+        );
+
+        // maximize는 pane이 넓어져 full 컨트롤로 전환되므로(⋯ 소멸) 닫는다.
+        let pane_id = pane_for_session(&app.workspace_tabs[app.selected_tab_index], sid);
+        app.close_controls_menu_on_action(&Message::TogglePaneMaximize(pane_id));
+        assert!(!app.session_by_id_mut(sid).unwrap().controls_menu_open);
+
+        // 레이아웃 변화(pane 닫기/리사이즈류)는 모든 메뉴를 닫는다.
+        let _ = app.handle_toggle_session_controls_menu(sid);
+        app.close_controls_menu_on_action(&Message::ClosePane(pane_id));
+        assert!(!app.session_by_id_mut(sid).unwrap().controls_menu_open);
+
+        // 탭 닫기/Cmd+W도 pane 소멸 경로 — 세션 객체에 열림 플래그가 남아 재열기 시
+        // 고아 메뉴(이중 컨트롤)로 나타나지 않아야 한다.
+        let _ = app.handle_toggle_session_controls_menu(sid);
+        app.close_controls_menu_on_action(&Message::CloseTab(0));
+        assert!(!app.session_by_id_mut(sid).unwrap().controls_menu_open);
+        let _ = app.handle_toggle_session_controls_menu(sid);
+        app.close_controls_menu_on_action(&Message::CloseFocusedPane);
+        assert!(!app.session_by_id_mut(sid).unwrap().controls_menu_open);
+    }
+
+    #[test]
+    fn interrupt_completed_broken_without_pid_sets_status() {
+        use crate::models::StdinWriteError;
+        let (mut app, ids) = manager_with_open_panes(&["a"]);
+        let sid = ids[0];
+        {
+            let session = app.session_by_id_mut(sid).unwrap();
+            session.is_running = true;
+            session.process_pid = None; // 시그널 폴백 불가 케이스
+        }
+        let _ = app.handle_session_interrupt_completed(
+            sid,
+            Err(StdinWriteError::Broken(String::from("no writer"))),
+        );
+        assert!(
+            app.status_message.contains("Interrupt"),
+            "user must be told the interrupt could not be delivered: {:?}",
+            app.status_message
+        );
+
+        // Timeout도 폴백 불가면 안내한다 (막힌 쓰기 경로의 에스컬레이션 실패 케이스).
+        app.status_message.clear();
+        let _ = app.handle_session_interrupt_completed(sid, Err(StdinWriteError::Timeout));
+        assert!(
+            app.status_message.contains("Interrupt pending"),
+            "timeout without a fallback pid must surface: {:?}",
+            app.status_message
+        );
+    }
+
+    #[test]
+    fn stdin_history_resolved_ignores_foreign_widget_id() {
+        let (mut app, ids) = manager_with_open_panes(&["a"]);
+        let sid = ids[0];
+        app.session_by_id_mut(sid).unwrap().is_running = true;
+        let _ = app.handle_open_session_stdin(sid);
+        let _ = app.handle_session_stdin_changed(sid, String::from("x"));
+        let _ = app.handle_session_stdin_submitted(sid);
+        let _ = app.handle_session_stdin_changed(sid, String::from("typing"));
+
+        // 검색 입력 등 다른 위젯이 포커스면 히스토리 키는 no-op.
+        let foreign = crate::views::shared::session_search_input_id(sid);
+        let _ = app.handle_stdin_bar_key_resolved(StdinBarKey::HistoryOlder, foreign);
+        assert_eq!(
+            app.session_by_id_mut(sid).unwrap().stdin_input.as_deref(),
+            Some("typing")
+        );
+    }
+
+    #[test]
     fn stop_discards_output_queued_behind_cancel() {
         // Stop(cancel) 후 채널에 남아 있던 출력 배치는 폐기되어야 한다 — 아니면 폭주 중
         // Stop 시 RunCompleted가 대형 배치들 뒤로 밀려 정지가 수 초 늦어 보인다.
@@ -5501,12 +6205,12 @@ mod tests {
         );
         assert!(app.status_message.contains("Input pending"));
 
-        // Ok(true) = pipe 성공 → 로컬 에코 한 줄.
+        // Ok(true) = 폴백 pipe(Windows <1809) 성공 → 로컬 에코 한 줄.
         let before = app.session_by_id_mut(sid).unwrap().output_lines.len();
         let _ = app.handle_session_stdin_write_completed(sid, String::from("echoed"), Ok(true));
         let session = app.session_by_id_mut(sid).unwrap();
         assert_eq!(session.output_lines.len(), before + 1);
-        // Ok(false) = PTY 성공 → 에코 없음 (전송이 담당).
+        // Ok(false) = PTY/ConPTY 성공 → 에코 없음 (전송이 담당).
         let before = session.output_lines.len();
         let _ = app.handle_session_stdin_write_completed(sid, String::from("quiet"), Ok(false));
         assert_eq!(
@@ -5516,20 +6220,32 @@ mod tests {
     }
 
     #[test]
-    fn close_active_bar_prefers_stdin_then_search() {
+    fn close_active_bar_prefers_menu_then_stdin_then_search() {
         let (mut app, ids) = manager_with_open_panes(&["a"]);
         let sid = ids[0];
         app.current_view = ViewMode::Sessions;
         let _ = app.handle_open_session_search(sid);
         let _ = app.handle_open_session_stdin(sid);
+        let _ = app.handle_toggle_session_controls_menu(sid);
 
-        // 1차 Esc: stdin만 닫힘 (검색 유지).
+        // 1차 Esc: 오버플로 메뉴만 닫힘 (가장 일시적 표면 우선).
         let _ = app.handle_close_active_bar();
-        let session = app.session_by_id_mut(sid).unwrap();
-        assert!(session.stdin_input.is_none());
-        assert!(session.search.is_some());
+        {
+            let session = app.session_by_id_mut(sid).unwrap();
+            assert!(!session.controls_menu_open);
+            assert!(session.stdin_input.is_some());
+            assert!(session.search.is_some());
+        }
 
-        // 2차 Esc: 검색 닫힘.
+        // 2차 Esc: stdin만 닫힘 (검색 유지).
+        let _ = app.handle_close_active_bar();
+        {
+            let session = app.session_by_id_mut(sid).unwrap();
+            assert!(session.stdin_input.is_none());
+            assert!(session.search.is_some());
+        }
+
+        // 3차 Esc: 검색 닫힘.
         let _ = app.handle_close_active_bar();
         assert!(app.session_by_id_mut(sid).unwrap().search.is_none());
     }
@@ -6098,6 +6814,165 @@ mod tests {
             app.workspace_tabs[0].open_session(*id, 1.0);
         }
         (app, ids)
+    }
+
+    /// ScriptText 모드 구성 하나를 선택 상태로 준비하고 에디터 버퍼를 동기화한다.
+    fn manager_with_script_text_config(script: &str) -> (RunConfigManager, Uuid) {
+        let (mut app, _task) = RunConfigManager::new();
+        let config = RunConfiguration {
+            name: String::from("script"),
+            type_data: ConfigTypeData::ShellScript {
+                execute_mode: ExecuteMode::ScriptText {
+                    script_text: script.to_string(),
+                },
+            },
+            ..RunConfiguration::default()
+        };
+        let id = config.id;
+        app.configurations.push(config);
+        app.selected_config_index = Some(app.configurations.len() - 1);
+        app.sync_script_editor();
+        (app, id)
+    }
+
+    /// 선택 구성의 script_text를 읽는다 (ScriptText 모드 전제).
+    fn selected_script_text(app: &RunConfigManager) -> String {
+        match &app.get_selected_config().unwrap().type_data {
+            ConfigTypeData::ShellScript {
+                execute_mode: ExecuteMode::ScriptText { script_text },
+            } => script_text.clone(),
+            other => panic!("expected ScriptText, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn script_editor_edit_roundtrips_newlines_and_preserves_buffer() {
+        use iced::widget::text_editor::{Action, Edit};
+        let (mut app, _id) = manager_with_script_text_config("");
+
+        // 멀티라인 붙여넣기 → 모델에 개행 그대로 기록.
+        let _ = app.handle_script_text_edited(Action::Edit(Edit::Paste(std::sync::Arc::new(
+            String::from("echo a\necho b"),
+        ))));
+        assert_eq!(selected_script_text(&app), "echo a\necho b");
+
+        // 동기화 훅이 돌아도 모델==캐시라 버퍼가 재구축되지 않는다 — 재구축됐다면
+        // 커서가 0으로 리셋돼 다음 편집이 앞에 삽입된다("BA" 순서 역전으로 검출).
+        app.sync_script_editor();
+        let _ = app.handle_script_text_edited(Action::Edit(Edit::Paste(std::sync::Arc::new(
+            String::from("\necho c"),
+        ))));
+        assert_eq!(selected_script_text(&app), "echo a\necho b\necho c");
+    }
+
+    #[test]
+    fn script_editor_wiring_flows_through_update() {
+        use iced::widget::text_editor::{Action, Edit};
+        // 실제 update() 경로(디스패치 → 중앙 sync 훅) 자체의 회귀 가드 — 훅 호출이
+        // update()에서 제거/재배치되면 이 테스트가 잡는다 (유닛 테스트는 sync를
+        // 직접 부르므로 배선 회귀를 못 본다).
+        let (mut app, _id) = manager_with_script_text_config("first");
+        let other = RunConfiguration {
+            name: String::from("other"),
+            type_data: ConfigTypeData::ShellScript {
+                execute_mode: ExecuteMode::ScriptText {
+                    script_text: String::from("second"),
+                },
+            },
+            ..RunConfiguration::default()
+        };
+        app.configurations.push(other);
+
+        // 편집이 update()를 거쳐 모델에 반영된다.
+        let _ = app.update(Message::ScriptTextEdited(Action::Edit(Edit::Paste(
+            std::sync::Arc::new(String::from("!")),
+        ))));
+        assert_eq!(selected_script_text(&app), "!first");
+
+        // 선택 전환(리스트 클릭 = StartConfigurationDrag)도 update()를 거치면
+        // 훅이 새 구성의 텍스트로 버퍼를 재구축한다.
+        let _ = app.update(Message::StartConfigurationDrag(1));
+        assert_eq!(app.selected_config_index, Some(1));
+        assert_eq!(app.configuration_ui.script_editor.text(), "second");
+    }
+
+    #[test]
+    fn script_editor_rebuilds_on_external_mutation_and_selection_change() {
+        let (mut app, id) = manager_with_script_text_config("original");
+        assert_eq!(app.configuration_ui.script_editor.text(), "original");
+
+        // 임포트류: 같은 id로 내용만 교체 → 동기화가 재구축한다.
+        if let ConfigTypeData::ShellScript {
+            execute_mode: ExecuteMode::ScriptText { script_text },
+        } = &mut app.configurations[0].type_data
+        {
+            *script_text = String::from("imported");
+        }
+        app.sync_script_editor();
+        assert_eq!(app.configuration_ui.script_editor.text(), "imported");
+        assert_eq!(
+            app.configuration_ui.script_editor_synced,
+            Some((id, String::from("imported")))
+        );
+
+        // 다른 ScriptText 구성으로 선택 전환 → 그 내용으로 재구축.
+        let other = RunConfiguration {
+            name: String::from("other"),
+            type_data: ConfigTypeData::ShellScript {
+                execute_mode: ExecuteMode::ScriptText {
+                    script_text: String::from("second"),
+                },
+            },
+            ..RunConfiguration::default()
+        };
+        app.configurations.push(other);
+        app.selected_config_index = Some(1);
+        app.sync_script_editor();
+        assert_eq!(app.configuration_ui.script_editor.text(), "second");
+
+        // ScriptText가 아닌 선택 → 캐시 무효화 (stale 기록 차단의 근거).
+        app.selected_config_index = None;
+        app.sync_script_editor();
+        assert!(app.configuration_ui.script_editor_synced.is_none());
+    }
+
+    #[test]
+    fn script_editor_mode_wipe_rebuilds_empty() {
+        // ExecuteModeChanged는 같은 모드 재선택에도 script_text를 초기화한다(기존
+        // 동작) — 동기화가 빈 버퍼로 따라와야 stale 텍스트 되쓰기가 없다.
+        let (mut app, _id) = manager_with_script_text_config("will be wiped");
+        let _ = app.handle_execute_mode_changed(ExecuteModeType::ScriptText);
+        app.sync_script_editor();
+        assert_eq!(app.configuration_ui.script_editor.text(), "");
+        assert_eq!(selected_script_text(&app), "");
+    }
+
+    #[test]
+    fn script_editor_drops_stale_action_after_selection_change() {
+        use iced::widget::text_editor::{Action, Edit};
+        let (mut app, _id) = manager_with_script_text_config("keep me");
+
+        // 선택이 바뀌었는데 동기화 훅이 아직 안 돈 찰나(디스패치 중) 도착한 액션은
+        // synced id 가드로 버려져야 한다 — 이전 구성의 버퍼가 새 구성에 기록되는 사고 방지.
+        let other = RunConfiguration {
+            name: String::from("other"),
+            type_data: ConfigTypeData::ShellScript {
+                execute_mode: ExecuteMode::ScriptText {
+                    script_text: String::from("second"),
+                },
+            },
+            ..RunConfiguration::default()
+        };
+        app.configurations.push(other);
+        app.selected_config_index = Some(1);
+        // sync 없이 바로 액션 도착.
+        let _ = app.handle_script_text_edited(Action::Edit(Edit::Paste(std::sync::Arc::new(
+            String::from("stale"),
+        ))));
+        assert_eq!(selected_script_text(&app), "second", "stale 액션은 무시");
+        app.selected_config_index = Some(0);
+        app.sync_script_editor();
+        assert_eq!(app.configuration_ui.script_editor.text(), "keep me");
     }
 
     #[test]
