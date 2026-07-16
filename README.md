@@ -28,6 +28,8 @@ Grab the latest pre-built binary for your platform from the [Releases page](http
 - Select configuration type (Application, Shell Script, Node, Kotlin, Compound)
 - Compound type runs several configurations together as one group
 - Set command, arguments, and working directory
+- Write inline Shell Script text in a multi-line editor (monospace font,
+  Enter for new lines, bounded height with internal scrolling)
 - Manage environment variables (add, edit, delete)
 - Reorder configurations with drag and drop
 - Save configurations (versioned JSON format)
@@ -56,9 +58,9 @@ Grab the latest pre-built binary for your platform from the [Releases page](http
 - stdin input bar per session (toggle button or Cmd+I): answer prompts and
   feed REPLs — the terminal echoes input naturally; on the legacy Windows
   pipe fallback (pre-1809) the app echoes locally. Submitted lines are kept
-  in a per-session history (recall with ArrowUp/ArrowDown), and the ^C
+  in a per-session history (recall with ArrowUp/ArrowDown), the ^C
   button — or Ctrl+C while the input is focused — sends an interrupt to the
-  running process
+  running process, and ^D / Ctrl+D sends EOF (ends REPLs and stdin readers)
 - Real-time output display (ANSI color support; OSC/DCS control sequences
   are filtered out)
 - Rerun, stop, remove, and hide sessions from a workspace
@@ -262,6 +264,11 @@ Configuration files are automatically saved in the OS-specific settings director
   is focused, Ctrl+C always sends an interrupt to the process; on
   Windows/Linux, if the input has an active selection, the text is also
   copied. Copying from the output area and macOS Cmd+C are unaffected.
+- **Ctrl+D sends EOF**: like a real terminal it takes effect at the start of
+  a line — an unsubmitted draft in the stdin bar is not sent first (press
+  Enter, then Ctrl+D). On Windows the console EOF sequence (Ctrl+Z+Enter) is
+  delivered under the hood; the legacy pipe fallback closes the stdin handle
+  instead.
 - On macOS/Linux, `sh -l` plus a real tty means shell profiles may print
   banners into the session output.
 

@@ -28,6 +28,8 @@ Rust와 iced GUI 프레임워크로 개발되었으며, 여러 프로그램 실�
 - 구성 타입 선택 (Application, Shell Script, Node, Kotlin, Compound)
 - Compound 타입은 여러 구성을 묶어 한 번에 실행
 - 명령어, 인자, 작업 디렉토리 설정
+- Shell Script 인라인 스크립트를 멀티라인 에디터로 작성 (고정폭 폰트,
+  Enter로 개행, 높이 유계 + 내부 스크롤)
 - 환경 변수 관리 (추가, 수정, 삭제)
 - 드래그 앤 드롭으로 구성 순서 변경
 - 구성 열기/저장 (버전 관리 JSON 형식)
@@ -53,7 +55,7 @@ Rust와 iced GUI 프레임워크로 개발되었으며, 여러 프로그램 실�
 - 세션별 stdin 입력바 (토글 버튼 또는 Cmd+I): 프롬프트 응답·REPL 입력 —
   터미널이 에코를 자연 처리, 구형 Windows pipe 폴백(1809 미만)만 앱이 로컬 에코.
   제출한 라인은 세션별 히스토리로 저장(↑/↓로 재호출), ^C 버튼 또는 입력창
-  포커스 중 Ctrl+C로 실행 중인 프로세스에 인터럽트 전송
+  포커스 중 Ctrl+C로 인터럽트 전송, ^D / Ctrl+D로 EOF 전송(REPL·stdin 리더 종료)
 - 실시간 출력 표시 (ANSI 색상 지원; OSC/DCS 제어 시퀀스는 걸러냄)
 - 세션 재실행, 중지, 제거, 워크스페이스에서 숨김
 - 완료된 세션의 상태 배지 (성공 / 실패 종료 코드 / 실행 시간)
@@ -252,6 +254,10 @@ open /Applications/RunConfigManager.app
   항상 프로세스로 인터럽트를 보냅니다. Windows/Linux에서 입력창에 선택 영역이
   있으면 복사도 함께 수행됩니다. 출력 영역 복사와 macOS의 Cmd+C 복사에는 영향이
   없습니다.
+- **Ctrl+D는 EOF**: 실제 터미널처럼 줄 시작에서 동작합니다 — stdin 입력바의
+  미제출 드래프트는 먼저 전송되지 않습니다(Enter로 제출 후 Ctrl+D). Windows는
+  내부적으로 콘솔 EOF 시퀀스(Ctrl+Z+Enter)를 전달하고, 구형 pipe 폴백은 stdin
+  핸들을 닫는 방식으로 EOF를 만듭니다.
 - macOS/Linux에서 `sh -l` + 진짜 tty 조합이라 셸 프로파일의 배너가 세션 출력에
   나타날 수 있습니다.
 
