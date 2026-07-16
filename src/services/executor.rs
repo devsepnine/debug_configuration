@@ -3975,6 +3975,16 @@ mod tests {
             script_text: String::from("echo hi"),
         };
         assert_eq!(build_shell_script_command(&mode), "echo hi");
+
+        // 멀티라인 스크립트도 그대로 — 단일 argv로 sh -c / powershell -Command에
+        // 전달되므로 개행이 구문 구분자로 살아 있어야 한다 (v0.6.2 멀티라인 에디터).
+        let multi = ExecuteMode::ScriptText {
+            script_text: String::from("echo a\nif true; then\n  echo b\nfi"),
+        };
+        assert_eq!(
+            build_shell_script_command(&multi),
+            "echo a\nif true; then\n  echo b\nfi"
+        );
     }
 
     #[cfg(target_os = "windows")]

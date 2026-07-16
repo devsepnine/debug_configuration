@@ -91,8 +91,8 @@ pub enum Message {
     InterpreterPathSelected(Result<String, String>),
     /// 인터프리터 옵션 변경
     InterpreterOptionsChanged(String),
-    /// 스크립트 텍스트 변경
-    ScriptTextChanged(String),
+    /// 스크립트 텍스트 멀티라인 에디터 액션 (편집/커서/스크롤 — text_editor 위젯)
+    ScriptTextEdited(iced::widget::text_editor::Action),
 
     // Node 구성 편집 메시지
     /// Node 프로젝트 디렉토리 선택 다이얼로그 열기

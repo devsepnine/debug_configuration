@@ -114,6 +114,14 @@ struct TabUiState {
 #[derive(Default)]
 struct ConfigurationUiState {
     editor_focus_area_active: bool,
+    /// ScriptText 멀티라인 에디터의 위젯 버퍼 (iced text_editor는 상태 보유형 —
+    /// 모델의 `script_text: String`과 별도로 앱 상태에 산다).
+    script_editor: iced::widget::text_editor::Content,
+    /// `script_editor`가 마지막으로 반영한 (구성 id, 정확한 모델 텍스트). 모델이
+    /// 에디터 밖에서 바뀌면(선택 전환·임포트·모드 전환·로드 등) 이 캐시와 어긋나
+    /// `sync_script_editor`가 Content를 재구축한다 — 변이 지점 열거에 기대지 않는
+    /// 구조적 방어(누락 시 stale 텍스트가 모델을 덮어쓰는 사고 차단).
+    script_editor_synced: Option<(Uuid, String)>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -619,6 +627,7 @@ impl RunConfigManager {
     pub fn update(&mut self, message: Message) -> Task<Message> {
         let task = self.dispatch_message(message);
         self.ensure_selected_env_bulk_input();
+        self.sync_script_editor();
         task
     }
 
@@ -685,7 +694,7 @@ impl RunConfigManager {
             | Message::BrowseInterpreterPath
             | Message::InterpreterPathSelected(_)
             | Message::InterpreterOptionsChanged(_)
-            | Message::ScriptTextChanged(_)
+            | Message::ScriptTextEdited(_)
             | Message::BrowseProjectDirectory
             | Message::ProjectDirectorySelected(_)
             | Message::PackageJsonsScanned(_, _, _)
@@ -853,7 +862,7 @@ impl RunConfigManager {
             Message::InterpreterOptionsChanged(value) => {
                 self.handle_interpreter_options_changed(value)
             }
-            Message::ScriptTextChanged(value) => self.handle_script_text_changed(value),
+            Message::ScriptTextEdited(action) => self.handle_script_text_edited(action),
             Message::BrowseProjectDirectory => self.handle_browse_project_directory(),
             Message::ProjectDirectorySelected(result) => {
                 self.handle_project_directory_selected(result)
@@ -1903,12 +1912,33 @@ impl RunConfigManager {
         Task::none()
     }
 
-    fn handle_script_text_changed(&mut self, value: String) -> Task<Message> {
+    /// ScriptText 멀티라인 에디터 액션 적용 + 모델 되쓰기. 편집 중엔 위젯 버퍼가
+    /// 단일 진실이고, 액션마다 전체 텍스트를 모델에 반영한다(스크립트는 작아
+    /// O(텍스트) 비용 무시 가능). 선택 전환 직후 도착한 stale 액션은 synced id
+    /// 가드로 버린다 — 다른 구성의 텍스트가 잘못 기록되는 것 방지.
+    fn handle_script_text_edited(
+        &mut self,
+        action: iced::widget::text_editor::Action,
+    ) -> Task<Message> {
+        let selected_id = self.get_selected_config().map(|config| config.id);
+        let synced_id = self
+            .configuration_ui
+            .script_editor_synced
+            .as_ref()
+            .map(|(id, _)| *id);
+        if selected_id.is_none() || selected_id != synced_id {
+            return Task::none();
+        }
+        self.configuration_ui.script_editor.perform(action);
+        let text = self.configuration_ui.script_editor.text();
         if let Some(script_text) = self
             .selected_type_data_mut()
             .and_then(ConfigTypeData::script_text_mut)
         {
-            *script_text = value;
+            *script_text = text.clone();
+            if let Some(synced) = &mut self.configuration_ui.script_editor_synced {
+                synced.1 = text;
+            }
         }
 
         Task::none()
@@ -4070,6 +4100,41 @@ impl RunConfigManager {
             .or_insert_with(|| crate::env_string::serialize_env_map(&config.environment_variables));
     }
 
+    /// ScriptText 에디터 버퍼를 모델과 동기화한다 — `update()` 말미에 매 메시지 후
+    /// 호출되는 중앙 훅. 선택 구성이 ScriptText 모드일 때 (id, 텍스트)가 synced
+    /// 캐시와 다르면 Content를 재구축한다 — 선택 전환·임포트(같은 id로 내용 교체)·
+    /// 모드 전환(script_text 초기화)·전체 로드 등 에디터 밖의 모든 변이를 개별
+    /// 열거 없이 커버한다. 편집 액션 직후엔 모델==캐시라 재구축이 없어 커서가
+    /// 보존된다. 비교는 참조로만 하고 재구축이 필요할 때만 클론한다.
+    fn sync_script_editor(&mut self) {
+        let rebuild: Option<(Uuid, String)> = {
+            let current = self
+                .selected_config_index
+                .and_then(|idx| self.configurations.get(idx))
+                .and_then(|config| match &config.type_data {
+                    ConfigTypeData::ShellScript {
+                        execute_mode: ExecuteMode::ScriptText { script_text },
+                    } => Some((config.id, script_text)),
+                    _ => None,
+                });
+            let Some((id, text)) = current else {
+                // ScriptText가 아닌 선택 — 캐시만 무효화 (Content는 뷰가 읽지 않는다).
+                self.configuration_ui.script_editor_synced = None;
+                return;
+            };
+            self.configuration_ui
+                .script_editor_synced
+                .as_ref()
+                .is_none_or(|(sid, stext)| *sid != id || stext != text)
+                .then(|| (id, text.clone()))
+        };
+        if let Some((id, text)) = rebuild {
+            self.configuration_ui.script_editor =
+                iced::widget::text_editor::Content::with_text(&text);
+            self.configuration_ui.script_editor_synced = Some((id, text));
+        }
+    }
+
     fn sync_editor_select_state_for_selected_config(&mut self) {
         let (scripts, package_jsons) = self
             .selected_config_index
@@ -4732,6 +4797,7 @@ impl RunConfigManager {
                                     &self.editor_select_state,
                                     &self.available_node_runtimes,
                                     &self.available_jdks,
+                                    &self.configuration_ui.script_editor,
                                 ))
                                 .width(Length::Fill)
                                 .height(Length::Shrink),
@@ -6614,6 +6680,134 @@ mod tests {
             app.workspace_tabs[0].open_session(*id, 1.0);
         }
         (app, ids)
+    }
+
+    /// ScriptText 모드 구성 하나를 선택 상태로 준비하고 에디터 버퍼를 동기화한다.
+    fn manager_with_script_text_config(script: &str) -> (RunConfigManager, Uuid) {
+        let (mut app, _task) = RunConfigManager::new();
+        let config = RunConfiguration {
+            name: String::from("script"),
+            type_data: ConfigTypeData::ShellScript {
+                execute_mode: ExecuteMode::ScriptText {
+                    script_text: script.to_string(),
+                },
+            },
+            ..RunConfiguration::default()
+        };
+        let id = config.id;
+        app.configurations.push(config);
+        app.selected_config_index = Some(app.configurations.len() - 1);
+        app.sync_script_editor();
+        (app, id)
+    }
+
+    /// 선택 구성의 script_text를 읽는다 (ScriptText 모드 전제).
+    fn selected_script_text(app: &RunConfigManager) -> String {
+        match &app.get_selected_config().unwrap().type_data {
+            ConfigTypeData::ShellScript {
+                execute_mode: ExecuteMode::ScriptText { script_text },
+            } => script_text.clone(),
+            other => panic!("expected ScriptText, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn script_editor_edit_roundtrips_newlines_and_preserves_buffer() {
+        use iced::widget::text_editor::{Action, Edit};
+        let (mut app, _id) = manager_with_script_text_config("");
+
+        // 멀티라인 붙여넣기 → 모델에 개행 그대로 기록.
+        let _ = app.handle_script_text_edited(Action::Edit(Edit::Paste(std::sync::Arc::new(
+            String::from("echo a\necho b"),
+        ))));
+        assert_eq!(selected_script_text(&app), "echo a\necho b");
+
+        // 동기화 훅이 돌아도 모델==캐시라 버퍼가 재구축되지 않는다 — 재구축됐다면
+        // 커서가 0으로 리셋돼 다음 편집이 앞에 삽입된다("BA" 순서 역전으로 검출).
+        app.sync_script_editor();
+        let _ = app.handle_script_text_edited(Action::Edit(Edit::Paste(std::sync::Arc::new(
+            String::from("\necho c"),
+        ))));
+        assert_eq!(selected_script_text(&app), "echo a\necho b\necho c");
+    }
+
+    #[test]
+    fn script_editor_rebuilds_on_external_mutation_and_selection_change() {
+        let (mut app, id) = manager_with_script_text_config("original");
+        assert_eq!(app.configuration_ui.script_editor.text(), "original");
+
+        // 임포트류: 같은 id로 내용만 교체 → 동기화가 재구축한다.
+        if let ConfigTypeData::ShellScript {
+            execute_mode: ExecuteMode::ScriptText { script_text },
+        } = &mut app.configurations[0].type_data
+        {
+            *script_text = String::from("imported");
+        }
+        app.sync_script_editor();
+        assert_eq!(app.configuration_ui.script_editor.text(), "imported");
+        assert_eq!(
+            app.configuration_ui.script_editor_synced,
+            Some((id, String::from("imported")))
+        );
+
+        // 다른 ScriptText 구성으로 선택 전환 → 그 내용으로 재구축.
+        let other = RunConfiguration {
+            name: String::from("other"),
+            type_data: ConfigTypeData::ShellScript {
+                execute_mode: ExecuteMode::ScriptText {
+                    script_text: String::from("second"),
+                },
+            },
+            ..RunConfiguration::default()
+        };
+        app.configurations.push(other);
+        app.selected_config_index = Some(1);
+        app.sync_script_editor();
+        assert_eq!(app.configuration_ui.script_editor.text(), "second");
+
+        // ScriptText가 아닌 선택 → 캐시 무효화 (stale 기록 차단의 근거).
+        app.selected_config_index = None;
+        app.sync_script_editor();
+        assert!(app.configuration_ui.script_editor_synced.is_none());
+    }
+
+    #[test]
+    fn script_editor_mode_wipe_rebuilds_empty() {
+        // ExecuteModeChanged는 같은 모드 재선택에도 script_text를 초기화한다(기존
+        // 동작) — 동기화가 빈 버퍼로 따라와야 stale 텍스트 되쓰기가 없다.
+        let (mut app, _id) = manager_with_script_text_config("will be wiped");
+        let _ = app.handle_execute_mode_changed(ExecuteModeType::ScriptText);
+        app.sync_script_editor();
+        assert_eq!(app.configuration_ui.script_editor.text(), "");
+        assert_eq!(selected_script_text(&app), "");
+    }
+
+    #[test]
+    fn script_editor_drops_stale_action_after_selection_change() {
+        use iced::widget::text_editor::{Action, Edit};
+        let (mut app, _id) = manager_with_script_text_config("keep me");
+
+        // 선택이 바뀌었는데 동기화 훅이 아직 안 돈 찰나(디스패치 중) 도착한 액션은
+        // synced id 가드로 버려져야 한다 — 이전 구성의 버퍼가 새 구성에 기록되는 사고 방지.
+        let other = RunConfiguration {
+            name: String::from("other"),
+            type_data: ConfigTypeData::ShellScript {
+                execute_mode: ExecuteMode::ScriptText {
+                    script_text: String::from("second"),
+                },
+            },
+            ..RunConfiguration::default()
+        };
+        app.configurations.push(other);
+        app.selected_config_index = Some(1);
+        // sync 없이 바로 액션 도착.
+        let _ = app.handle_script_text_edited(Action::Edit(Edit::Paste(std::sync::Arc::new(
+            String::from("stale"),
+        ))));
+        assert_eq!(selected_script_text(&app), "second", "stale 액션은 무시");
+        app.selected_config_index = Some(0);
+        app.sync_script_editor();
+        assert_eq!(app.configuration_ui.script_editor.text(), "keep me");
     }
 
     #[test]
