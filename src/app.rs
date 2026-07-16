@@ -6866,6 +6866,37 @@ mod tests {
     }
 
     #[test]
+    fn script_editor_wiring_flows_through_update() {
+        use iced::widget::text_editor::{Action, Edit};
+        // 실제 update() 경로(디스패치 → 중앙 sync 훅) 자체의 회귀 가드 — 훅 호출이
+        // update()에서 제거/재배치되면 이 테스트가 잡는다 (유닛 테스트는 sync를
+        // 직접 부르므로 배선 회귀를 못 본다).
+        let (mut app, _id) = manager_with_script_text_config("first");
+        let other = RunConfiguration {
+            name: String::from("other"),
+            type_data: ConfigTypeData::ShellScript {
+                execute_mode: ExecuteMode::ScriptText {
+                    script_text: String::from("second"),
+                },
+            },
+            ..RunConfiguration::default()
+        };
+        app.configurations.push(other);
+
+        // 편집이 update()를 거쳐 모델에 반영된다.
+        let _ = app.update(Message::ScriptTextEdited(Action::Edit(Edit::Paste(
+            std::sync::Arc::new(String::from("!")),
+        ))));
+        assert_eq!(selected_script_text(&app), "!first");
+
+        // 선택 전환(리스트 클릭 = StartConfigurationDrag)도 update()를 거치면
+        // 훅이 새 구성의 텍스트로 버퍼를 재구축한다.
+        let _ = app.update(Message::StartConfigurationDrag(1));
+        assert_eq!(app.selected_config_index, Some(1));
+        assert_eq!(app.configuration_ui.script_editor.text(), "second");
+    }
+
+    #[test]
     fn script_editor_rebuilds_on_external_mutation_and_selection_change() {
         let (mut app, id) = manager_with_script_text_config("original");
         assert_eq!(app.configuration_ui.script_editor.text(), "original");
