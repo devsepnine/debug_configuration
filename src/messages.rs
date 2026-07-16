@@ -26,6 +26,8 @@ pub enum StdinBarKey {
     HistoryNewer,
     /// Ctrl+C — 실행 중인 프로세스에 인터럽트 전송 (^C 버튼과 동일 경로)
     Interrupt,
+    /// Ctrl+D — 실행 중인 프로세스 stdin에 EOF 전송 (^D 버튼과 동일 경로)
+    Eof,
 }
 
 /// 애플리케이션의 모든 이벤트와 액션을 정의하는 메시지 타입
@@ -363,6 +365,10 @@ pub enum Message {
     SessionInterruptRequested(Uuid),
     /// 인터럽트 전송 결과 (`session_id`) — 성공은 침묵(에코는 터미널 몫), 실패만 폴백/안내
     SessionInterruptCompleted(Uuid, Result<(), crate::models::StdinWriteError>),
+    /// 실행 중인 세션 stdin에 EOF(Ctrl+D) 전송 (`session_id` — ^D 버튼/키 공용)
+    SessionEofRequested(Uuid),
+    /// EOF 전송 결과 (`session_id`) — 성공은 침묵, 실패만 안내(EOF엔 시그널 폴백 없음)
+    SessionEofCompleted(Uuid, Result<(), crate::models::StdinWriteError>),
     /// 세션 출력 버퍼 비우기 (`session_id`) — 실행 중인 프로세스는 유지, 화면 로그만 클리어
     ClearSessionOutput(Uuid),
     /// 세션 출력을 파일로 내보내기 (`session_id`)

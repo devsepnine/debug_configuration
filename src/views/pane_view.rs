@@ -737,12 +737,18 @@ fn view_session_stdin_bar(session: &RunSession) -> Element<'_, Message> {
     } else {
         IconButtonState::Inactive
     };
-    // ^C를 x(닫기)와 비인접하게 맨 앞에 둔다 — 인터럽트/닫기 오클릭이 최악의 쌍.
+    // ^C/^D를 x(닫기)와 비인접하게 앞쪽에 둔다 — 파괴적 액션/닫기 오클릭이 최악의 쌍.
     let controls = row![
         glyph_button(
             "^C",
             "Interrupt (Ctrl+C)",
             Message::SessionInterruptRequested(session_id),
+            send_state
+        ),
+        glyph_button(
+            "^D",
+            "Send EOF (Ctrl+D)",
+            Message::SessionEofRequested(session_id),
             send_state
         ),
         glyph_button(

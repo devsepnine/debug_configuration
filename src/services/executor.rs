@@ -294,6 +294,58 @@ pub async fn interrupt_session(session_id: Uuid) -> Result<(), crate::models::St
     }
 }
 
+/// 실행 중인 세션 stdin에 EOF를 보낸다 (Ctrl+D).
+///
+/// - unix PTY: VEOF(`0x04`) — cooked tty의 라인 디시플린이 줄 시작의 0x04를
+///   read()=0(EOF)으로 번역한다. 줄 중간이면 부분 입력만 플러시된다 — 실제
+///   터미널의 Ctrl+D와 동일하며, 입력바의 미제출 드래프트는 전송되지 않는다.
+/// - Windows ConPTY: cooked 콘솔의 EOF 시퀀스 = Ctrl+Z + Enter(`0x1A 0x0D`) —
+///   줄 시작의 ^Z 제출을 콘솔 read가 0으로 번역한다.
+/// - Windows 레거시 pipe 폴백(<1809): stdin 핸들을 drop하는 것이 진짜 EOF다 —
+///   레지스트리에서 writer를 꺼내(take) **락 밖에서** 버린다. 이후 쓰기는 기존
+///   "not available" `Broken`으로 자연 귀결된다. 진행 중이던 쓰기가 Arc 클론을
+///   쥐고 있으면 그 쓰기가 끝날 때까지 실제 close가 늦어질 수 있다(유계).
+/// - 미등록/종료 세션은 `Broken` — EOF엔 시그널 폴백이 없어 호출측은 안내만 한다.
+pub async fn eof_session(session_id: Uuid) -> Result<(), crate::models::StdinWriteError> {
+    #[cfg(windows)]
+    {
+        // pipe 폴백은 acquire(Arc 복제) 대신 레지스트리에서 직접 take해야 close가
+        // 성립한다. Pty 세션이면 take하지 않고 아래 공용 경로로 내려간다.
+        let taken = {
+            let mut map = SESSION_IO.lock().map_err(|_| {
+                crate::models::StdinWriteError::Broken(String::from("session io registry poisoned"))
+            })?;
+            match map.get_mut(&session_id) {
+                Some(io) if matches!(io.writer, Some(SessionWriter::Pipe(_))) => io.writer.take(),
+                _ => None,
+            }
+        };
+        if let Some(writer) = taken {
+            drop(writer);
+            return Ok(());
+        }
+    }
+
+    let writer = acquire_session_writer(session_id).await?;
+    match writer {
+        WriterHandle::Pty(w) => {
+            #[cfg(windows)]
+            const EOF_PAYLOAD: &[u8] = b"\x1a\r";
+            #[cfg(not(windows))]
+            const EOF_PAYLOAD: &[u8] = b"\x04";
+            write_pty_payload(w, EOF_PAYLOAD.to_vec()).await
+        }
+        #[cfg(windows)]
+        WriterHandle::Pipe(_) => {
+            // 위 take 블록이 Pipe를 처리하므로 정상 흐름에선 도달하지 않는다 —
+            // 등록 경합 등 비정상 상태의 방어적 실패 처리.
+            Err(crate::models::StdinWriteError::Broken(String::from(
+                "process input is not available for this session",
+            )))
+        }
+    }
+}
+
 /// 레지스트리에서 세션 writer 핸들을 복제해 꺼낸다. 락은 조회에만 쓰고 Arc를 복제해
 /// 나온다 — 느린 세션 하나가 레지스트리(다른 세션의 조회/등록)를 막지 않게 한다.
 ///
@@ -2863,6 +2915,16 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn eof_session_unregistered_session_is_broken() {
+        // EOF엔 시그널 폴백이 없다 — 미등록 세션은 Broken으로 즉시 안내 대상.
+        let result = eof_session(Uuid::new_v4()).await;
+        assert!(matches!(
+            result,
+            Err(crate::models::StdinWriteError::Broken(_))
+        ));
+    }
+
     // ---- PTY 통합 (unix 실프로세스; openpty 불가 환경은 self-skip) ----
 
     #[cfg(unix)]
@@ -2996,6 +3058,62 @@ mod tests {
                 out.matches("hello").count() >= 2,
                 "tty echo + child print expected: {out:?}"
             );
+        }
+
+        #[tokio::test]
+        async fn pty_eof_ends_stdin_reader() {
+            // eof_session의 VEOF(0x04)가 cooked tty에서 read()=0(EOF)으로 번역되는지
+            // 종단 확인 — cat은 stdin EOF에서 종료한다. 미전달이면 10s 타임아웃 실패.
+            let config = test_config("/tmp");
+            let session_id = Uuid::new_v4();
+            let pty = match spawn_in_pty(&config, "cat", &[], session_id, (80, 24)) {
+                Ok(p) => p,
+                Err(PtySpawnError::PtyUnavailable(_)) => {
+                    eprintln!("[skip] pty unavailable in this environment");
+                    return;
+                }
+                Err(PtySpawnError::Spawn(e)) => panic!("spawn failed: {e}"),
+            };
+            // 한 줄 먼저 흘려 cat이 실제로 stdin을 읽고 있음을 확인한 뒤 EOF를 쏜다.
+            {
+                let map = SESSION_IO.lock().unwrap();
+                let io = map.get(&session_id).expect("registered");
+                match io.writer.as_ref().expect("pty writer") {
+                    SessionWriter::Pty(w) => {
+                        use std::io::Write;
+                        let mut w = w.lock().unwrap();
+                        w.write_all(b"hello\n").unwrap();
+                        w.flush().unwrap();
+                    }
+                    #[cfg(windows)]
+                    _ => unreachable!(),
+                }
+            }
+            let mut chunks_rx = pty.chunks_rx;
+            let mut collected = Vec::new();
+            // tty 에코 + cat 출력 = "hello" 2회가 보일 때까지 대기.
+            while String::from_utf8_lossy(&collected).matches("hello").count() < 2 {
+                let chunk = tokio::time::timeout(Duration::from_secs(10), chunks_rx.recv())
+                    .await
+                    .expect("echo+cat output within 10s")
+                    .expect("stream open");
+                collected.extend_from_slice(&chunk);
+            }
+
+            eof_session(session_id).await.expect("eof write");
+
+            let exited = tokio::time::timeout(Duration::from_secs(10), async {
+                while let Some(bytes) = chunks_rx.recv().await {
+                    collected.extend_from_slice(&bytes);
+                }
+                pty.exit_rx.await
+            })
+            .await;
+            unregister_session_io(session_id);
+            let status = exited
+                .expect("cat must exit promptly after EOF")
+                .unwrap_or(Err(String::from("no status")));
+            assert_eq!(status, Ok(0), "clean EOF exit expected");
         }
 
         #[tokio::test]
@@ -3604,6 +3722,114 @@ mod tests {
             assert!(
                 !out.contains("done"),
                 "pipeline must be cut before the post-sleep output: {out:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn conpty_eof_ends_stdin_reader() {
+            // eof_session의 0x1A 0x0D(Ctrl+Z+Enter)가 cooked 콘솔 입력에서 EOF로
+            // 번역되는지 종단 확인 — ReadToEnd는 콘솔 read가 0을 반환해야 끝난다.
+            // v0.6.2의 유일한 macOS-검증-불가 가정을 CI 상시 게이트로 만든다.
+            let wd = HangWatchdog::arm("conpty_eof_ends_stdin_reader");
+            let config = test_config();
+            let session_id = Uuid::new_v4();
+            wd.mark("spawn_in_pty (powershell probe + openpty + CreateProcess)");
+            let pty = match spawn_in_pty(
+                &config,
+                "Write-Output ready; \
+                 $in = [Console]::In.ReadToEnd(); \
+                 Write-Output ('got:' + $in.Trim())",
+                &[],
+                session_id,
+                (80, 24),
+            ) {
+                Ok(p) => p,
+                Err(PtySpawnError::PtyUnavailable(e)) => {
+                    eprintln!("[skip] conpty unavailable: {e}");
+                    return;
+                }
+                Err(PtySpawnError::Spawn(e)) => panic!("spawn failed: {e}"),
+            };
+            let pty_pid = pty.pid;
+            let mut chunks_rx = pty.chunks_rx;
+            let mut exit_rx = pty.exit_rx;
+            let mut collected = Vec::new();
+
+            wd.mark("waiting for ready marker before stdin write");
+            while !String::from_utf8_lossy(&collected).contains("ready") {
+                match tokio::time::timeout(T, chunks_rx.recv()).await {
+                    Ok(Some(bytes)) => collected.extend_from_slice(&bytes),
+                    Ok(None) | Err(_) => {
+                        if let Some(pid) = pty_pid {
+                            force_kill_process_tree(pid);
+                        }
+                        panic!(
+                            "no ready marker from conpty child; collected: {:?}",
+                            String::from_utf8_lossy(&collected)
+                        );
+                    }
+                }
+            }
+
+            wd.mark("writing hello then eof");
+            {
+                let map = SESSION_IO.lock().unwrap();
+                let io = map.get(&session_id).expect("registered");
+                match io.writer.as_ref().expect("conpty writer") {
+                    SessionWriter::Pty(w) => {
+                        use std::io::Write;
+                        let mut w = w.lock().unwrap();
+                        w.write_all(b"hello\r").unwrap();
+                        w.flush().unwrap();
+                    }
+                    SessionWriter::Pipe(_) => unreachable!("conpty session uses Pty writer"),
+                }
+            }
+            eof_session(session_id)
+                .await
+                .expect("eof write must succeed on a live conpty");
+
+            wd.mark("awaiting child exit after eof");
+            let exited = tokio::time::timeout(T, async {
+                loop {
+                    tokio::select! {
+                        chunk = chunks_rx.recv() => {
+                            if let Some(bytes) = chunk { collected.extend_from_slice(&bytes); }
+                        }
+                        status = &mut exit_rx => {
+                            let _ = status;
+                            return;
+                        }
+                    }
+                }
+            })
+            .await;
+            if exited.is_err() {
+                if let Some(pid) = pty_pid {
+                    force_kill_process_tree(pid);
+                }
+                panic!(
+                    "child did not exit after eof; collected: {:?}",
+                    String::from_utf8_lossy(&collected)
+                );
+            }
+
+            wd.mark("teardown: unregister on blocking pool + drain to EOF");
+            let close = tokio::task::spawn_blocking(move || unregister_session_io(session_id));
+            tokio::time::timeout(T, async {
+                while let Some(bytes) = chunks_rx.recv().await {
+                    collected.extend_from_slice(&bytes);
+                }
+            })
+            .await
+            .expect("reader did not reach EOF after unregister");
+            let _ = tokio::time::timeout(T, close).await;
+            wd.mark("done");
+
+            let out = String::from_utf8_lossy(&collected);
+            assert!(
+                out.contains("got:hello"),
+                "child must see the line then EOF: {out:?}"
             );
         }
     }

@@ -774,6 +774,8 @@ impl RunConfigManager {
             | Message::StdinBarKeyResolved(_, _)
             | Message::SessionInterruptRequested(_)
             | Message::SessionInterruptCompleted(_, _)
+            | Message::SessionEofRequested(_)
+            | Message::SessionEofCompleted(_, _)
             | Message::SearchNextInActivePane
             | Message::SearchPrevInActivePane
             | Message::ClearSessionOutput(_)
@@ -1021,6 +1023,12 @@ impl RunConfigManager {
             }
             Message::SessionInterruptCompleted(session_id, result) => {
                 self.handle_session_interrupt_completed(session_id, result)
+            }
+            Message::SessionEofRequested(session_id) => {
+                self.handle_session_eof_requested(session_id)
+            }
+            Message::SessionEofCompleted(session_id, result) => {
+                self.handle_session_eof_completed(session_id, result)
             }
             Message::SearchNextInActivePane => match self.search_nav_target() {
                 Some(session_id) => self.handle_session_search_step(session_id, 1),
@@ -3052,6 +3060,7 @@ impl RunConfigManager {
                 }
             }
             StdinBarKey::Interrupt => self.handle_session_interrupt_requested(session_id),
+            StdinBarKey::Eof => self.handle_session_eof_requested(session_id),
         }
     }
 
@@ -3106,6 +3115,46 @@ impl RunConfigManager {
                 StdinWriteError::Broken(_) => "Interrupt is not available for this session",
             });
         }
+        Task::none()
+    }
+
+    /// ^D 버튼/Ctrl+D 키 공통 진입점 — 실행 중이 아니면 no-op (버튼은 Inactive
+    /// 상태에서도 on_press가 발화하므로 여기서 가드한다).
+    fn handle_session_eof_requested(&mut self, session_id: Uuid) -> Task<Message> {
+        let running = self
+            .session_by_id_mut(session_id)
+            .is_some_and(|s| s.is_running);
+        if !running {
+            return Task::none();
+        }
+        Task::perform(crate::services::eof_session(session_id), move |result| {
+            Message::SessionEofCompleted(session_id, result)
+        })
+    }
+
+    /// EOF 결과 처리. 성공은 침묵 — 자식의 반응(REPL 종료 등)은 출력으로 보인다.
+    /// EOF엔 시그널 폴백이 없어 실패는 안내만 하고, 그 사이 Stop/Remove/종료가
+    /// 선행됐으면 침묵한다(인터럽트 완료 처리와 동일한 이유).
+    fn handle_session_eof_completed(
+        &mut self,
+        session_id: Uuid,
+        result: Result<(), crate::models::StdinWriteError>,
+    ) -> Task<Message> {
+        use crate::models::StdinWriteError;
+        let Err(error) = result else {
+            return Task::none();
+        };
+        if !self
+            .sessions
+            .iter()
+            .any(|s| s.id == session_id && s.is_running)
+        {
+            return Task::none();
+        }
+        self.status_message = String::from(match error {
+            StdinWriteError::Timeout => "EOF pending — the process is not reading stdin yet",
+            StdinWriteError::Broken(_) => "EOF is not available for this session",
+        });
         Task::none()
     }
 
@@ -3370,14 +3419,15 @@ impl RunConfigManager {
 
     /// stdin 바 전용 키 매칭 (구독 클로저는 fn 포인터 — 대상 해석은
     /// `handle_stdin_bar_key_pressed`의 find_focused가 담당).
-    /// - Ctrl+C: **status 게이트 없음** — win/linux의 text_input은 포커스 중 Ctrl+C를
-    ///   선택 유무와 무관하게 캡처하므로(복사 arm의 capture가 무조건) Ignored 게이트를
-    ///   두면 키가 영원히 도달하지 않는다. 판정은 **물리 KeyC 또는 logical "c"의
-    ///   합집합** — 물리키는 한글 등 비라틴 레이아웃(logical이 "ㅊ"; text_input의
-    ///   복사 판정 to_latin도 비라틴에서만 물리키를 참조)을, logical은 Dvorak처럼
-    ///   라틴 문자가 물리적으로 이동한 레이아웃(to_latin이 logical을 신뢰)을
-    ///   커버한다. macOS의 복사는 Cmd+C(logo)라 이 arm(control 전용, logo 배제)과
-    ///   겹치지 않는다.
+    /// - Ctrl+C(인터럽트)/Ctrl+D(EOF): **status 게이트 없음** — win/linux의
+    ///   text_input은 포커스 중 Ctrl+C를 선택 유무와 무관하게 캡처하므로(복사 arm의
+    ///   capture가 무조건) Ignored 게이트를 두면 키가 영원히 도달하지 않는다
+    ///   (Ctrl+D는 캡처되지 않지만 일관성을 위해 동일 규칙). 판정은 **물리 키 또는
+    ///   logical 문자의 합집합** — 물리키는 한글 등 비라틴 레이아웃(logical이
+    ///   "ㅊ"/"ㅇ"; text_input의 복사 판정 to_latin도 비라틴에서만 물리키를 참조)을,
+    ///   logical은 Dvorak처럼 라틴 문자가 물리적으로 이동한 레이아웃(to_latin이
+    ///   logical을 신뢰)을 커버한다. macOS의 복사는 Cmd+C(logo)라 이 arm(control
+    ///   전용, logo 배제)과 겹치지 않는다.
     /// - ↑/↓: 수식키 없음 + `Status::Ignored`만 — iced text_input은 수직 방향키를
     ///   캡처하지 않아 포커스 중에도 Ignored로 도달하고, 게이트는 미래에 방향키를
     ///   캡처하는 위젯이 생겨도 이중 발화를 막는 위생 장치다.
@@ -3387,17 +3437,17 @@ impl RunConfigManager {
         modifiers: keyboard::Modifiers,
         status: event::Status,
     ) -> Option<Message> {
-        let is_key_c = matches!(
-            physical_key,
-            keyboard::key::Physical::Code(keyboard::key::Code::KeyC)
-        ) || matches!(key, keyboard::Key::Character(c) if c.as_str().eq_ignore_ascii_case("c"));
-        if is_key_c
-            && modifiers.control()
-            && !modifiers.shift()
-            && !modifiers.alt()
-            && !modifiers.logo()
-        {
-            return Some(Message::StdinBarKeyPressed(StdinBarKey::Interrupt));
+        if modifiers.control() && !modifiers.shift() && !modifiers.alt() && !modifiers.logo() {
+            let is_key = |code: keyboard::key::Code, ch: &str| {
+                matches!(physical_key, keyboard::key::Physical::Code(c) if c == code)
+                    || matches!(key, keyboard::Key::Character(s) if s.as_str().eq_ignore_ascii_case(ch))
+            };
+            if is_key(keyboard::key::Code::KeyC, "c") {
+                return Some(Message::StdinBarKeyPressed(StdinBarKey::Interrupt));
+            }
+            if is_key(keyboard::key::Code::KeyD, "d") {
+                return Some(Message::StdinBarKeyPressed(StdinBarKey::Eof));
+            }
         }
         let arrow_eligible = modifiers.is_empty() && matches!(status, event::Status::Ignored);
         match key {
@@ -5812,6 +5862,71 @@ mod tests {
                 .is_none()
             );
         }
+    }
+
+    #[test]
+    fn stdin_bar_key_message_maps_ctrl_d_to_eof() {
+        use keyboard::key::{Code, Physical};
+        let ctrl = keyboard::Modifiers::CTRL;
+        let phys_d = Physical::Code(Code::KeyD);
+        let key_d = keyboard::Key::Character("d".into());
+        // Ctrl+C와 동일 규칙: 캡처 상태 무관, 물리키/logical 합집합.
+        assert!(matches!(
+            RunConfigManager::stdin_bar_key_message(&key_d, phys_d, ctrl, event::Status::Captured),
+            Some(Message::StdinBarKeyPressed(StdinBarKey::Eof))
+        ));
+        let key_hangul = keyboard::Key::Character("ㅇ".into());
+        assert!(matches!(
+            RunConfigManager::stdin_bar_key_message(
+                &key_hangul,
+                phys_d,
+                ctrl,
+                event::Status::Ignored
+            ),
+            Some(Message::StdinBarKeyPressed(StdinBarKey::Eof))
+        ));
+        // 수식키 배제.
+        assert!(
+            RunConfigManager::stdin_bar_key_message(
+                &key_d,
+                phys_d,
+                ctrl | keyboard::Modifiers::SHIFT,
+                event::Status::Ignored
+            )
+            .is_none()
+        );
+        assert!(
+            RunConfigManager::stdin_bar_key_message(
+                &key_d,
+                phys_d,
+                keyboard::Modifiers::empty(),
+                event::Status::Ignored
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn eof_completed_reports_only_while_running() {
+        use crate::models::StdinWriteError;
+        let (mut app, ids) = manager_with_open_panes(&["a"]);
+        let sid = ids[0];
+        app.session_by_id_mut(sid).unwrap().is_running = true;
+        let _ = app.handle_session_eof_completed(
+            sid,
+            Err(StdinWriteError::Broken(String::from("no writer"))),
+        );
+        assert!(
+            app.status_message.contains("EOF"),
+            "user must be told EOF could not be delivered: {:?}",
+            app.status_message
+        );
+
+        // Stop 선행 등으로 이미 종료된 세션엔 침묵 — 방금 뜬 메시지를 덮지 않는다.
+        app.status_message.clear();
+        app.session_by_id_mut(sid).unwrap().is_running = false;
+        let _ = app.handle_session_eof_completed(sid, Err(StdinWriteError::Timeout));
+        assert!(app.status_message.is_empty());
     }
 
     #[test]
