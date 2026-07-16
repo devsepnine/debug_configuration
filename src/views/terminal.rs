@@ -2762,5 +2762,26 @@ mod flood_bench {
             "[bench] refresh_search_matches at 50k (query 'y'): {:?}",
             t.elapsed()
         );
+
+        // 증분 갱신(v0.6.2): cap-regime에서 배치당 비용 — 위 전체 재스캔과 비교용.
+        // 프로덕션 경로(handle_output_received)와 동일하게 앵커 캡처 → 적용 → 증분.
+        let mut t_inc = std::time::Duration::ZERO;
+        for _ in 0..20 {
+            let anchor = session
+                .output_lines
+                .front()
+                .map(|(id, _)| *id)
+                .zip(session.output_lines.back().map(|(id, _)| *id));
+            let t = Instant::now();
+            for e in &batch {
+                session.apply_output_event(e);
+            }
+            session.refresh_search_matches_incremental(anchor);
+            t_inc += t.elapsed();
+        }
+        eprintln!(
+            "[bench] cap-regime apply + incremental search refresh: avg {:?}/4096-event batch",
+            t_inc / 20
+        );
     }
 }

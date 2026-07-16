@@ -2579,6 +2579,15 @@ impl RunConfigManager {
             if session.cancel_flag.load(Ordering::Relaxed) {
                 return Task::none();
             }
+            // 배치 적용 전 앵커(front/last line_id) — 검색이 열려 있을 때만 캡처해
+            // 증분 매치 갱신에 쓴다.
+            let search_anchor = session.search.is_some().then(|| {
+                session
+                    .output_lines
+                    .front()
+                    .map(|(id, _)| *id)
+                    .zip(session.output_lines.back().map(|(id, _)| *id))
+            });
             // executor가 묶어 보낸 이벤트 배치 (process_output_loop의 coalescing —
             // UI 메시지 폭주 방지). Line=추가, Replace=마지막 라인 교체(라이브 진행바).
             for event in events {
@@ -2589,10 +2598,10 @@ impl RunConfigManager {
                 session.scroll_progress = 1.0;
             }
 
-            // 출력이 바뀌었으니 검색 매치 캐시 갱신 — 배치당 1회 (이벤트당 금지: 라이브
-            // 진행바는 초당 수십 배치라 O(버퍼) 스캔이 곱해진다). search 닫힘 시 no-op.
-            if session.search.is_some() {
-                session.refresh_search_matches();
+            // 검색 매치 캐시 증분 갱신 — 배치당 1회. 전체 재스캔은 O(버퍼)라 폭주
+            // (초당 수십 배치)에서 곱해졌다; 증분은 O(evict+신규+캐시 조정)로 유계.
+            if let Some(anchor) = search_anchor {
+                session.refresh_search_matches_incremental(anchor);
             }
         }
 
