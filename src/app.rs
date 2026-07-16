@@ -3169,9 +3169,17 @@ impl RunConfigManager {
             .is_some_and(crate::services::interrupt_session_process)
     }
 
-    /// Esc: 활성 바 하나만 닫는다. 우선순위 = 포커스 pane stdin → 포커스 pane 검색 →
-    /// 임의 stdin-open 세션 → 임의 search-open 세션 (LIFO 근사 — 나중에 연 표면 먼저).
+    /// Esc: 활성 표면 하나만 닫는다. 우선순위 = 오버플로 메뉴(⋯) → 포커스 pane
+    /// stdin → 포커스 pane 검색 → 임의 stdin-open 세션 → 임의 search-open 세션
+    /// (LIFO 근사 — 가장 일시적인 표면부터). 메뉴는 한 번에 하나만 열리지만
+    /// 전체를 닫아 토글 핸들러의 단일-열림 불변식과 일치시킨다.
     fn handle_close_active_bar(&mut self) -> Task<Message> {
+        if self.sessions.iter().any(|s| s.controls_menu_open) {
+            for session in &mut self.sessions {
+                session.controls_menu_open = false;
+            }
+            return Task::none();
+        }
         if let Some(session_id) = self.stdin_nav_target() {
             return self.handle_close_session_stdin(session_id);
         }
@@ -5153,17 +5161,16 @@ impl RunConfigManager {
         } else {
             Subscription::none()
         };
-        // ESC = 검색 닫기. 실제로 검색바가 열려 있을 때만 활성화해 다른 ESC 용도와
-        // 충돌하지 않게 한다 (검색이 없으면 ESC를 가로채지 않음).
-        // Esc = 활성 바(stdin 우선 → 검색) 하나 닫기. 단일 구독·단일 메시지로 두고
-        // 우선순위는 핸들러(handle_close_active_bar)가 정한다 — 바 종류별 Esc 구독을
-        // 병렬로 두면 한 번의 Esc에 둘 다 닫히는 이중 발화가 생긴다.
+        // Esc = 활성 표면(⋯ 메뉴 → stdin → 검색) 하나 닫기. 실제로 열린 표면이 있을
+        // 때만 활성화해 다른 ESC 용도와 충돌하지 않게 한다. 단일 구독·단일 메시지로
+        // 두고 우선순위는 핸들러(handle_close_active_bar)가 정한다 — 표면 종류별
+        // Esc 구독을 병렬로 두면 한 번의 Esc에 여럿이 닫히는 이중 발화가 생긴다.
         // (의도적으로 status 게이트 없음 — 포커스된 input 안에서도 Esc가 동작해야 한다)
         let bar_close_subscription = if sessions_active
             && self
                 .sessions
                 .iter()
-                .any(|s| s.search.is_some() || s.stdin_input.is_some())
+                .any(|s| s.search.is_some() || s.stdin_input.is_some() || s.controls_menu_open)
         {
             event::listen_with(|event, _status, _id| match event {
                 Event::Keyboard(keyboard::Event::KeyPressed {
@@ -6213,20 +6220,32 @@ mod tests {
     }
 
     #[test]
-    fn close_active_bar_prefers_stdin_then_search() {
+    fn close_active_bar_prefers_menu_then_stdin_then_search() {
         let (mut app, ids) = manager_with_open_panes(&["a"]);
         let sid = ids[0];
         app.current_view = ViewMode::Sessions;
         let _ = app.handle_open_session_search(sid);
         let _ = app.handle_open_session_stdin(sid);
+        let _ = app.handle_toggle_session_controls_menu(sid);
 
-        // 1차 Esc: stdin만 닫힘 (검색 유지).
+        // 1차 Esc: 오버플로 메뉴만 닫힘 (가장 일시적 표면 우선).
         let _ = app.handle_close_active_bar();
-        let session = app.session_by_id_mut(sid).unwrap();
-        assert!(session.stdin_input.is_none());
-        assert!(session.search.is_some());
+        {
+            let session = app.session_by_id_mut(sid).unwrap();
+            assert!(!session.controls_menu_open);
+            assert!(session.stdin_input.is_some());
+            assert!(session.search.is_some());
+        }
 
-        // 2차 Esc: 검색 닫힘.
+        // 2차 Esc: stdin만 닫힘 (검색 유지).
+        let _ = app.handle_close_active_bar();
+        {
+            let session = app.session_by_id_mut(sid).unwrap();
+            assert!(session.stdin_input.is_none());
+            assert!(session.search.is_some());
+        }
+
+        // 3차 Esc: 검색 닫힘.
         let _ = app.handle_close_active_bar();
         assert!(app.session_by_id_mut(sid).unwrap().search.is_none());
     }
