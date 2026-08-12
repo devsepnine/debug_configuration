@@ -3169,10 +3169,11 @@ impl RunConfigManager {
             .is_some_and(crate::services::interrupt_session_process)
     }
 
-    /// Esc: 활성 표면 하나만 닫는다. 우선순위 = 오버플로 메뉴(⋯) → 포커스 pane
-    /// stdin → 포커스 pane 검색 → 임의 stdin-open 세션 → 임의 search-open 세션
-    /// (LIFO 근사 — 가장 일시적인 표면부터). 메뉴는 한 번에 하나만 열리지만
-    /// 전체를 닫아 토글 핸들러의 단일-열림 불변식과 일치시킨다.
+    /// Esc: 우선순위가 가장 높은 표면 레이어 하나를 닫는다. 우선순위 = 오버플로
+    /// 메뉴(⋯) → 포커스 pane stdin → 포커스 pane 검색 → 임의 stdin-open 세션 →
+    /// 임의 search-open 세션 (LIFO 근사 — 가장 일시적인 표면부터). 메뉴는 pane마다
+    /// 독립적으로 열리지만 포커스 개념이 없어 하나씩 닫을 기준이 없으므로 메뉴
+    /// 레이어 전체를 한 번에 닫는다.
     fn handle_close_active_bar(&mut self) -> Task<Message> {
         if self.sessions.iter().any(|s| s.controls_menu_open) {
             for session in &mut self.sessions {
@@ -3190,14 +3191,11 @@ impl RunConfigManager {
     }
 
     /// 오버플로 메뉴(⋯) 토글. pane이 좁을 때 compact의 `⋯` 버튼이 보낸다.
-    /// 한 번에 하나의 메뉴만 열리도록, 대상 세션을 토글하고 나머지는 모두 닫는다.
+    /// 메뉴는 자기 pane 안에 쌓이는 로컬 표면이라 pane마다 독립이다 — 다른
+    /// 세션의 메뉴는 건드리지 않는다(나란히 띄운 세션들을 동시에 조작 가능).
     fn handle_toggle_session_controls_menu(&mut self, session_id: Uuid) -> Task<Message> {
-        let opening = !self
-            .session_by_id_mut(session_id)
-            .map(|session| session.controls_menu_open)
-            .unwrap_or(false);
-        for session in &mut self.sessions {
-            session.controls_menu_open = opening && session.id == session_id;
+        if let Some(session) = self.session_by_id_mut(session_id) {
+            session.controls_menu_open = !session.controls_menu_open;
         }
         Task::none()
     }
@@ -6032,6 +6030,32 @@ mod tests {
         let _ = app.handle_toggle_session_controls_menu(sid);
         app.close_controls_menu_on_action(&Message::CloseFocusedPane);
         assert!(!app.session_by_id_mut(sid).unwrap().controls_menu_open);
+    }
+
+    #[test]
+    fn controls_menus_open_independently_per_session() {
+        let (mut app, ids) = manager_with_open_panes(&["a", "b"]);
+        let (sid_a, sid_b) = (ids[0], ids[1]);
+
+        // 다른 pane에서 메뉴를 열어도 먼저 연 메뉴는 유지된다.
+        let _ = app.handle_toggle_session_controls_menu(sid_a);
+        let _ = app.handle_toggle_session_controls_menu(sid_b);
+        assert!(
+            app.session_by_id_mut(sid_a).unwrap().controls_menu_open,
+            "opening another pane's menu must not close the first"
+        );
+        assert!(app.session_by_id_mut(sid_b).unwrap().controls_menu_open);
+
+        // 토글은 자기 세션만 닫는다.
+        let _ = app.handle_toggle_session_controls_menu(sid_b);
+        assert!(app.session_by_id_mut(sid_a).unwrap().controls_menu_open);
+        assert!(!app.session_by_id_mut(sid_b).unwrap().controls_menu_open);
+
+        // Esc는 열린 메뉴 레이어 전체를 닫는다.
+        let _ = app.handle_toggle_session_controls_menu(sid_b);
+        let _ = app.handle_close_active_bar();
+        assert!(!app.session_by_id_mut(sid_a).unwrap().controls_menu_open);
+        assert!(!app.session_by_id_mut(sid_b).unwrap().controls_menu_open);
     }
 
     #[test]
