@@ -65,6 +65,7 @@ Grab the latest pre-built binary for your platform from the [Releases page](http
   are filtered out)
 - Rerun, stop, remove, and hide sessions from a workspace
 - Status badge on finished sessions (success, failed exit code, run duration)
+- Finished sessions dim slightly so still-running panes stand out at a glance
 - Desktop notification when a run finishes while the window is unfocused
 - Bulk actions: Stop All, Rerun All, Rerun Failed
 - Persistent session list with workspace-aware open state
@@ -77,6 +78,7 @@ Grab the latest pre-built binary for your platform from the [Releases page](http
   - Drag and drop pane rearrangement
   - Resize panes
   - Maximize and restore panes when multiple panes are open
+  - Compact overflow (⋯) menu on narrow panes, opening independently per pane
 
 ### Output Search and Export
 - Search output (Ctrl+F): case-insensitive substring or regex
