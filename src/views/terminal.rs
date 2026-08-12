@@ -29,6 +29,22 @@ const SCROLL_SPEED: f32 = 3.0;
 /// 좌우 패딩 (픽셀)
 const HORIZONTAL_PADDING: f32 = 10.0;
 
+/// 종료된 세션 터미널을 어둡게 하는 검정 오버레이 불투명도.
+/// 실행 중인 pane과 한눈에 구분될 만큼만 살짝 어둡게 한다.
+const ENDED_SESSION_DIM_ALPHA: f32 = 0.15;
+
+/// 검정을 `alpha`로 src-over 합성한 것과 동일하게 RGB를 어둡게 한다
+/// (channel × (1-α), α 불변). 캔버스 dim 오버레이가 못 덮는 컨테이너 패딩
+/// 영역의 밝기를 오버레이 결과와 정확히 맞추기 위한 것.
+fn dim_toward_black(base: Color, alpha: f32) -> Color {
+    Color {
+        r: base.r * (1.0 - alpha),
+        g: base.g * (1.0 - alpha),
+        b: base.b * (1.0 - alpha),
+        a: base.a,
+    }
+}
+
 /// D2 Coding 12pt 기준 실제 문자 너비 (픽셀)
 /// 런타임에 ttf-parser로 정확히 계산됨
 fn get_char_width() -> f32 {
@@ -175,6 +191,8 @@ struct TerminalCanvas<'a> {
     /// 가상화 wrap 캐시 무효화 키. 이 키가 같으면 `prepare_lines` 결과(=`lines`)도
     /// 동일하므로 캐시를 재사용한다.
     render_key: RenderKey,
+    /// 종료된 세션 여부. draw()가 마지막에 반투명 검정을 덮어 전체를 살짝 어둡게 한다.
+    dimmed: bool,
 }
 
 /// 터미널에 렌더링할 한 줄. 대부분은 세션 버퍼를 빌려(zero-copy) 클론 비용을 없앤다.
@@ -793,6 +811,17 @@ impl<'a> canvas::Program<Message> for TerminalCanvas<'a> {
             visible_lines,
             scrollbar_color,
         );
+
+        // 종료된 세션은 맨 위에 반투명 검정을 덮어 실행 중 pane과 한눈에 구분한다.
+        if self.dimmed {
+            frame.fill(
+                &canvas::Path::rectangle(Point::ORIGIN, bounds.size()),
+                Color {
+                    a: ENDED_SESSION_DIM_ALPHA,
+                    ..Color::BLACK
+                },
+            );
+        }
 
         vec![frame.into_geometry()]
     }
@@ -1956,6 +1985,7 @@ fn render_key_for(session: &RunSession) -> RenderKey {
 /// * `session` - 렌더링할 세션의 참조
 pub fn view_terminal_for_session(session: &RunSession, is_dragging: bool) -> Element<'_, Message> {
     let (lines, highlights, scroll_target_row) = prepare_lines(session);
+    let dimmed = !session.is_running;
 
     let canvas = Canvas::new(TerminalCanvas {
         lines,
@@ -1968,6 +1998,7 @@ pub fn view_terminal_for_session(session: &RunSession, is_dragging: bool) -> Ele
         first_line_id: session.output_lines.front().map(|(id, _)| *id),
         last_line_id: session.output_lines.back().map(|(id, _)| *id),
         render_key: render_key_for(session),
+        dimmed,
     })
     .width(Length::Fill)
     .height(Length::Fill);
@@ -1977,7 +2008,14 @@ pub fn view_terminal_for_session(session: &RunSession, is_dragging: bool) -> Ele
         .height(Length::Fill)
         .padding(HORIZONTAL_PADDING)
         .style(move |theme: &Theme| {
-            let bg_color = theme.extended_palette().background.weaker.color;
+            let base = theme.extended_palette().background.weaker.color;
+            // 캔버스의 dim 오버레이(검정 α 합성)와 같은 비율로 배경을 어둡게 해
+            // 패딩 영역과 캔버스 영역의 밝기를 맞춘다.
+            let bg_color = if dimmed {
+                dim_toward_black(base, ENDED_SESSION_DIM_ALPHA)
+            } else {
+                base
+            };
             let background = if is_dragging {
                 iced::Color {
                     r: bg_color.r,
@@ -2105,6 +2143,19 @@ mod tests {
     use crate::ansi::TextSegment;
     use iced::Size;
     use iced::widget::canvas::Program as _;
+
+    /// 종료 세션 dim: 배경 RGB 스케일이 캔버스 검정 오버레이의 src-over 합성
+    /// 결과와 일치해야 패딩 영역과 캔버스 영역의 밝기가 맞는다.
+    #[test]
+    fn dim_toward_black_matches_black_overlay_composite() {
+        let base = Color::from_rgb(0.3, 0.5, 0.7);
+        let dimmed = dim_toward_black(base, ENDED_SESSION_DIM_ALPHA);
+        // src-over: result = src×α + dst×(1-α), src = 검정(0).
+        for (got, dst) in [(dimmed.r, base.r), (dimmed.g, base.g), (dimmed.b, base.b)] {
+            assert!((got - dst * (1.0 - ENDED_SESSION_DIM_ALPHA)).abs() < 1e-6);
+        }
+        assert_eq!(dimmed.a, base.a, "알파(배경 투명도)는 유지");
+    }
 
     // ---- 검색 점프 앵커: prepare_lines의 line_id → canvas 행 해석 ----
 
@@ -2266,6 +2317,7 @@ mod tests {
                 first_line_id: None,
                 last_line_id: None,
                 render_key: RenderKey::default(),
+                dimmed: false,
             },
             id,
         )
@@ -2439,6 +2491,7 @@ mod tests {
             first_line_id: None,
             last_line_id: None,
             render_key: RenderKey::default(),
+            dimmed: false,
         };
         let bounds = test_bounds();
         let mut state = ready_state(id);
@@ -2510,6 +2563,7 @@ mod tests {
                 filter: false,
                 query: String::new(),
             },
+            dimmed: false,
         }
     }
 
