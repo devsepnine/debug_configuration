@@ -2124,7 +2124,7 @@ impl RunConfigManager {
                     None
                 }
             })
-            .map_or((Uuid::new_v4(), String::from(".")), |value| value);
+            .unwrap_or((Uuid::new_v4(), String::from(".")));
 
         let project_dir = Path::new(&project_directory);
         let full_path = project_dir.join(relative_path.trim_start_matches("./"));
