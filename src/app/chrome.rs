@@ -7,7 +7,7 @@ use crate::models::RunSession;
 use crate::views::shared::{
     IconButtonState, chrome_border_color, icon_button_foreground, icon_button_style,
 };
-use iced::widget::{button, container, svg};
+use iced::widget::{button, container, svg, text};
 use iced::{Background, Border, Color, Theme, border};
 
 /// 세션 리스트 항목의 액션 버튼 종류 (스타일 분기용).
@@ -267,6 +267,26 @@ pub(crate) fn session_action_icon_style(
         } else {
             icon_button_foreground(theme, IconButtonState::Inactive)
         }),
+    }
+}
+
+/// 종료 세션 구분선의 라벨/카운트. 목록의 주인공은 실행 중인 세션이므로 경계 표시는
+/// 배경에 가깝게 죽인다.
+pub(crate) fn session_divider_label_style(theme: &Theme) -> text::Style {
+    text::Style {
+        color: Some(Color {
+            a: 0.45,
+            ..theme.extended_palette().background.base.text
+        }),
+    }
+}
+
+/// 구분선의 실선(1px). 상태바 상단선과 같은 chrome 경계색을 쓴다 — 창 안의 hairline은
+/// 한 가지 색으로 통일해야 패널마다 경계 밝기가 달라 보이지 않는다.
+pub(crate) fn session_divider_line_style(theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(chrome_border_color(theme))),
+        ..container::Style::default()
     }
 }
 

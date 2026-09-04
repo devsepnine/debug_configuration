@@ -53,11 +53,12 @@ use settings_modal::SettingsModalState;
 
 use chrome::{
     SessionActionKind, empty_workspace_content_style, session_action_button_style,
-    session_action_icon_style, session_empty_state_style, session_list_item_container_style,
-    session_list_panel_style, session_list_status_dot_style, status_bar_style,
-    status_bar_top_border_style, status_bar_version_style, window_border_overlay_style,
-    window_chrome_style, window_radius, workspace_content_island_style,
-    workspace_content_surface_style, workspace_tab_bar_island_style,
+    session_action_icon_style, session_divider_label_style, session_divider_line_style,
+    session_empty_state_style, session_list_item_container_style, session_list_panel_style,
+    session_list_status_dot_style, status_bar_style, status_bar_top_border_style,
+    status_bar_version_style, window_border_overlay_style, window_chrome_style, window_radius,
+    workspace_content_island_style, workspace_content_surface_style,
+    workspace_tab_bar_island_style,
 };
 
 /// 세션 리스트의 상태 배지 고정 폭 — 레이아웃 계산과 실제 렌더링이 공유한다.
@@ -500,6 +501,9 @@ pub(crate) struct AvailableUpdate {
 /// 상태바 업데이트 확인 로딩 스피너 프레임. D2Coding(모노스페이스)에서 항상
 /// 렌더되도록 ASCII만 사용한다.
 const UPDATE_SPINNER_FRAMES: [&str; 4] = ["|", "/", "-", "\\"];
+
+/// 세션 목록의 부분집합 — 저장 인덱스와 세션 참조의 짝(인덱스는 `sessions`의 위치 그대로).
+type SessionRefs<'a> = Vec<(usize, &'a RunSession)>;
 
 impl RunConfigManager {
     /// 새로운 애플리케이션 인스턴스 생성 및 초기화
@@ -3805,7 +3809,8 @@ impl RunConfigManager {
             tab.remove_session(session_id);
         }
 
-        // hovered_session_index는 표시용 인덱스(뷰에서 사용)이므로 제거 위치에 맞춰 보정.
+        // hovered_session_index는 sessions의 저장 인덱스다(목록은 실행/종료로 묶어 다른
+        // 순서로 그리지만 인덱스는 저장 순서 그대로 넘어간다) — 제거 위치에 맞춰 보정한다.
         self.hovered_session_index = match self.hovered_session_index {
             Some(_) if self.sessions.is_empty() => None,
             Some(hovered) if hovered == removed_pos => None,
@@ -4637,7 +4642,16 @@ impl RunConfigManager {
             );
         } else {
             let name_max_width = session_name_max_width();
-            for (index, session) in self.sessions.iter().enumerate() {
+            let (running, ended) = Self::split_sessions_by_run_state(&self.sessions);
+            let (running_count, ended_count) = (running.len(), ended.len());
+
+            for (position, (index, session)) in running.into_iter().chain(ended).enumerate() {
+                // 종료 구간의 첫 항목 앞에 경계를 그린다. 종료 세션이 없으면 그리지 않고,
+                // 전부 종료됐으면 목록 맨 위에 온다(그 자체가 "돌고 있는 게 없다"는 표시).
+                if ended_count > 0 && position == running_count {
+                    list = list.push(Self::view_session_ended_divider(ended_count));
+                }
+
                 let is_open_in_workspace =
                     current_tab.is_some_and(|tab| tab.contains_session(session.id));
                 let is_hovered = self.hovered_session_index == Some(index);
@@ -4667,6 +4681,35 @@ impl RunConfigManager {
             .padding([8, 6])
             .style(session_list_panel_style)
             .into()
+    }
+
+    /// 실행 중 / 종료됨으로 가른다(각 그룹 안에서는 원래 순서 유지). 돌려주는 인덱스는
+    /// `sessions`의 저장 인덱스 그대로다 — hover 추적과 제거 시 보정이 표시 순서가 아니라
+    /// 저장 순서를 기준으로 하므로, 표시를 재배치해도 인덱스는 함께 움직이면 안 된다.
+    fn split_sessions_by_run_state(sessions: &[RunSession]) -> (SessionRefs<'_>, SessionRefs<'_>) {
+        sessions
+            .iter()
+            .enumerate()
+            .partition(|(_, session)| session.is_running)
+    }
+
+    /// 종료 세션 구간의 시작선. 끝난 세션이 실행 중인 세션 사이에 섞이면 지금 무엇이 돌고
+    /// 있는지 한눈에 안 들어온다 — 아래로 몰고 경계를 그린다.
+    fn view_session_ended_divider(count: usize) -> Element<'static, Message> {
+        row![
+            text("Ended").size(10).style(session_divider_label_style),
+            container(Space::new())
+                .width(Length::Fill)
+                .height(1)
+                .style(session_divider_line_style),
+            text(count.to_string())
+                .size(10)
+                .style(session_divider_label_style),
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center)
+        .padding([2, 8])
+        .into()
     }
 
     fn view_session_list_item(
@@ -6356,6 +6399,67 @@ mod tests {
         let _ = app.handle_delete_configuration(Some(0));
         assert!(app.configurations.is_empty());
         assert_eq!(app.selected_config_index, None);
+    }
+
+    /// 세션 목록은 실행 중인 것을 위로, 종료된 것을 아래로 모아 보여준다. 그때도 인덱스는
+    /// 저장 순서 그대로여야 한다 — hover 추적과 제거 시 보정이 이 인덱스를 쓴다.
+    #[test]
+    fn split_sessions_keeps_store_indices_and_order() {
+        let (mut app, _ids) = manager_with_sessions(&["a", "b", "c", "d"]);
+        app.sessions[0].is_running = false;
+        app.sessions[2].is_running = false;
+
+        let (running, ended) = RunConfigManager::split_sessions_by_run_state(&app.sessions);
+
+        assert_eq!(
+            running
+                .iter()
+                .map(|(index, session)| (*index, session.config_name.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(1, "b"), (3, "d")]
+        );
+        assert_eq!(
+            ended
+                .iter()
+                .map(|(index, session)| (*index, session.config_name.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(0, "a"), (2, "c")]
+        );
+    }
+
+    /// 한쪽으로만 몰린 목록: 종료가 없으면 구분선을 그릴 근거가 없고(뷰는 종료 그룹의
+    /// 크기로 판단한다), 전부 종료면 구분선이 목록 맨 위에 온다.
+    #[test]
+    fn split_sessions_handles_single_state_lists() {
+        let (mut app, _ids) = manager_with_sessions(&["a", "b"]);
+
+        let (running, ended) = RunConfigManager::split_sessions_by_run_state(&app.sessions);
+        assert_eq!(running.len(), 2);
+        assert!(ended.is_empty());
+
+        for session in &mut app.sessions {
+            session.is_running = false;
+        }
+
+        let (running, ended) = RunConfigManager::split_sessions_by_run_state(&app.sessions);
+        assert!(running.is_empty());
+        assert_eq!(ended.len(), 2);
+    }
+
+    /// 회귀 방지: 세션이 실행 중 → 종료로 바뀌면 표시 위치는 종료 그룹으로 내려가지만 저장
+    /// 인덱스는 그대로다. 뷰에 표시 순서 기준 인덱스를 넘기면 이 순간 hover가 다른 항목에
+    /// 붙는다(`view_session_list_item`의 `is_hovered` 판정이 이 인덱스로 이뤄진다).
+    #[test]
+    fn hovered_index_follows_the_session_moved_to_the_ended_group() {
+        let (mut app, _ids) = manager_with_sessions(&["a", "b", "c"]);
+        app.hovered_session_index = Some(0);
+
+        app.sessions[0].is_running = false;
+
+        let (_, ended) = RunConfigManager::split_sessions_by_run_state(&app.sessions);
+        let (index, session) = ended[0];
+        assert_eq!(app.hovered_session_index, Some(index));
+        assert_eq!(session.config_name, "a");
     }
 
     fn manager_with_sessions(names: &[&str]) -> (RunConfigManager, Vec<Uuid>) {
