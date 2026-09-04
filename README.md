@@ -69,6 +69,8 @@ Grab the latest pre-built binary for your platform from the [Releases page](http
 - Desktop notification when a run finishes while the window is unfocused
 - Bulk actions: Stop All, Rerun All, Rerun Failed
 - Persistent session list with workspace-aware open state
+- Running sessions stay at the top of the session list; ended ones move
+  below a divider that counts them
 - Workspace tab system
   - Keep at least one workspace tab available
   - Add, close, and rename workspaces
