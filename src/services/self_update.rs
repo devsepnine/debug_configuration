@@ -225,10 +225,20 @@ fn parse_checksums(text: &str) -> HashMap<String, String> {
 }
 
 /// 버퍼의 SHA-256을 소문자 hex 문자열로 반환.
+/// digest 0.11의 출력 타입은 `LowerHex`를 구현하지 않아 hex를 직접 쓴다.
 fn sha256_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+
     let mut hasher = Sha256::new();
     hasher.update(bytes);
-    format!("{:x}", hasher.finalize())
+    hasher.finalize().iter().fold(
+        String::with_capacity(Sha256::output_size() * 2),
+        |mut hex, byte| {
+            // String에 대한 write는 실패하지 않는다.
+            let _ = write!(hex, "{byte:02x}");
+            hex
+        },
+    )
 }
 
 /// 검증 완료된 payload를 플랫폼별로 적용한다 (blocking — spawn_blocking 안에서 호출).

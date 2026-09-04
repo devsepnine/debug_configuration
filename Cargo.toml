@@ -18,10 +18,12 @@ open = "5.3"
 ctrlc = { version = "3.5", features = ["termination"] }
 rfd = "0.17"
 notify-rust = "4.18.0"
+# 0.12 유지: 0.13의 `rustls` 피처는 aws-lc-rs(+cmake/C 툴체인)와 OS 신뢰저장소 검증기를
+# 끌어와, 아래 "순수 Rust · 시스템 의존성 없음" 정책과 3-OS 릴리스 빌드 전제를 깬다.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 # 인앱 자기 업데이트: 다운로드 무결성(sha2) + 서명 검증(minisign-verify) + 자산 추출(flate2/tar).
 # 전부 순수 Rust — 시스템 의존성/크로스컴파일 부담 없음 (rustls 정책과 일관).
-sha2 = "0.10"
+sha2 = "0.11"
 flate2 = "1"
 tar = "0.4"
 minisign-verify = "0.2"
