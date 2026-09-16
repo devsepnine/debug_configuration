@@ -152,7 +152,7 @@ pub fn view_pane_layout<'a>(
             pane,
             sessions,
             pane_count,
-            pane_focus(pane_count, pane.session_id, focused_session_id),
+            focused_session_id,
             maximized_pane == Some(pane_id),
             is_dragging_pane,
             dragging_pane_id,
@@ -174,7 +174,7 @@ pub fn view_pane_layout<'a>(
 /// * `pane` - 렌더링할 Pane 데이터 (단일 세션)
 /// * `sessions` - 모든 세션 데이터
 /// * `pane_count` - 현재 워크스페이스의 Pane 개수
-/// * `focus` - 타이틀바 포커스 강조 상태
+/// * `focused_session_id` - 활성 탭에서 포커스된 세션 (타이틀바 강조·선택 소유권 판정)
 /// * `is_maximized` - 현재 Pane 최대화 여부
 /// * `_is_dragging_pane` - Pane 드래그 중 여부 (현재 미사용)
 /// * `dragging_pane_id` - 드래그 중인 Pane ID (`pane_grid` 네이티브 드래그)
@@ -184,11 +184,12 @@ fn view_pane_content<'a>(
     pane: &'a Pane,
     sessions: &'a [RunSession],
     pane_count: usize,
-    focus: PaneFocus,
+    focused_session_id: Option<Uuid>,
     is_maximized: bool,
     _is_dragging_pane: bool,
     dragging_pane_id: Option<pane_grid::Pane>,
 ) -> pane_grid::Content<'a, Message> {
+    let focus = pane_focus(pane_count, pane.session_id, focused_session_id);
     // 세션 이름 가져오기
     let current_session = pane
         .session_id
@@ -207,7 +208,13 @@ fn view_pane_content<'a>(
             // Pane 드래그 중 여부 (반투명 효과 적용용)
             let is_dragging = dragging_pane_id == Some(pane_id);
 
-            let terminal_output = view_terminal_for_session(session, is_dragging);
+            // 포커스 pane만 텍스트 선택을 보유한다 — 나머지 pane의 잔여 선택은 Cmd+C를
+            // 가로채 다른 내용을 복사시킨다(`view_terminal_for_session` 참고).
+            let terminal_output = view_terminal_for_session(
+                session,
+                is_dragging,
+                focused_session_id == Some(session_id),
+            );
             // 넓으면 전체 버튼(full), 좁아 안 들어가면 ⋯+닫기(compact).
             // title_bar가 너비를 보고 자동 전환한다(Controls::dynamic).
             title_controls = Some((

@@ -191,6 +191,10 @@ struct TerminalCanvas<'a> {
     /// 가상화 wrap 캐시 무효화 키. 이 키가 같으면 `prepare_lines` 결과(=`lines`)도
     /// 동일하므로 캐시를 재사용한다.
     render_key: RenderKey,
+    /// 이 pane이 활성 탭의 포커스 pane인지. 텍스트 선택의 소유권을 단일 pane으로 묶는 데 쓴다
+    /// — 키보드 이벤트는 위젯 라우팅 없이 열려 있는 모든 canvas에 전달되므로, 선택이 남은
+    /// pane이 여럿이면 Cmd+C가 여러 개의 복사를 발행해 방금 드래그한 내용을 덮어쓴다.
+    is_focused: bool,
     /// 종료된 세션 여부. draw()가 마지막에 반투명 검정을 덮어 전체를 살짝 어둡게 한다.
     dimmed: bool,
 }
@@ -450,6 +454,18 @@ impl<'a> TerminalCanvas<'a> {
         if let Some(evicted_wrapped) = self.try_incremental_wrap_update(state, max_chars) {
             return evicted_wrapped;
         }
+        // 전체 재생성 경로에는 사유가 섞여 있다: 가로폭만 바뀐 경우(줄 집합 그대로 → 선택
+        // 유효), 앞줄 evict(인덱스만 밀렸으므로 시프트로 복구), 줄 집합 교체(필터 토글·검색어
+        // 변경·clear_output → 선택 무효). line_id 범위로 셋을 구분해, evict면 당기고 근거가
+        // 없으면 버린다 — 남겨두면 같은 `line_idx`가 다른 줄을 가리켜 드래그한 적 없는 내용이
+        // 복사된다. 캐시가 없는 첫 빌드는 비교 기준 자체가 없으므로 건드리지 않는다.
+        if !state.line_counts.is_empty() {
+            match self.evicted_lines_since_cache(state) {
+                Some(evicted) => Self::shift_selection_after_eviction(state, evicted),
+                None => Self::clear_selection(state),
+            }
+        }
+
         // 그 외(가로폭/필터/검색어 변경, clear, 캐시 없음)는 전체 재생성.
         state.line_counts = self
             .lines
@@ -523,6 +539,7 @@ impl<'a> TerminalCanvas<'a> {
 
         // 앞에서 evicted개 제거(그 행 수 합이 offset 보정량), 뒤에 append된 줄만 wrap 계산.
         let evicted_wrapped: usize = state.line_counts.drain(..evicted).map(|c| c as usize).sum();
+        Self::shift_selection_after_eviction(state, evicted);
         // 같은 프레임 배치에 Replace가 섞였다면 잔존 구간의 tail(=append 직전 경계 줄)
         // 내용이 바뀌었을 수 있다 — [Replace, Line…] 프레임과 "Replace가 바이트 예산
         // eviction을 유발한" 프레임(appended==0) 둘 다 커버하도록 무조건 재계산 (O(1)).
@@ -543,6 +560,21 @@ impl<'a> TerminalCanvas<'a> {
         state.cached_first_line_id = self.first_line_id;
         state.cached_last_line_id = self.last_line_id;
         Some(evicted_wrapped)
+    }
+
+    /// 캐시를 만든 시점 이후 앞에서 evict된 줄 수 — "evict 말고는 줄 집합이 그대로"임을
+    /// 확인할 수 있을 때만 Some이다. `line_id`는 세션당 단조 증가하고(clear_output도 리셋하지
+    /// 않는다) 버퍼는 `pop_front`로만 줄어들어 항상 연속 구간이므로, 같은 세션·필터 off라면
+    /// 첫 id의 차이가 곧 evict된 줄 수다. 필터 모드는 표시 줄이 비연속 부분집합이라 추론할 수
+    /// 없고, id가 뒤로 가거나(다른 세션) 버퍼가 비면 근거가 없으므로 None.
+    fn evicted_lines_since_cache(&self, state: &ScrollState) -> Option<usize> {
+        if state.cached_session_id != Some(self.session_id)
+            || state.cached_render_key.filter
+            || self.render_key.filter
+        {
+            return None;
+        }
+        self.first_line_id?.checked_sub(state.cached_first_line_id?)
     }
 
     /// 한 줄의 최대 display width 계산
@@ -671,6 +703,18 @@ impl<'a> canvas::Program<Message> for TerminalCanvas<'a> {
             state.offset = (state.offset - evicted_wrapped as f32).max(0.0);
         }
 
+        // 선택은 포커스 pane 하나만 갖는다. State는 세션이 아니라 위젯 슬롯에 붙어 살아남고
+        // Cmd+C는 모든 canvas가 받으므로, 포커스를 잃은 pane에 선택이 남아 있으면 그 pane도
+        // 복사를 발행해 사용자가 방금 드래그한 내용을 덮어쓴다(워크스페이스 전환 시 슬롯을
+        // 물려받은 선택이 특히 그렇다).
+        //
+        // 드래그 중에는 건너뛴다: 선택을 시작한 클릭의 `PaneClicked`는 다음 view에서야
+        // 포커스에 반영되므로, 같은 프레임의 후속 이벤트에서 방금 시작한 선택을 지우면
+        // 드래그가 시작되자마자 죽는다.
+        if !self.is_focused && !state.is_selecting {
+            Self::clear_selection(state);
+        }
+
         if let Some(action) = self.initialize_scroll_state(state, bounds) {
             return Some(action);
         }
@@ -727,11 +771,18 @@ impl<'a> canvas::Program<Message> for TerminalCanvas<'a> {
             Event::Mouse(mouse::Event::CursorMoved { position }) => {
                 return self.handle_cursor_moved(state, *position, bounds, metrics);
             }
+            // 창이 포커스를 잃으면 버튼 뗌 이벤트가 오지 않을 수 있다(Cmd+Tab·시스템 다이얼로그).
+            // 드래그 플래그가 걸린 채 남으면 이후 단순 마우스 이동이 선택 끝을 계속 끌고 다녀
+            // 드래그한 적 없는 범위가 복사되고, 포커스 상실 시 선택 폐기(위)도 영영 막힌다.
+            // app.rs가 타이틀바 터치 드래그에 두는 방어와 같은 이유.
+            Event::Window(window::Event::Unfocused) => {
+                state.is_selecting = false;
+            }
             Event::Keyboard(keyboard::Event::KeyPressed {
                 key: keyboard::Key::Character(c),
                 modifiers,
                 ..
-            }) if c.as_str() == "c" && modifiers.command() => {
+            }) if c.as_str() == "c" && modifiers.command() && self.is_focused => {
                 if let (Some(start), Some(end)) = (state.selection_start, state.selection_end) {
                     let text = self.extract_selected_text(start, end);
                     if !text.is_empty() {
@@ -910,6 +961,10 @@ impl<'a> TerminalCanvas<'a> {
 
         state.last_session_id = Some(self.session_id);
         state.is_initialized = true;
+        // 선택은 이전 세션의 줄 인덱스다 — 새 세션에 그대로 두면 드래그한 적 없는 내용이
+        // 강조되고 복사된다. State가 위젯 슬롯에 붙어 세션 교체를 넘어 살아남기 때문에
+        // (워크스페이스 탭 전환 = 같은 슬롯에 다른 세션) 여기서 명시적으로 버려야 한다.
+        Self::clear_selection(state);
         // wrap 캐시(line_counts·cached_first/last_line_id)는 여기서 리셋하지 않는다. 세션이
         // 바뀌면 content_version/줄 수가 달라 rebuild_wrap_cache_if_needed가 캐시 미스로
         // 전체 재빌드하며 자연스럽게 새 세션 기준으로 갱신되고, 증분 경로도 line_id 범위
@@ -1135,6 +1190,48 @@ impl<'a> TerminalCanvas<'a> {
         state.offset = (state.offset + scroll_delta)
             .max(0.0)
             .min((Self::usize_to_f32(total_wrapped_lines) - visible_lines).max(0.0));
+    }
+
+    /// 선택을 버린다. 선택 위치는 `lines`의 인덱스라 줄 집합이 바뀌면 다른 내용을 가리키므로,
+    /// 유효성을 잃는 지점마다(포커스 상실·세션 교체·줄 집합 교체) 호출한다.
+    fn clear_selection(state: &mut ScrollState) {
+        state.selection_start = None;
+        state.selection_end = None;
+        state.is_selecting = false;
+    }
+
+    /// 앞에서 `evicted`줄이 사라진 만큼 선택 위치를 당긴다. offset 보정(②)과 같은 이유다 —
+    /// 보정하지 않으면 같은 `line_idx`가 다른 줄을 가리켜 드래그한 것과 다른 내용이 복사된다.
+    /// 선택 구간이 통째로 evict됐으면 남은 게 없으므로 폐기하고(0으로 clamp하면 드래그한 적
+    /// 없는 맨 윗줄이 유령 선택으로 남는다), 앞부분만 잘렸으면 그 끝점을 살아남은 첫 줄
+    /// 머리로 옮겨 실제로 남아 있는 구간만 유지한다.
+    fn shift_selection_after_eviction(state: &mut ScrollState, evicted: usize) {
+        if evicted == 0 {
+            return;
+        }
+        let (Some(start), Some(end)) = (state.selection_start, state.selection_end) else {
+            return;
+        };
+        // 위로 드래그하면 start가 end보다 뒤 줄이다 — 생존 판정은 둘 중 뒷줄로 한다.
+        if start.line_idx.max(end.line_idx) < evicted {
+            Self::clear_selection(state);
+            return;
+        }
+        for position in [&mut state.selection_start, &mut state.selection_end]
+            .into_iter()
+            .flatten()
+        {
+            *position = match position.line_idx.checked_sub(evicted) {
+                Some(line_idx) => TextPosition {
+                    line_idx,
+                    char_idx: position.char_idx,
+                },
+                None => TextPosition {
+                    line_idx: 0,
+                    char_idx: 0,
+                },
+            };
+        }
     }
 
     /// 선택 영역 정규화 (시작이 끝보다 앞에 오도록)
@@ -1983,7 +2080,13 @@ fn render_key_for(session: &RunSession) -> RenderKey {
 ///
 /// # Arguments
 /// * `session` - 렌더링할 세션의 참조
-pub fn view_terminal_for_session(session: &RunSession, is_dragging: bool) -> Element<'_, Message> {
+/// * `is_dragging` - pane 드래그 중 여부(반투명 처리)
+/// * `is_focused` - 이 pane이 활성 탭의 포커스 pane인지(선택·복사 소유권)
+pub fn view_terminal_for_session(
+    session: &RunSession,
+    is_dragging: bool,
+    is_focused: bool,
+) -> Element<'_, Message> {
     let (lines, highlights, scroll_target_row) = prepare_lines(session);
     let dimmed = !session.is_running;
 
@@ -1998,6 +2101,7 @@ pub fn view_terminal_for_session(session: &RunSession, is_dragging: bool) -> Ele
         first_line_id: session.output_lines.front().map(|(id, _)| *id),
         last_line_id: session.output_lines.back().map(|(id, _)| *id),
         render_key: render_key_for(session),
+        is_focused,
         dimmed,
     })
     .width(Length::Fill)
@@ -2317,6 +2421,7 @@ mod tests {
                 first_line_id: None,
                 last_line_id: None,
                 render_key: RenderKey::default(),
+                is_focused: true,
                 dimmed: false,
             },
             id,
@@ -2491,6 +2596,7 @@ mod tests {
             first_line_id: None,
             last_line_id: None,
             render_key: RenderKey::default(),
+            is_focused: true,
             dimmed: false,
         };
         let bounds = test_bounds();
@@ -2545,7 +2651,12 @@ mod tests {
         session_id: Uuid,
     ) -> TerminalCanvas<'static> {
         let n = texts.len();
-        let last_id = first_id + n.saturating_sub(1);
+        // 빈 버퍼는 프로덕션(`view_terminal_for_session`)과 동일하게 id가 없다.
+        let (first, last) = if n == 0 {
+            (None, None)
+        } else {
+            (Some(first_id), Some(first_id + n - 1))
+        };
         TerminalCanvas {
             lines: texts
                 .into_iter()
@@ -2556,13 +2667,14 @@ mod tests {
             initial_scroll_progress: 1.0,
             auto_scroll: false,
             scroll_target: None,
-            first_line_id: Some(first_id),
-            last_line_id: Some(last_id),
+            first_line_id: first,
+            last_line_id: last,
             render_key: RenderKey {
                 content_version,
                 filter: false,
                 query: String::new(),
             },
+            is_focused: true,
             dimmed: false,
         }
     }
@@ -2744,6 +2856,245 @@ mod tests {
         assert_eq!(TerminalCanvas::wrapped_total(&[]), 0);
         assert_eq!(TerminalCanvas::wrapped_total(&[1, 1, 1]), 3);
         assert_eq!(TerminalCanvas::wrapped_total(&[1, 3, 2, 1]), 7);
+    }
+    // ── 선택 소유권 (드래그한 것과 다른 내용이 복사되던 버그) ──────────────────
+
+    /// Cmd+C 키 이벤트. iced는 키 이벤트를 위젯별로 라우팅하지 않으므로 열려 있는 모든
+    /// terminal canvas의 `update`가 이 이벤트를 그대로 받는다.
+    fn copy_shortcut() -> Event {
+        Event::Keyboard(keyboard::Event::KeyPressed {
+            key: keyboard::Key::Character("c".into()),
+            modified_key: keyboard::Key::Character("c".into()),
+            physical_key: keyboard::key::Physical::Code(keyboard::key::Code::KeyC),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::COMMAND,
+            text: None,
+            repeat: false,
+        })
+    }
+
+    fn select_first_line(state: &mut ScrollState) {
+        state.selection_start = Some(TextPosition {
+            line_idx: 1,
+            char_idx: 0,
+        });
+        state.selection_end = Some(TextPosition {
+            line_idx: 1,
+            char_idx: 6,
+        });
+    }
+
+    /// 회귀 방지: 포커스가 없는 pane에 선택이 남아 있으면 그 pane도 Cmd+C에 복사를 발행해
+    /// 클립보드를 덮어쓴다("우측 pane에서 드래그했는데 다른 pane 내용이 복사됨"). 비포커스
+    /// pane은 발행하지 않고, 남은 선택도 즉시 버려야 한다.
+    #[test]
+    fn unfocused_pane_does_not_answer_copy_shortcut() {
+        let (mut canvas, id) = canvas_with_lines(5, false);
+        canvas.is_focused = false;
+        let mut state = ready_state(id);
+        select_first_line(&mut state);
+
+        let action = canvas.update(&mut state, &copy_shortcut(), test_bounds(), cursor_inside());
+
+        assert!(action.is_none(), "비포커스 pane은 복사를 발행하지 않는다");
+        assert_eq!(state.selection_start, None, "잔여 선택은 즉시 버린다");
+        assert_eq!(state.selection_end, None);
+    }
+
+    /// 포커스 pane은 자기 선택 범위를 그대로 복사한다.
+    #[test]
+    fn focused_pane_copies_its_own_selection() {
+        let (canvas, id) = canvas_with_lines(5, false);
+        let mut state = ready_state(id);
+        select_first_line(&mut state);
+
+        let action = canvas.update(&mut state, &copy_shortcut(), test_bounds(), cursor_inside());
+
+        assert!(action.is_some(), "포커스 pane은 복사를 발행한다");
+        assert!(
+            state.selection_start.is_some(),
+            "선택은 복사 후에도 유지된다"
+        );
+        assert_eq!(
+            canvas.extract_selected_text(
+                state.selection_start.expect("선택 시작"),
+                state.selection_end.expect("선택 끝"),
+            ),
+            "line 1",
+            "발행되는 텍스트는 이 canvas의 줄에서 나온다"
+        );
+    }
+
+    /// 회귀 방지: 선택을 시작한 클릭의 `PaneClicked`는 다음 view에서야 포커스에 반영된다.
+    /// 드래그 중에 비포커스라는 이유로 선택을 지우면 드래그가 시작되자마자 죽는다.
+    #[test]
+    fn active_drag_survives_focus_lag() {
+        let (mut canvas, id) = canvas_with_lines(5, false);
+        canvas.is_focused = false;
+        let mut state = ready_state(id);
+        select_first_line(&mut state);
+        state.is_selecting = true;
+
+        let moved = Event::Mouse(mouse::Event::CursorMoved {
+            position: Point::new(120.0, 40.0),
+        });
+        let _ = canvas.update(&mut state, &moved, test_bounds(), cursor_inside());
+
+        assert!(state.selection_start.is_some(), "드래그 중 선택은 유지된다");
+        assert!(state.is_selecting, "드래그 상태도 유지된다");
+    }
+
+    /// 회귀 방지: State는 세션이 아니라 위젯 슬롯에 붙어 살아남는다(워크스페이스 탭 전환 =
+    /// 같은 슬롯에 다른 세션). 이전 세션의 line_idx를 물려받으면 드래그한 적 없는 내용이
+    /// 강조·복사된다.
+    #[test]
+    fn session_swap_drops_previous_selection() {
+        let (canvas, _) = canvas_with_lines(5, false);
+        let mut state = ready_state(Uuid::new_v4());
+        select_first_line(&mut state);
+
+        let redraw = Event::Window(window::Event::RedrawRequested(std::time::Instant::now()));
+        let _ = canvas.update(&mut state, &redraw, test_bounds(), cursor_inside());
+
+        assert_eq!(state.selection_start, None, "이전 세션 선택은 버린다");
+        assert_eq!(state.selection_end, None);
+    }
+
+    /// 회귀 방지: 앞 줄 evict로 `line_idx`가 밀리면 같은 선택이 다른 줄을 가리킨다. offset
+    /// 보정(②)과 동일하게 선택도 evict된 줄 수만큼 당겨야 한다.
+    #[test]
+    fn eviction_shifts_selection_like_offset() {
+        let mc = test_max_chars();
+        let sid = Uuid::new_v4();
+        let mut state = ScrollState::default();
+
+        let before = canvas_with_ids(varied_texts(0..5), 0, 1, sid);
+        before.rebuild_wrap_cache_if_needed(&mut state, mc);
+        state.selection_start = Some(TextPosition {
+            line_idx: 3,
+            char_idx: 2,
+        });
+        state.selection_end = Some(TextPosition {
+            line_idx: 4,
+            char_idx: 5,
+        });
+
+        // id 0,1 evict + id 5,6 append.
+        let after = canvas_with_ids(varied_texts(2..7), 2, 2, sid);
+        after.rebuild_wrap_cache_if_needed(&mut state, mc);
+
+        assert_eq!(
+            state.selection_start,
+            Some(TextPosition {
+                line_idx: 1,
+                char_idx: 2
+            })
+        );
+        assert_eq!(
+            state.selection_end,
+            Some(TextPosition {
+                line_idx: 2,
+                char_idx: 5
+            })
+        );
+    }
+
+    /// 회귀 방지: 필터를 켜면 표시 줄이 매치 부분집합으로 바뀐다 — 같은 `line_idx`가 다른
+    /// 줄을 가리키므로 선택은 무효다.
+    #[test]
+    fn filter_toggle_drops_selection() {
+        let mc = test_max_chars();
+        let sid = Uuid::new_v4();
+        let mut state = ScrollState::default();
+
+        let plain = canvas_with_ids(varied_texts(0..5), 0, 1, sid);
+        plain.rebuild_wrap_cache_if_needed(&mut state, mc);
+        select_first_line(&mut state);
+
+        let mut filtered = canvas_with_ids(varied_texts(0..2), 0, 2, sid);
+        filtered.render_key.filter = true;
+        filtered.rebuild_wrap_cache_if_needed(&mut state, mc);
+
+        assert_eq!(state.selection_start, None, "줄 집합이 바뀌면 선택은 무효");
+        assert_eq!(state.selection_end, None);
+    }
+
+    /// 회귀 방지: `clear_output`으로 줄이 사라져도 선택은 남아 있었다. 버퍼가 다시 차면 같은
+    /// `line_idx`가 새 내용을 가리킨다. 비운 직후(빈 버퍼)와, 비운 뒤 이전보다 많이 다시 찬
+    /// 경우(line_id는 리셋되지 않고 이어진다) 모두 버려야 한다.
+    #[test]
+    fn output_clear_drops_selection() {
+        let mc = test_max_chars();
+        let sid = Uuid::new_v4();
+
+        for refilled in [Vec::new(), varied_texts(5..12)] {
+            let mut state = ScrollState::default();
+            let filled = canvas_with_ids(varied_texts(0..5), 0, 1, sid);
+            filled.rebuild_wrap_cache_if_needed(&mut state, mc);
+            select_first_line(&mut state);
+
+            let after_clear = canvas_with_ids(refilled, 5, 2, sid);
+            after_clear.rebuild_wrap_cache_if_needed(&mut state, mc);
+
+            assert_eq!(state.selection_start, None);
+            assert_eq!(state.selection_end, None);
+        }
+    }
+
+    /// 회귀 방지: 가로폭만 바뀐 재생성은 줄 집합이 그대로다(래핑 행 수만 달라진다) —
+    /// 선택을 함께 버리면 창 크기를 조금만 바꿔도 드래그가 사라진다.
+    #[test]
+    fn resize_only_rebuild_preserves_selection() {
+        let sid = Uuid::new_v4();
+        let mut state = ScrollState::default();
+        let canvas = canvas_with_ids(varied_texts(0..5), 0, 1, sid);
+        canvas.rebuild_wrap_cache_if_needed(&mut state, test_max_chars());
+        select_first_line(&mut state);
+        let selection = (state.selection_start, state.selection_end);
+
+        canvas.rebuild_wrap_cache_if_needed(&mut state, test_max_chars() / 2);
+
+        assert_eq!((state.selection_start, state.selection_end), selection);
+    }
+
+    /// 회귀 방지: 선택 구간이 통째로 evict되면 0으로 clamp하지 말고 버려야 한다 — clamp하면
+    /// 드래그한 적 없는 맨 윗줄이 유령 선택으로 남아 그대로 복사된다.
+    #[test]
+    fn full_eviction_drops_selection() {
+        let mc = test_max_chars();
+        let sid = Uuid::new_v4();
+        let mut state = ScrollState::default();
+
+        let before = canvas_with_ids(varied_texts(0..5), 0, 1, sid);
+        before.rebuild_wrap_cache_if_needed(&mut state, mc);
+        select_first_line(&mut state);
+
+        // id 0..2 evict — 선택(줄 1)이 통째로 사라진다.
+        let after = canvas_with_ids(varied_texts(3..8), 3, 2, sid);
+        after.rebuild_wrap_cache_if_needed(&mut state, mc);
+
+        assert_eq!(state.selection_start, None);
+        assert_eq!(state.selection_end, None);
+    }
+
+    /// 회귀 방지: 창이 포커스를 잃으면 버튼 뗌 이벤트가 오지 않을 수 있다. 드래그 플래그가
+    /// 걸린 채 남으면 이후 마우스 이동이 선택 끝을 계속 끌고 다녀 드래그한 적 없는 범위가
+    /// 복사된다.
+    #[test]
+    fn window_unfocus_ends_stuck_drag() {
+        let (canvas, id) = canvas_with_lines(5, false);
+        let mut state = ready_state(id);
+        select_first_line(&mut state);
+        state.is_selecting = true;
+
+        let unfocused = Event::Window(window::Event::Unfocused);
+        let _ = canvas.update(&mut state, &unfocused, test_bounds(), cursor_inside());
+
+        assert!(!state.is_selecting, "드래그 플래그는 해제된다");
+        assert!(
+            state.selection_start.is_some(),
+            "확정된 선택 자체는 유지된다"
+        );
     }
 }
 
