@@ -28,6 +28,15 @@ flate2 = "1"
 tar = "0.4"
 minisign-verify = "0.2"
 portable-pty = "0.9"
+# 로컬 MCP 서버(POST /mcp, JSON-RPC). 네 크레이트 모두 이미 reqwest 경유로 의존성
+# 그래프에 있어, 직접 선언은 대체로 피처만 켠다 — 새로 들어오는 건 hyper의 `server`
+# 피처가 끌어오는 httpdate(순수 Rust, Date 헤더 포맷) 하나뿐이라 위의 "순수 Rust ·
+# 시스템 의존성 없음" 정책과 3-OS 릴리스 빌드 전제가 그대로 유지된다.
+# SSE·resumability를 제공하지 않으므로 http1 + server 피처만으로 충분하다.
+hyper = { version = "1", default-features = false, features = ["server", "http1"] }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
+http-body-util = "0.1"
+bytes = "1"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

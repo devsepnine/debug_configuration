@@ -78,6 +78,15 @@ fn line_text(segments: &[TextSegment]) -> String {
     segments.iter().map(|seg| seg.text.as_str()).collect()
 }
 
+/// 세션 검색용 정규식 컴파일. 검색 경로가 네 곳(전체 재스캔·증분 갱신·검색바 유효성 표시·
+/// MCP 인자 검증)으로 갈라져 있어 컴파일 설정을 각자 세우면 한쪽이 받아준 패턴을 다른 쪽이
+/// 거부한다. 그 거부는 `search_matches`에서 빈 결과로 나와 "매치 없음"과 구별되지 않는다.
+pub fn compile_search_regex(pattern: &str) -> Result<regex::Regex, regex::Error> {
+    regex::RegexBuilder::new(pattern)
+        .case_insensitive(true)
+        .build()
+}
+
 /// 한 라인에 대한 정규식 매치를 char 인덱스 범위로 `out`에 추가한다. 빈 매치는
 /// 강조 대상이 아니라 제외하고, 정규식의 byte offset은 char 인덱스로 변환한다.
 /// (전체 재스캔과 증분 갱신이 공유하는 단일 구현 — 결과 등가성의 근거.)
@@ -425,10 +434,7 @@ impl RunSession {
         } else if regex {
             // 잘못된 패턴은 전체 스캔과 동일하게 "매치 없음" (쿼리/모드 변경은 항상
             // 전체 refresh를 타므로 여기 도달 시 캐시도 이미 그 상태다).
-            if let Ok(re) = regex::RegexBuilder::new(&query)
-                .case_insensitive(true)
-                .build()
-            {
+            if let Ok(re) = compile_search_regex(&query) {
                 for (offset, (_, segments)) in
                     self.output_lines.iter().skip(rescan_from).enumerate()
                 {
@@ -456,12 +462,11 @@ impl RunSession {
         }
     }
 
-    /// 검색어에 매치하는 `output_lines`의 위치 인덱스 목록. `regex`면 대소문자 무시
-    /// 정규식(잘못된 패턴은 매치 없음으로 처리), 아니면 대소문자 무시 부분일치.
-    /// 빈 검색어면 빈 목록. FIFO 제거로 인덱스가 변할 수 있어 매번 즉석 계산한다.
-    /// 모든 매치를 (라인, char 범위)로 계산한다. 한 라인에 매치가 여러 개면 각각 별도
-    /// 항목으로 수집된다. 위치는 char 인덱스(디스플레이 폭 아님)이며, 뷰가 wrap·wide char를
-    /// 고려해 픽셀로 변환한다.
+    /// 검색어에 매치하는 모든 위치를 (라인 인덱스, char 범위)로 계산한다. 한 라인에 매치가
+    /// 여러 개면 각각 별도 항목이다. `regex`면 대소문자 무시 정규식, 아니면 대소문자 무시
+    /// 부분일치이며, 빈 검색어와 컴파일 실패는 둘 다 빈 목록이다. FIFO 제거로 라인 인덱스가
+    /// 바뀌므로 캐시하지 않고 매번 즉석 계산한다. 위치는 char 인덱스(디스플레이 폭 아님)이며,
+    /// 뷰가 wrap·wide char를 고려해 픽셀로 변환한다.
     pub fn search_matches(&self, query: &str, regex: bool) -> Vec<SearchMatch> {
         if query.is_empty() {
             return Vec::new();
@@ -470,11 +475,10 @@ impl RunSession {
         let mut out = Vec::new();
 
         if regex {
-            // 잘못된 패턴은 빈 결과(패닉/크래시 방지). 컴파일은 refresh 시점에만 일어난다.
-            let Ok(re) = regex::RegexBuilder::new(query)
-                .case_insensitive(true)
-                .build()
-            else {
+            // GUI 검색바는 타이핑 중인 `[`를 정상 상태로 취급해야 하므로 잘못된 패턴을
+            // 빈 결과로 흘린다. 이 관용을 감당할 수 없는 호출자는 먼저 컴파일해 봐야 한다
+            // (MCP의 `validate_regex`).
+            let Ok(re) = compile_search_regex(query) else {
                 return Vec::new();
             };
             for (line_idx, (_, segments)) in self.output_lines.iter().enumerate() {

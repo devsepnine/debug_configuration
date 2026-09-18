@@ -5,9 +5,10 @@ use crate::models::{
     SessionStatusKind, WorkspaceTab,
 };
 use crate::services::{
-    AppSettings, UpdateOutcome, check_latest_release, export_text, force_kill_process_tree,
-    load_or_migrate_store, load_settings, register_running_pid, run_configuration_stream,
-    save_settings, save_to_store, terminate_session_process, unregister_running_pid,
+    AppSettings, McpPermission, UpdateOutcome, check_latest_release, export_text,
+    force_kill_process_tree, load_or_migrate_store, load_settings, mask_token, mcp_server,
+    register_running_pid, run_configuration_stream, save_settings, save_to_store,
+    terminate_session_process, unregister_running_pid,
 };
 use crate::utils::{DIALOG_CANCELLED, ICON_DELETE, ICON_PLAY, ICON_REFRESH, ICON_STOP};
 use crate::views::shared::icon_tooltip;
@@ -42,6 +43,7 @@ mod confirm_update_modal;
 mod env_modal;
 mod export_modal;
 mod import_modal;
+mod mcp;
 mod settings_modal;
 
 use confirm_delete_modal::ConfirmDeleteModalState;
@@ -49,6 +51,7 @@ use confirm_update_modal::ConfirmUpdateModalState;
 use env_modal::EnvModalState;
 use export_modal::ExportModalState;
 use import_modal::ImportModalState;
+pub use mcp::McpServerStatus;
 use settings_modal::SettingsModalState;
 
 use chrome::{
@@ -424,6 +427,18 @@ pub struct RunConfigManager {
     default_auto_scroll: bool,
     /// 설정: 앱 시작 시 업데이트 자동 확인
     auto_check_updates: bool,
+    /// 설정: 로컬 MCP 서버 활성화 (기본 off — 리스너는 사용자가 켤 때만 뜬다)
+    mcp_enabled: bool,
+    /// 설정: MCP 서버 리스닝 포트
+    mcp_port: u16,
+    /// 설정: MCP 클라이언트에 허용할 권한 단계
+    mcp_permission: McpPermission,
+    /// 설정: MCP 응답에 환경변수 **값**을 실을지 여부 (기본 off — 값은 마스킹)
+    mcp_expose_env_values: bool,
+    /// MCP Bearer 토큰. 서버를 처음 켤 때 `~/.run_config_mcp_token`에서 로드/생성한다
+    mcp_token: Option<String>,
+    /// MCP 리스너 상태 (설정 모달 표시용)
+    mcp_status: McpServerStatus,
     file_dialog: FileDialogState,
 
     /// Node package script 캐시 (`config_id` 기준)
@@ -518,7 +533,7 @@ impl RunConfigManager {
         let configuration_split_ratio = settings.configuration_split_ratio.unwrap_or(0.30);
         let auto_check_updates = settings.auto_check_updates;
 
-        let app = Self {
+        let mut app = Self {
             current_view: ViewMode::Configuration,
             configurations: vec![],
             selected_config_index: None,
@@ -534,6 +549,12 @@ impl RunConfigManager {
             max_output_lines: settings.max_output_lines,
             default_auto_scroll: settings.default_auto_scroll,
             auto_check_updates,
+            mcp_enabled: settings.mcp_enabled,
+            mcp_port: settings.mcp_port,
+            mcp_permission: settings.mcp_permission,
+            mcp_expose_env_values: settings.mcp_expose_env_values,
+            mcp_token: None,
+            mcp_status: McpServerStatus::default(),
             file_dialog: FileDialogState::default(),
             node_available_scripts: HashMap::new(),
             node_ui: NodeUiState::default(),
@@ -617,6 +638,11 @@ impl RunConfigManager {
             .discard(),
         );
 
+        // 5. MCP 토큰 로드 (설정이 켜진 경우만). 토큰이 도착하면 subscription이 리스너를 띄운다.
+        if app.mcp_enabled {
+            tasks.push(app.mcp_token_task());
+        }
+
         (app, Task::batch(tasks))
     }
 
@@ -657,6 +683,21 @@ impl RunConfigManager {
             Message::SettingsToggleAutoCheckUpdates(value) => {
                 self.handle_settings_toggle_auto_check_updates(value)
             }
+            Message::SettingsToggleMcpEnabled(value) => {
+                self.handle_settings_toggle_mcp_enabled(value)
+            }
+            Message::SettingsMcpPortChanged(text) => self.handle_settings_mcp_port_changed(text),
+            Message::SettingsMcpPermissionChanged(permission) => {
+                self.handle_settings_mcp_permission_changed(permission)
+            }
+            Message::SettingsToggleMcpExposeEnv(value) => {
+                self.handle_settings_toggle_mcp_expose_env(value)
+            }
+            Message::SettingsCopyMcpToken => self.handle_settings_copy_mcp_token(),
+            Message::SettingsCopyMcpCommand => self.handle_settings_copy_mcp_command(),
+            Message::SettingsRegenerateMcpToken => self.handle_settings_regenerate_mcp_token(),
+            Message::McpTokenLoaded(result) => self.handle_mcp_token_loaded(result),
+            Message::Mcp(event) => self.handle_mcp_event(event),
             Message::OpenExportModal => self.handle_open_export_modal(),
             Message::ConfirmExportModal => self.handle_confirm_export_modal(),
             Message::CancelExportModal => self.handle_cancel_export_modal(),
@@ -1262,6 +1303,10 @@ impl RunConfigManager {
             max_output_lines: self.max_output_lines,
             default_auto_scroll: self.default_auto_scroll,
             auto_check_updates: self.auto_check_updates,
+            mcp_enabled: self.mcp_enabled,
+            mcp_port: self.mcp_port,
+            mcp_permission: self.mcp_permission,
+            mcp_expose_env_values: self.mcp_expose_env_values,
             window_size: Some((self.window_size.width, self.window_size.height)),
             window_position: Some((self.window_pos.x, self.window_pos.y)),
         });
@@ -5297,9 +5342,18 @@ impl RunConfigManager {
             Subscription::none()
         };
 
+        // `McpServerConfig`가 subscription 정체성이므로 포트·토큰이 바뀌면 iced가 낡은
+        // 스트림을 drop해 리스너가 닫히고 새 설정으로 다시 뜬다.
+        let mcp_subscription = match self.mcp_listener_config() {
+            Some(config) => Subscription::run_with(config, |config| mcp_server(config.clone()))
+                .map(Message::Mcp),
+            None => Subscription::none(),
+        };
+
         Subscription::batch([
             cursor_subscription,
             configuration_release_subscription,
+            mcp_subscription,
             editor_focus_subscription,
             env_modal_keyboard_subscription,
             settings_modal_keyboard_subscription,
@@ -5372,6 +5426,13 @@ impl RunConfigManager {
                 max_output_lines_text: &modal.max_output_lines_text,
                 default_auto_scroll: modal.default_auto_scroll,
                 auto_check_updates: modal.auto_check_updates,
+                mcp_enabled: modal.mcp_enabled,
+                mcp_port_text: &modal.mcp_port_text,
+                mcp_permission: modal.mcp_permission,
+                mcp_expose_env_values: modal.mcp_expose_env_values,
+                mcp_masked_token: self.mcp_token.as_deref().map(mask_token),
+                mcp_add_command: self.mcp_add_command(false),
+                mcp_status: self.mcp_status.label(),
             };
             layers = layers.push(view_settings_modal(props));
         }

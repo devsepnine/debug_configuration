@@ -1,4 +1,5 @@
 use crate::models::RunConfiguration;
+use crate::services::mcp::McpPermission;
 use crate::utils::DIALOG_CANCELLED;
 use rfd::AsyncFileDialog;
 use serde::{Deserialize, Serialize};
@@ -34,6 +35,19 @@ pub struct AppSettings {
     /// 마지막 창 좌상단 위치 `(x, y)` (logical px). 멀티 모니터에서 음수 좌표도 유효하다.
     #[serde(default)]
     pub window_position: Option<(f32, f32)>,
+    /// 설정: 로컬 MCP 서버를 띄울지 여부. 기본 off — 리스너는 사용자가 명시적으로 켤 때만
+    /// 열린다(임의 명령 실행 권한까지 열 수 있는 표면이므로 opt-in).
+    #[serde(default)]
+    pub mcp_enabled: bool,
+    /// 설정: MCP 서버 리스닝 포트 (`127.0.0.1` 고정)
+    #[serde(default = "default_mcp_port")]
+    pub mcp_port: u16,
+    /// 설정: MCP 클라이언트에 허용할 권한 단계
+    #[serde(default)]
+    pub mcp_permission: McpPermission,
+    /// 설정: MCP 응답에 환경변수 **값**을 실을지 여부. 기본 off(키만 노출).
+    #[serde(default)]
+    pub mcp_expose_env_values: bool,
 }
 
 /// serde 기본값 헬퍼: bool 필드의 기본은 `true` (켜짐). `#[derive(Default)]`의
@@ -47,6 +61,11 @@ fn default_max_output_lines() -> usize {
     crate::models::DEFAULT_MAX_OUTPUT_LINES
 }
 
+/// serde 기본값 헬퍼: MCP 포트 기본값 (서버 모듈과 단일 출처 공유).
+fn default_mcp_port() -> u16 {
+    crate::services::mcp::DEFAULT_PORT
+}
+
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
@@ -58,6 +77,10 @@ impl Default for AppSettings {
             auto_check_updates: true,
             window_size: None,
             window_position: None,
+            mcp_enabled: false,
+            mcp_port: default_mcp_port(),
+            mcp_permission: McpPermission::default(),
+            mcp_expose_env_values: false,
         }
     }
 }
@@ -440,6 +463,30 @@ mod tests {
         assert!(settings.auto_check_updates);
         assert!(settings.window_size.is_none());
         assert!(settings.window_position.is_none());
+        // MCP는 기본 off + 읽기 전용으로 로드되어야 한다 — 구버전 설정 파일을 쓰는
+        // 사용자가 업그레이드만으로 리스너나 편집 권한을 얻어선 안 된다.
+        assert!(!settings.mcp_enabled);
+        assert_eq!(settings.mcp_permission, McpPermission::ReadOnly);
+        assert!(!settings.mcp_expose_env_values);
+        assert_eq!(settings.mcp_port, crate::services::mcp::DEFAULT_PORT);
+    }
+
+    #[test]
+    fn app_settings_mcp_fields_round_trip() {
+        let settings = AppSettings {
+            mcp_enabled: true,
+            mcp_port: 51000,
+            mcp_permission: McpPermission::Edit,
+            mcp_expose_env_values: true,
+            ..AppSettings::default()
+        };
+        let json = serde_json::to_string(&settings).unwrap();
+        let back: AppSettings = serde_json::from_str(&json).unwrap();
+
+        assert!(back.mcp_enabled);
+        assert_eq!(back.mcp_port, 51000);
+        assert_eq!(back.mcp_permission, McpPermission::Edit);
+        assert!(back.mcp_expose_env_values);
     }
 
     #[test]
