@@ -403,12 +403,13 @@ static TOOLS: &[ToolSpec] = &[
                     "working_directory": {
                         "type": "string",
                         "maxLength": MAX_PATH_CHARS,
-                        "description": "Directory the program runs in. Existence is not \
-                                        checked, but an empty value is refused: it is handed to the \
-                                        process as its working directory and the spawn then fails. \
-                                        Two types ignore it — Compound runs each member in the \
-                                        member's own directory, and Node takes this from its \
-                                        project_directory — so for those it may be an empty string.",
+                        "description": "Directory the program runs in. Creating it does not check \
+                                        that the path exists; a run does, and fails before spawning \
+                                        if it is not a directory. An empty value is refused here \
+                                        because no run could use it. Two types ignore it — Compound \
+                                        runs each member in the member's own directory, and Node \
+                                        takes this from its project_directory — so for those it may \
+                                        be an empty string.",
                     },
                     "environment_variables": env_map_schema(),
                     "type_data": type_data_schema(),
@@ -460,9 +461,11 @@ static TOOLS: &[ToolSpec] = &[
                     "working_directory": {
                         "type": "string",
                         "maxLength": MAX_PATH_CHARS,
-                        "description": "New working directory. Existence is not checked. Empty is \
-                                        refused unless the resulting type ignores it (Compound, or \
-                                        Node, which derives it from project_directory).",
+                        "description": "New working directory. Saving it does not check that it \
+                                        exists; a run does, and fails before spawning if it is not \
+                                        a directory. Empty is refused unless the resulting type \
+                                        ignores it (Compound, or Node, which derives it from \
+                                        project_directory).",
                     },
                     "type_data": type_data_schema(),
                     "set_environment_variables": env_map_schema(),
@@ -967,9 +970,10 @@ fn require_length(key: &str, value: &str, limit: usize) -> Result<(), JsonRpcErr
 /// Node: 값을 이 필드에서 받지 않고 `project_directory`에서 파생시킨다
 /// (`derive_node_working_directory`) — 무엇을 실어도 덮이므로 요구하지 않는다.
 ///
-/// 나머지 타입에서 빈 값을 막는 것은 그것이 프로세스의 cwd이기 때문이다
-/// (`cmd.current_dir(&config.working_directory)`). 결과 타입이 이 패치만으로 결정되지 않는
-/// update 경로는 앱 계층이 같은 불변식을 다시 본다(`check_working_directory`).
+/// 나머지 타입에서 빈 값을 막는 것은 그것이 프로세스의 cwd이기 때문이다 — 빈 값으로는 어느
+/// 스폰 경로도 설정된 디렉터리에서 돌 수 없고, 실행 시점의 판정은
+/// `verify_working_directory`에 있다. 결과 타입이 이 패치만으로 결정되지 않는 update 경로는
+/// 앱 계층이 같은 불변식을 다시 본다(`check_working_directory`).
 fn require_working_directory(value: &str, type_data: &ConfigTypeData) -> Result<(), JsonRpcError> {
     if matches!(
         type_data,

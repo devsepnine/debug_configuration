@@ -1303,7 +1303,8 @@ fn find_configuration<'a>(
 
 /// 결과 상태의 작업 디렉터리 불변식. 파서는 `type_data`를 함께 싣지 않은 패치에서 결과 타입을
 /// 알 수 없으므로(`require_working_directory`), 최종 타입과 최종 디렉터리를 함께 아는 자리는
-/// 여기뿐이다. 빈 값은 그대로 프로세스의 cwd로 넘어가고 `chdir("")`는 `ENOENT`다.
+/// 여기뿐이다. 빈 값으로는 설정된 디렉터리에서 돌 수 없다 — 비-PTY 폴백은 `ENOENT`로 실패하고,
+/// 기본 PTY 경로는 그 값을 버리고 `$HOME`으로 접었다(그래서 스폰 전 `verify_working_directory`).
 ///
 /// Node에서 보는 것이 `project_directory`인 이유는 `derive_node_working_directory`가 싣는다.
 fn check_working_directory(
@@ -3729,7 +3730,9 @@ mod tests {
     #[test]
     fn a_node_configuration_needs_a_project_directory() {
         // Node의 cwd는 이 필드에서 파생되므로, 빈 값을 받아 주면 빈 cwd가 필드만 옮겨 그대로
-        // 남는다 — `chdir("")`는 `ENOENT`이고 실패는 호출자가 아니라 사용자에게 돌아간다.
+        // 남는다 — 그 값으로는 어느 스폰 경로도 설정된 디렉터리에서 돌 수 없고
+        // (`verify_working_directory`), 쓰기 경계에서 막지 않으면 그 실패가 호출자가 아니라
+        // 사용자에게 돌아간다.
         let mut app = app_at_edit_tier();
         let op = McpOp::CreateConfiguration(Box::new(CreateConfigurationArgs {
             type_data: node_type_data("   "),

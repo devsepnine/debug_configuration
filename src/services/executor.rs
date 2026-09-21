@@ -6,6 +6,7 @@ use crate::models::{
 use iced::stream;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
+use std::path::Path;
 use std::sync::{
     Arc, LazyLock, Mutex,
     atomic::{AtomicBool, Ordering},
@@ -515,6 +516,23 @@ impl Drop for CompletionGuard {
     }
 }
 
+/// 스폰 전에 작업 디렉터리를 확인한다.
+///
+/// PTY 경로는 이 검사를 대신해 주지 않는다 — `portable_pty::CommandBuilder::cwd`는 값이
+/// 디렉터리가 아니면 **버리고** `$HOME`으로 접으므로, 없는 경로로 실행하면 프로세스가 사용자의
+/// 홈에서 돌고 세션은 그 명령이 거기서 낸 결과를 보고한다. 배너가 설정된 경로를 단언하고 있어
+/// 어디서 돌았는지가 감춰진다: `rm -rf build`처럼 상대 경로를 쓰는 명령이 의도한 프로젝트 밖에서
+/// 돈다. 비-PTY 폴백은 `Command::current_dir`가 `ENOENT`로 실패하므로 두 경로가 갈려 있었다.
+fn verify_working_directory(directory: &str) -> Result<(), String> {
+    if Path::new(directory).is_dir() {
+        return Ok(());
+    }
+
+    Err(format!(
+        "Working directory does not exist or is not a directory: {directory}"
+    ))
+}
+
 pub fn run_configuration_stream(
     config: RunConfiguration,
     session_id: Uuid,
@@ -541,6 +559,15 @@ pub fn run_configuration_stream(
                 show_env,
             )
             .await;
+
+            // 배너가 단언한 디렉터리에서 실제로 돌 수 없으면 여기서 세운다(사유는
+            // `verify_working_directory`). 배너 뒤에 두는 것은 어느 경로가 틀렸는지를 사용자와
+            // 호출자가 함께 보게 하기 위한 것이다.
+            if let Err(reason) = verify_working_directory(&config.working_directory) {
+                send_run_result(&mut output, session_id, Err(RunFailure::Failed(reason))).await;
+                completion.disarm();
+                return;
+            }
 
             // 기본 경로: PTY(unix)/ConPTY(Windows 10 1809+) — 진짜 터미널로 색·진행바·
             // 프롬프트가 살아난다. PtyUnavailable(unix: openpty 실패, windows: ConPTY
@@ -2459,6 +2486,95 @@ fn resolve_java_executable(jdk_path: Option<&String>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- 작업 디렉터리 선행 검사 ----
+
+    /// 순수 술어가 아니라 **배선**을 잰다 — 검사가 `run_configuration_stream`에서 빠지면 세 스폰
+    /// 경로가 그대로 돌아가고, `CommandBuilder::cwd`가 없는 디렉터리를 버리고 `$HOME`으로 접으므로
+    /// 배너가 단언한 경로와 프로세스의 실제 cwd가 갈린 채 세션이 그 명령의 결과로 끝난다.
+    ///
+    /// 없는 디렉터리에서는 스폰이 일어나지 않으므로 이 테스트는 프로세스도 파일도 만들지 않는다.
+    /// 없는 경로는 UUID로 만들어 머신 상태와 무관하게 없다.
+    #[tokio::test]
+    async fn a_run_in_a_missing_directory_fails_before_spawning() {
+        use iced::futures::StreamExt;
+
+        let missing = std::env::temp_dir().join(format!("run-config-absent-{}", Uuid::new_v4()));
+        let config = RunConfiguration {
+            working_directory: missing.to_string_lossy().into_owned(),
+            ..RunConfiguration::default()
+        };
+        let session_id = Uuid::new_v4();
+
+        let messages: Vec<Message> = run_configuration_stream(
+            config,
+            session_id,
+            Arc::new(AtomicBool::new(false)),
+            false,
+            None,
+        )
+        .collect()
+        .await;
+
+        assert!(
+            !messages
+                .iter()
+                .any(|message| matches!(message, Message::ProcessStarted(..))),
+            "스폰이 일어났다: {messages:?}"
+        );
+
+        // 배너보다 **뒤**라는 순서도 계약이다 — 어느 경로가 틀렸는지를 사용자와 호출자가 함께
+        // 보는 것이 그 순서의 목적이므로, 단정하지 않으면 가드를 배너 앞으로 옮겨도 스위트가
+        // 초록인 채 그 목적만 사라진다.
+        let banner = messages
+            .iter()
+            .position(|message| matches!(message, Message::OutputReceived(..)))
+            .expect("배너가 먼저 나가야 한다");
+        let completed: Vec<usize> = messages
+            .iter()
+            .enumerate()
+            .filter(|(_, message)| matches!(message, Message::RunCompleted(..)))
+            .map(|(at, _)| at)
+            .collect();
+
+        // 완료가 **정확히 하나**여야 `completion.disarm()`이 고정된다 — 빼먹으면 가드가
+        // `CompletionGuard`의 Drop 보고를 뒤에 하나 더 붙인다.
+        assert_eq!(
+            completed.len(),
+            1,
+            "완료 메시지가 하나여야 한다: {messages:?}"
+        );
+        assert!(banner < completed[0], "배너가 완료보다 앞이어야 한다");
+
+        match &messages[completed[0]] {
+            Message::RunCompleted(_, Err(RunFailure::Failed(reason))) => {
+                assert!(reason.contains("Working directory"), "{reason}");
+            }
+            other => panic!("실패로 끝나야 한다: {other:?}"),
+        }
+    }
+
+    /// 두 입력은 머신 상태에 의존하지 않도록 골랐다 — 임시 디렉터리는 존재하고, UUID를 붙인
+    /// 하위 경로는 존재하지 않는다.
+    #[test]
+    fn a_missing_working_directory_fails_the_check() {
+        let existing = std::env::temp_dir();
+        let missing = existing.join(format!("run-config-absent-{}", Uuid::new_v4()));
+        let missing = missing.to_string_lossy().to_string();
+
+        assert!(verify_working_directory(&existing.to_string_lossy()).is_ok());
+
+        let reason =
+            verify_working_directory(&missing).expect_err("없는 디렉터리는 스폰 전에 걸러야 한다");
+        assert!(reason.contains(&missing), "{reason}");
+    }
+
+    /// 빈 값도 같은 검사에 걸린다. `CommandBuilder::cwd`의 필터는 빈 문자열도 버리므로 빈 값의
+    /// 실제 동작은 없는 디렉터리와 같았다 — 비-PTY 경로만 `ENOENT`로 실패했다.
+    #[test]
+    fn an_empty_working_directory_is_refused() {
+        assert!(verify_working_directory("").is_err());
+    }
 
     // ---- LineAssembler: CR/LF 조립 매트릭스 ----
 

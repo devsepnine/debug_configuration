@@ -41,7 +41,7 @@ pub enum StdinWriteError {
 pub enum RunFailure {
     /// 사용자 또는 stop 툴이 멈췄다.
     StoppedByUser,
-    /// 스폰 실패, 대기 실패, 예기치 않은 중단.
+    /// 스폰 전 거절(작업 디렉터리 부재), 스폰 실패, 대기 실패, 예기치 않은 중단.
     Failed(String),
 }
 
