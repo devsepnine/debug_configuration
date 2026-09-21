@@ -553,9 +553,11 @@ fn request_id_schema(description: &str) -> Value {
 /// 거절된다. 대신 `type` 목록만 모델(`ConfigurationType::ALL`)에서 끌어오고, 나머지는
 /// `get_configuration`이 돌려준 형태를 그대로 쓰라고 설명에 싣는다.
 ///
-/// 느슨한 스키마가 검증을 느슨하게 만들지 않는 근거는 `ConfigTypeData`의 `deny_unknown_fields`
-/// 하나다 — 그것 없이는 여러 필드가 `#[serde(default)]`이므로 오타가 기본값으로 파싱된다.
-/// 스키마를 느슨하게 두는 판단은 그 속성에 매여 있다.
+/// 느슨한 스키마가 검증을 느슨하게 만들지 않는 근거는 `ConfigTypeData`와 그 안의 `ExecuteMode`
+/// ·`KotlinLaunchMode`에 걸린 `deny_unknown_fields`다 — 그것 없이는 여러 필드가
+/// `#[serde(default)]`이거나 `Option`이므로 오타가 기본값·`None`으로 파싱된다. 스키마를 느슨하게
+/// 두는 판단은 세 속성 전부에 매여 있다. 한 겹만 걸려 있던 동안 중첩 열거형의 오타가 저장된 값을
+/// 조용히 지웠다.
 fn type_data_schema() -> Value {
     let types: Vec<Value> = ConfigurationType::ALL
         .iter()
@@ -1927,6 +1929,50 @@ mod tests {
                 tool.name,
                 err.message
             );
+        }
+    }
+
+    /// D50의 엄격함은 `ConfigTypeData` 한 겹까지였다 — 중첩 열거형은 `tag`만 갖고 있어,
+    /// `Option` 필드 이름을 오타 내면 serde가 부재를 `None`으로 채워 저장돼 있던
+    /// `interpreter_path`가 성공 응답(`changed: true`)과 함께 디스크에서 사라졌다.
+    #[test]
+    fn a_typo_in_a_nested_mode_field_is_rejected_instead_of_erasing_the_stored_value() {
+        let cases = [
+            (
+                "interpreterPath",
+                json!({
+                    "type": "ShellScript",
+                    "execute_mode": {
+                        "mode": "ScriptFile",
+                        "script_path": "/tmp/burnin.sh",
+                        "script_options": "",
+                        "interpreterPath": "/bin/zsh",
+                    },
+                }),
+            ),
+            (
+                "jar_options",
+                json!({
+                    "type": "Kotlin",
+                    "vm_options": "",
+                    "program_arguments": "",
+                    "launch_mode": {
+                        "mode": "Jar",
+                        "jar_path": "/tmp/burnin.jar",
+                        "jar_options": "-verbose",
+                    },
+                }),
+            ),
+        ];
+
+        for (typo, type_data) in cases {
+            let args = json!({ "configuration": "target", "type_data": type_data });
+
+            let err = parse_call("update_configuration", &args)
+                .expect_err("중첩 열거형의 미지 필드도 거절돼야 한다");
+
+            assert_eq!(err.code, INVALID_PARAMS, "{typo}");
+            assert!(err.message.contains(typo), "{typo}: {}", err.message);
         }
     }
 

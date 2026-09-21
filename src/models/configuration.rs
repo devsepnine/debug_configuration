@@ -299,8 +299,12 @@ impl std::fmt::Display for ExecuteModeType {
 }
 
 /// Shell Script 실행 모드
+///
+/// `deny_unknown_fields`는 `ConfigTypeData`와 같은 이유로 필요하다(사유는 그쪽 doc). 한 겹
+/// 위에만 걸었을 때 `interpreter_path` 오타가 이 열거형에서 미지 필드로 무시되고 `Option`의
+/// 부재가 `None`으로 채워져, 저장돼 있던 인터프리터가 성공 응답과 함께 사라졌다.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(tag = "mode")]
+#[serde(tag = "mode", deny_unknown_fields)]
 pub enum ExecuteMode {
     /// 스크립트 파일로 실행
     ScriptFile {
@@ -357,8 +361,10 @@ impl std::fmt::Display for KotlinLaunchModeType {
 }
 
 /// Kotlin 실행 모드
+///
+/// `deny_unknown_fields`의 사유는 `ExecuteMode`와 같다.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(tag = "mode")]
+#[serde(tag = "mode", deny_unknown_fields)]
 pub enum KotlinLaunchMode {
     /// main class 실행 (`java -cp <classpath> <main_class>`)
     MainClass {
@@ -405,6 +411,9 @@ impl KotlinLaunchMode {
 /// 제약을 기록한다: 이 열거형의 필드를 **빼는** 변경은 옛 파일을, **더하는** 변경은 새 파일을 옛
 /// 앱이 읽을 수 없게 만든다. 그래서 두 방향 모두 `CURRENT_CONFIG_VERSION` +1을 요구하며(사유는
 /// 그쪽 doc), 빼는 쪽은 `migrate_config_file`에 변환 단계까지 필요하다(현재 단계는 0개다).
+///
+/// 같은 속성이 중첩 열거형 `ExecuteMode`·`KotlinLaunchMode`에도 걸려 있으므로 위 제약은 그
+/// 둘의 필드에도 그대로 적용된다 — 한 겹만 걸었을 때 그 안의 오타가 조용히 통과했다.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", deny_unknown_fields)]
 pub enum ConfigTypeData {
