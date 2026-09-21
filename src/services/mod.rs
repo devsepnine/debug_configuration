@@ -11,9 +11,10 @@ pub use executor::{
     write_session_stdin,
 };
 pub use mcp::{
-    MAX_SEARCH_MATCHES, McpEvent, McpOp, McpOutcome, McpPermission, McpRequest, McpServerConfig,
-    load_or_create_token, mask_token, regenerate_token, server as mcp_server,
-    tools_for as mcp_tools_for,
+    CreateConfigurationArgs, DedupLookup, DedupScope, DeleteConfigurationArgs, MAX_SEARCH_MATCHES,
+    MCP_DEDUP_MAX_ENTRIES, MCP_DEDUP_WINDOW, McpEvent, McpOp, McpOutcome, McpPermission,
+    McpRequest, McpRequestLog, McpServerConfig, UpdateConfigurationArgs, load_or_create_token,
+    mask_token, regenerate_token, server as mcp_server, tools_for as mcp_tools_for,
 };
 pub use self_update::{RelaunchPlan, cleanup_stale_update_artifacts, download_and_apply};
 pub use storage::{

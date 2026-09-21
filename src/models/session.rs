@@ -13,6 +13,10 @@ use uuid::Uuid;
 pub enum OutputEvent {
     /// 새 라인 추가 (확정된 라인, 또는 새로 열린 라이브 라인)
     Line(String),
+    /// 앱이 찍는 환경변수 배너 줄. `Line`과 갈라 두는 것은 어느 줄이 배너인지를 **찍는 쪽만**
+    /// 알기 때문이다 — MCP 읽기 경계가 텍스트 모양으로 되짚으면 프로그램이 스스로 찍은
+    /// `Environment: ...` 줄까지 가려 사용자 출력을 잃는다.
+    EnvBanner(String),
     /// 가장 최근에 추가된 라인의 내용 교체 (라이브 진행바 갱신)
     Replace(String),
 }
@@ -28,6 +32,19 @@ pub enum StdinWriteError {
     Broken(String),
 }
 
+/// 종료 코드를 남기지 못한 실행 종료의 사유.
+///
+/// 사용자 중지도 종료 코드가 없어 같은 경로로 보고되지만 실패가 아니다. 문자열 하나로
+/// 실어 보내면 두 경우가 구별되지 않아, 의도적인 Stop이 `Errored`로 굳는다 — 그래서
+/// 갈라지는 지점을 타입에 둔다.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunFailure {
+    /// 사용자 또는 stop 툴이 멈췄다.
+    StoppedByUser,
+    /// 스폰 실패, 대기 실패, 예기치 않은 중단.
+    Failed(String),
+}
+
 /// 세션의 현재 상태 (배지 표시용).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionStatusKind {
@@ -39,6 +56,10 @@ pub enum SessionStatusKind {
     Failed(i32),
     /// 사용자가 중지 (종료 코드 없음)
     Stopped,
+    /// 종료 코드를 남기지 못한 실패 — 프로세스가 아예 뜨지 못했거나 실행이 중단됐다.
+    /// `Stopped`와 나누는 이유는 이 둘이 합쳐지면 "시작 실패"와 "사용자가 멈춤"이
+    /// 배지에서도, MCP 응답에서도 똑같이 보이기 때문이다.
+    Errored,
 }
 
 /// 터미널 출력 버퍼의 최대 라인 수 (보관 상한). 이 제한을 초과하면 오래된 라인이 FIFO로
@@ -185,6 +206,9 @@ pub struct RunSession {
     pub output_lines: VecDeque<(usize, Vec<TextSegment>)>,
     /// 다음 라인에 할당할 ID (증가만 하여 제거되어도 키 안정성 보장)
     next_line_id: usize,
+    /// 앱이 찍은 환경변수 배너에 해당하는 줄 id. MCP 읽기 경계의 마스킹이 이 목록으로만
+    /// 대상을 고른다 — `add_env_banner_line` 참고.
+    env_banner_line_ids: Vec<usize>,
     /// 출력 콘텐츠 변경 카운터. 줄 추가/초기화 시 증가하며, 터미널 뷰의 가상화 wrap
     /// 캐시(per-line 래핑 행 수)를 언제 재생성할지 판단하는 키로 쓰인다. 콘텐츠가
     /// 안 바뀐 프레임에서는 값이 그대로라 캐시를 재사용한다.
@@ -196,6 +220,9 @@ pub struct RunSession {
     pub is_running: bool,
     /// 프로세스 종료 코드 (종료되지 않았으면 None)
     pub exit_code: Option<i32>,
+    /// 종료 코드 없이 끝난 실패의 사유. 스폰 실패와 실행 중단이 여기로 들어오며,
+    /// 이 값이 있으면 상태가 `Stopped`가 아니라 `Errored`가 된다.
+    pub run_error: Option<String>,
     /// 프로세스 종료 시각 (실행 중이면 None) — 소요 시간 계산용
     pub finished_at: Option<SystemTime>,
     /// 프로세스 취소를 위한 플래그 (멀티스레드 안전)
@@ -270,10 +297,12 @@ impl RunSession {
             started_at: SystemTime::now(),
             output_lines: VecDeque::new(),
             next_line_id: 0,
+            env_banner_line_ids: Vec::new(),
             content_version: 0,
             total_bytes: 0,
             is_running: true,
             exit_code: None,
+            run_error: None,
             finished_at: None,
             cancel_flag: Arc::new(AtomicBool::new(false)),
             scroll_progress: 1.0, // 기본값: 맨 아래
@@ -515,10 +544,28 @@ impl RunSession {
         self.content_version = self.content_version.wrapping_add(1);
     }
 
+    /// 환경변수 배너 줄을 추가하고 그 줄 id를 기록한다. MCP 읽기 경계는 이 기록으로만
+    /// 마스킹 대상을 판정하므로, 배너를 찍는 경로는 반드시 이쪽으로 들어와야 한다.
+    ///
+    /// 값이 개행을 담아 여러 줄로 나뉘어도 생긴 줄 전체를 기록한다 — 첫 줄만 기록하면
+    /// 나머지가 그대로 노출된다.
+    pub fn add_env_banner_line(&mut self, line: &str) {
+        let first_id = self.next_line_id;
+        self.add_output_line(line);
+        self.env_banner_line_ids.extend(first_id..self.next_line_id);
+    }
+
+    /// 이 줄이 앱이 찍은 환경변수 배너인지. 기록에는 지금 배너를 담고 있는 줄만 남는다 —
+    /// 축출된 줄은 `evict_over_budget`이, 내용이 교체된 줄은 `replace_last_line`이 놓는다.
+    pub fn is_env_banner_line(&self, line_id: usize) -> bool {
+        self.env_banner_line_ids.contains(&line_id)
+    }
+
     /// 실행 스트림 이벤트 1건 적용 (`Line`=추가, `Replace`=마지막 라인 교체).
     pub fn apply_output_event(&mut self, event: &OutputEvent) {
         match event {
             OutputEvent::Line(text) => self.add_output_line(text),
+            OutputEvent::EnvBanner(text) => self.add_env_banner_line(text),
             OutputEvent::Replace(text) => self.replace_last_line(text),
         }
     }
@@ -531,6 +578,11 @@ impl RunSession {
             self.add_output_line(line);
             return;
         };
+        // 교체된 내용은 더 이상 앱이 찍은 배너가 아니다 — id를 재사용하므로 기록도 함께 놓는다.
+        // 생산자는 배너를 `EnvBanner` 한 건으로만 내므로(`send_command_info`) 이 정리가 정상
+        // 마스킹을 지우지 않고, 판정이 "배너가 마지막 줄이 될 수 없다"는 executor 쪽 순서에
+        // 기대지 않게 된다.
+        self.env_banner_line_ids.retain(|id| *id != line_id);
         self.total_bytes = self
             .total_bytes
             .saturating_sub(segments_bytes(&old_segments));
@@ -571,6 +623,7 @@ impl RunSession {
     /// 줄 수/바이트 예산 초과분을 앞에서 제거(FIFO, O(1) per pop).
     /// 마지막 1줄은 유지 — worst-case 초과 폭은 MAX_OUTPUT_BYTES + 줄 상한(의도적 트레이드오프).
     fn evict_over_budget(&mut self) {
+        let before = self.output_lines.len();
         while self.output_lines.len() > self.max_output_lines
             || (self.total_bytes > MAX_OUTPUT_BYTES && self.output_lines.len() > 1)
         {
@@ -580,11 +633,24 @@ impl RunSession {
                 break;
             }
         }
+        if self.output_lines.len() == before || self.env_banner_line_ids.is_empty() {
+            return;
+        }
+        // 버려진 줄의 배너 기록도 함께 버린다 — 재실행이 출력을 지우지 않으므로 이 목록은
+        // 세션 수명 내내 쌓이고, 마스킹 판정은 선형 탐색이다. id는 오름차순이고 축출은
+        // 앞에서만 일어나므로, 남은 첫 줄보다 작은 id가 다시 나타나는 일은 없다.
+        let oldest = self
+            .output_lines
+            .front()
+            .map_or(usize::MAX, |(line_id, _)| *line_id);
+        self.env_banner_line_ids
+            .retain(|line_id| *line_id >= oldest);
     }
 
     /// 출력 버퍼 초기화
     pub fn clear_output(&mut self) {
         self.output_lines.clear();
+        self.env_banner_line_ids.clear();
         self.total_bytes = 0;
         // 점프할 대상이 사라졌으므로 1회성 목표도 함께 버린다 — 남겨두면 빈 버퍼에선
         // 소비(clamp)가 게이트돼 영영 Some으로 남아 auto_scroll 판정을 계속 우회시킨다.
@@ -600,6 +666,8 @@ impl RunSession {
             match self.exit_code {
                 Some(0) => SessionStatusKind::Succeeded,
                 Some(code) => SessionStatusKind::Failed(code),
+                // 사유가 남아 있으면 사용자가 멈춘 것이 아니다.
+                None if self.run_error.is_some() => SessionStatusKind::Errored,
                 None => SessionStatusKind::Stopped,
             }
         }
@@ -630,6 +698,7 @@ impl RunSession {
             ),
             SessionStatusKind::Failed(code) => format!("✕ exit {code}"),
             SessionStatusKind::Stopped => String::from("Stopped"),
+            SessionStatusKind::Errored => String::from("✕ error"),
         }
     }
 
@@ -652,6 +721,10 @@ impl RunSession {
             SessionStatusKind::Stopped => self.run_duration().map_or_else(
                 || String::from("Stopped"),
                 |d| format!("Stopped · {}", format_duration(d)),
+            ),
+            SessionStatusKind::Errored => self.run_duration().map_or_else(
+                || String::from("✕ error"),
+                |d| format!("✕ error · {}", format_duration(d)),
             ),
         }
     }
@@ -717,6 +790,21 @@ mod tests {
             session.add_output_line(&format!("line {i}"));
         }
         assert_eq!(session.output_lines.len(), 3);
+    }
+
+    #[test]
+    fn evicting_a_banner_line_forgets_its_masking_record() {
+        // 재실행이 출력을 지우지 않으므로 이 기록은 세션 수명 내내 쌓인다. 버려진 줄의 id를
+        // 남겨 두면 마스킹 판정(선형 탐색)의 비용이 재실행 횟수만큼 늘어난다.
+        let mut session = RunSession::new("test".to_string());
+        session.max_output_lines = 2;
+        session.add_env_banner_line("Environment: API_TOKEN=secret");
+        let banner_id = session.output_lines.front().expect("banner line").0;
+        session.add_output_line("one");
+        session.add_output_line("two");
+
+        assert!(!session.is_env_banner_line(banner_id));
+        assert!(session.env_banner_line_ids.is_empty());
     }
 
     #[test]
@@ -879,6 +967,32 @@ mod tests {
         assert_eq!(session.status_kind(), SessionStatusKind::Stopped);
     }
 
+    #[test]
+    fn a_failure_without_an_exit_code_is_not_a_user_stop() {
+        // 스폰 실패와 실행 중단은 종료 코드를 남기지 못한다. `Stopped`로 접히면 배지와 MCP
+        // 응답 양쪽에서 "사용자가 멈춤"과 구별되지 않는다.
+        let mut session = RunSession::new("x".to_string());
+        session.is_running = false;
+        session.run_error = Some("Failed to spawn process: not found".to_string());
+
+        assert_eq!(session.status_kind(), SessionStatusKind::Errored);
+        assert_eq!(session.status_badge_label_compact(), "✕ error");
+
+        session.finished_at = Some(session.started_at + Duration::from_millis(3400));
+        assert_eq!(session.status_badge_label(), "✕ error · 3.4s");
+    }
+
+    #[test]
+    fn an_exit_code_outranks_a_recorded_error() {
+        // 프로세스가 코드를 남겼다면 그게 결과다 — 사유는 앞선 실행의 잔재일 수 있다.
+        let mut session = RunSession::new("x".to_string());
+        session.is_running = false;
+        session.run_error = Some("Run interrupted unexpectedly".to_string());
+        session.exit_code = Some(3);
+
+        assert_eq!(session.status_kind(), SessionStatusKind::Failed(3));
+    }
+
     /// 저장된 라인의 순수 텍스트 (세그먼트 join) — CR 붕괴 검증용.
     fn line_text_at(session: &RunSession, idx: usize) -> String {
         session.output_lines[idx]
@@ -936,6 +1050,38 @@ mod tests {
         assert_eq!(session.output_lines.len(), 2);
         assert_eq!(line_text_at(&session, 0), "a");
         assert_eq!(line_text_at(&session, 1), "B");
+    }
+
+    #[test]
+    fn an_env_banner_event_marks_its_line_for_masking() {
+        use super::OutputEvent;
+
+        // MCP 마스킹은 이 기록만 보고 판정한다 — 이벤트가 일반 라인으로 들어가면 값이 그대로
+        // 나가면서 나머지 테스트는 전부 초록으로 남는다.
+        let mut session = RunSession::new("x".to_string());
+        session.apply_output_event(&OutputEvent::Line(String::from("Environment: FAKE=1")));
+        session.apply_output_event(&OutputEvent::EnvBanner(String::from("Environment: T=s")));
+
+        let printed_by_program = session.output_lines[0].0;
+        let banner_id = session.output_lines[1].0;
+        assert!(
+            !session.is_env_banner_line(printed_by_program),
+            "프로그램이 스스로 찍은 같은 모양의 줄"
+        );
+        assert!(session.is_env_banner_line(banner_id));
+    }
+
+    #[test]
+    fn replacing_a_banner_line_drops_its_masking_record() {
+        // 기록의 뜻은 "이 줄이 지금 배너를 담고 있다"다 — id를 재사용하는 교체가 지나가면
+        // 그 줄은 더 이상 배너가 아니다.
+        let mut session = RunSession::new("x".to_string());
+        session.add_env_banner_line("Environment: API_TOKEN=secret");
+        let banner_id = session.output_lines[0].0;
+
+        session.replace_last_line("build 100%");
+
+        assert!(!session.is_env_banner_line(banner_id));
     }
 
     #[test]

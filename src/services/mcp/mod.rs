@@ -14,15 +14,23 @@
 //! hyper task ──mpsc──▶ Subscription ──▶ Message::Mcp ──▶ update() ──mpsc(1)──▶ hyper task
 //! ```
 
+mod dedup;
 mod http;
 mod protocol;
 mod token;
 mod tools;
 
+pub use dedup::{
+    DEDUP_WINDOW as MCP_DEDUP_WINDOW, DedupLookup, DedupScope,
+    MAX_ENTRIES as MCP_DEDUP_MAX_ENTRIES, RequestLog as McpRequestLog,
+};
 pub use token::{
     load_or_create as load_or_create_token, mask as mask_token, regenerate as regenerate_token,
 };
-pub use tools::{MAX_SEARCH_MATCHES, McpOp, McpPermission, tools_for};
+pub use tools::{
+    CreateConfigurationArgs, DeleteConfigurationArgs, MAX_SEARCH_MATCHES, McpOp, McpPermission,
+    UpdateConfigurationArgs, tools_for,
+};
 
 use iced::futures::Stream;
 use iced::stream;

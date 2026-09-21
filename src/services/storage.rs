@@ -143,6 +143,13 @@ pub fn save_settings(settings: &AppSettings) {
 
 /// 현재 구성 파일 스키마 버전. 디스크 포맷이 호환 불가하게 바뀔 때마다 +1 하고
 /// `migrate_config_file`에 변환 단계를 추가한다.
+///
+/// `ConfigTypeData`에 필드를 **더하는** 변경도 여기서 +1 해야 한다. 그 열거형은
+/// `deny_unknown_fields`이므로(사유는 그쪽 doc) 새 필드가 든 파일을 옛 앱이 읽지 못하는데,
+/// 버전을 올리지 않으면 그 실패가 `migrate_config_file`의 "이 앱이 지원하는 버전보다 새 파일"
+/// 게이트를 통과해 원인 없는 `Deserialization error`로 나타난다 — 사용자에게는 구성이 전부
+/// 사라진 것으로 보이고, 화면에는 무엇을 해야 하는지가 없다. 최상위 필드는 이 제약을 받지
+/// 않는다(`parse_config_file` 참조).
 const CURRENT_CONFIG_VERSION: u32 = 1;
 
 /// 디스크에 저장되는 구성 파일 형식 (버전 envelope).
@@ -158,10 +165,15 @@ struct ConfigFile {
 
 /// 버전 envelope을 현재 스키마로 마이그레이션.
 ///
-/// 현재까지의 변경은 구조 수준에서 forward-compatible(미지 필드 무시, 누락 옵션 기본값)
-/// 하므로 데이터 변환은 없다. 예: `Compound.workspace`(Option, serde default) 추가는 구·신
-/// 버전 양방향 호환된다. 향후 호환 불가 변경 시 버전별 변환을 여기에 추가한다.
-/// 앱이 지원하는 버전보다 새 파일은 손상시키지 않도록 명확한 에러로 거부한다.
+/// 지금까지 데이터 변환이 없는 것은 변경들이 최상위에서 양방향 호환이었기 때문이다(미지 필드
+/// 무시, 누락 옵션 기본값). 그 성질은 `type_data` 안에서는 성립하지 않는다 — `ConfigTypeData`가
+/// `deny_unknown_fields`이므로 거기 필드를 더하는 변경은 옛 앱이 새 파일을 읽지 못하게 만들고,
+/// 따라서 `CURRENT_CONFIG_VERSION`을 함께 올려야 한다. 예로 들려 있던 `Compound.workspace`
+/// 추가는 그 속성이 붙기 전의 일이다.
+///
+/// 앱이 지원하는 버전보다 새 파일은 손상시키지 않도록 명확한 에러로 거부한다. 버전을 올려야 하는
+/// 이유가 이것이다 — 옛 앱은 어느 쪽이든 그 파일을 읽지 못하지만, 버전이 올라 있으면 무엇을
+/// 해야 하는지 아는 에러를 낸다.
 fn migrate_config_file(file: ConfigFile) -> Result<Vec<RunConfiguration>, String> {
     if file.version > CURRENT_CONFIG_VERSION {
         return Err(format!(
@@ -178,7 +190,8 @@ fn migrate_config_file(file: ConfigFile) -> Result<Vec<RunConfiguration>, String
 fn parse_config_file(content: &str) -> Result<Vec<RunConfiguration>, String> {
     let trimmed = content.trim_start_matches('\u{FEFF}').trim_start();
     if trimmed.starts_with('[') {
-        // 구버전: 버전 없는 베어 배열 (제거된 config_type 등 미지 필드는 serde가 무시)
+        // 구버전: 버전 없는 베어 배열. 최상위의 미지 필드(제거된 `config_type` 등)는 serde가
+        // 무시하지만 `type_data` 안은 다르다 — `ConfigTypeData`의 `deny_unknown_fields`가 거절한다.
         serde_json::from_str(trimmed).map_err(|e| format!("Deserialization error: {e}"))
     } else {
         let file: ConfigFile =

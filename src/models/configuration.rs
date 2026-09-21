@@ -394,8 +394,19 @@ impl KotlinLaunchMode {
 }
 
 /// 구성 타입별 데이터
+///
+/// `deny_unknown_fields`는 MCP 편집 경계 때문에 필요하다 — `update_configuration`은 `type_data`를
+/// 통째로 교체하고 여러 필드가 `#[serde(default)]`이므로, 없이 두면 `members` → `member` 같은
+/// 오타 하나가 기본값으로 조용히 파싱되어 사용자의 compound가 멤버 0개로 교체된다. 호출자는
+/// 성공 응답을 받는다.
+///
+/// 저장소 읽기에도 같은 엄격함이 걸리는 것은 의도한 방향이다. 미지 필드를 조용히 버리면 그 필드는
+/// 다음 Save에서 파일에서도 사라지므로, 무시는 호환이 아니라 유실이다. 대신 이 속성이 만드는
+/// 제약을 기록한다: 이 열거형의 필드를 **빼는** 변경은 옛 파일을, **더하는** 변경은 새 파일을 옛
+/// 앱이 읽을 수 없게 만든다. 그래서 두 방향 모두 `CURRENT_CONFIG_VERSION` +1을 요구하며(사유는
+/// 그쪽 doc), 빼는 쪽은 `migrate_config_file`에 변환 단계까지 필요하다(현재 단계는 0개다).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(tag = "type")]
+#[serde(tag = "type", deny_unknown_fields)]
 pub enum ConfigTypeData {
     /// Application 타입 데이터
     Application {

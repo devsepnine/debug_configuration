@@ -1,7 +1,7 @@
 use crate::messages::Message;
 use crate::models::{
     ConfigTypeData, ExecuteMode, KotlinLaunchMode, NodeCommand, OutputEvent, PackageManager,
-    RunConfiguration,
+    RunConfiguration, RunFailure,
 };
 use iced::stream;
 use std::collections::{HashMap, HashSet};
@@ -507,7 +507,9 @@ impl Drop for CompletionGuard {
         if self.armed {
             let _ = self.output.try_send(Message::RunCompleted(
                 self.session_id,
-                Err(String::from("Run interrupted unexpectedly")),
+                Err(RunFailure::Failed(String::from(
+                    "Run interrupted unexpectedly",
+                ))),
             ));
         }
     }
@@ -556,7 +558,7 @@ pub fn run_configuration_stream(
                         return;
                     }
                     Err(PtySpawnError::Spawn(e)) => {
-                        send_run_result(&mut output, session_id, Err(e)).await;
+                        send_run_result(&mut output, session_id, Err(RunFailure::Failed(e))).await;
                         completion.disarm();
                         return;
                     }
@@ -594,7 +596,7 @@ pub fn run_configuration_stream(
                     send_run_result(
                         &mut output,
                         session_id,
-                        Err(format!("Failed to spawn process: {e}")),
+                        Err(RunFailure::Failed(format!("Failed to spawn process: {e}"))),
                     )
                     .await;
                 }
@@ -1132,6 +1134,16 @@ fn spawn_in_pty(
     })
 }
 
+/// 배너 한 줄에 실을 조각. 개행을 이스케이프 형태로 되돌려 배너가 한 줄에 머물게 한다.
+///
+/// 환경변수 값은 실제 개행을 담을 수 있다 — `env_string`의 파싱이 `\n`을 개행으로 풀어 준다.
+/// PEM 키나 서비스 계정 JSON이 배너를 화면 절반까지 늘리는 것을 막는 표시용 정리이고,
+/// 역이스케이프로 원값이 복원되는 것은 보장하지 않는다. MCP 읽기 경계의 마스킹은 이 형태에
+/// 기대지 않는다 — `RunSession::add_env_banner_line`이 배너가 만든 줄 id를 전부 기록한다.
+fn single_line(fragment: &str) -> String {
+    fragment.replace('\n', "\\n").replace('\r', "\\r")
+}
+
 async fn send_command_info(
     output: &mut iced::futures::channel::mpsc::Sender<Message>,
     session_id: Uuid,
@@ -1142,17 +1154,20 @@ async fn send_command_info(
 ) {
     use iced::futures::SinkExt;
 
-    let mut command_info = String::new();
-    command_info.push_str("═══════════════════════════════════════════════════════\n");
-    let _ = writeln!(command_info, "Configuration: {}", config.name);
-    let _ = writeln!(command_info, "Type: {:?}", config.config_type());
-    let _ = writeln!(
-        command_info,
-        "Working Directory: {}",
-        config.working_directory
-    );
+    let mut head = String::new();
+    head.push_str("═══════════════════════════════════════════════════════\n");
+    let _ = writeln!(head, "Configuration: {}", config.name);
+    let _ = writeln!(head, "Type: {:?}", config.config_type());
+    let _ = writeln!(head, "Working Directory: {}", config.working_directory);
+
+    let mut tail = String::new();
+    let _ = writeln!(tail, "Command: {command_str}");
+    tail.push_str("═══════════════════════════════════════════════════════\n");
+
+    let mut events = lines_to_events(&head);
     // 환경변수는 더 이상 Command 문자열에 보이지 않으므로 별도 라인으로 표시해 가시성 유지.
-    // 단, 설정에서 끄면(show_env=false) 출력하지 않는다.
+    // 단, 설정에서 끄면(show_env=false) 출력하지 않는다. `Line`이 아니라 `EnvBanner`로 보내는
+    // 이유는 그 variant의 문서에 있다 — 이 줄이 배너라는 사실을 아는 곳은 여기뿐이다.
     if show_env && (!config.environment_variables.is_empty() || !extra_env.is_empty()) {
         let mut pairs: Vec<(String, String)> = config
             .environment_variables
@@ -1163,18 +1178,15 @@ async fn send_command_info(
         pairs.extend(extra_env.iter().cloned());
         let rendered = pairs
             .iter()
-            .map(|(k, v)| format!("{k}={v}"))
+            .map(|(k, v)| format!("{}={}", single_line(k), single_line(v)))
             .collect::<Vec<_>>()
             .join("; ");
-        let _ = writeln!(command_info, "Environment: {rendered}");
+        events.push(OutputEvent::EnvBanner(format!("Environment: {rendered}")));
     }
-    let _ = writeln!(command_info, "Command: {command_str}");
-    command_info.push_str("═══════════════════════════════════════════════════════\n");
+    events.extend(lines_to_events(&tail));
+
     let _ = output
-        .send(Message::OutputReceived(
-            session_id,
-            lines_to_events(&command_info),
-        ))
+        .send(Message::OutputReceived(session_id, events))
         .await;
 }
 
@@ -1205,15 +1217,10 @@ async fn handle_pty_process(
     {
         PtyLoopEnd::Cancelled { exit_taken } => {
             terminate_and_reap_pty(pty.pid, &mut pty.exit_rx, exit_taken).await;
-            send_run_result(
-                output,
-                session_id,
-                Err(String::from("Process stopped by user")),
-            )
-            .await;
+            send_run_result(output, session_id, Err(RunFailure::StoppedByUser)).await;
         }
         PtyLoopEnd::Completed(result) => {
-            send_run_result(output, session_id, result).await;
+            send_run_result(output, session_id, result.map_err(RunFailure::Failed)).await;
         }
     }
 }
@@ -1578,12 +1585,7 @@ async fn handle_spawned_process(
     if cancelled {
         // 시그널 전송 후 반드시 wait로 reap (Unix 좀비 방지) + SIGTERM 무시 시 SIGKILL 에스컬레이션.
         terminate_and_reap(&mut child).await;
-        send_run_result(
-            output,
-            session_id,
-            Err(String::from("Process stopped by user")),
-        )
-        .await;
+        send_run_result(output, session_id, Err(RunFailure::StoppedByUser)).await;
     } else {
         wait_for_process(output, session_id, &mut child, &cancel_flag).await;
     }
@@ -1813,17 +1815,21 @@ struct EventBatch {
 
 impl EventBatch {
     fn push(&mut self, event: OutputEvent) {
+        // `EnvBanner`가 병합 대상에 없는 것은 이 조립기를 지나지 않기 때문이다 — 배너는
+        // PTY 루프가 시작되기 전에 `send_command_info`가 따로 보낸다.
         if let OutputEvent::Replace(new_text) = &event
-            && let Some(last) = self.events.last_mut()
+            && let Some(OutputEvent::Line(text) | OutputEvent::Replace(text)) =
+                self.events.last_mut()
         {
-            let (OutputEvent::Line(text) | OutputEvent::Replace(text)) = last;
             self.bytes = self.bytes.saturating_sub(text.len()) + new_text.len();
             // 직전 이벤트의 종류(Line/Replace)는 유지한 채 내용만 최신으로.
             *text = new_text.clone();
             return;
         }
         self.bytes += match &event {
-            OutputEvent::Line(text) | OutputEvent::Replace(text) => text.len(),
+            OutputEvent::Line(text) | OutputEvent::EnvBanner(text) | OutputEvent::Replace(text) => {
+                text.len()
+            }
         };
         self.events.push(event);
     }
@@ -2055,7 +2061,7 @@ async fn wait_for_process(
             send_run_result(
                 output,
                 session_id,
-                Err(String::from("Process stopped by user")),
+                Err(RunFailure::StoppedByUser),
             )
             .await;
         }
@@ -2067,7 +2073,7 @@ async fn wait_for_process(
                 send_run_result(
                     output,
                     session_id,
-                    Err(format!("Failed to wait for process: {e}")),
+                    Err(RunFailure::Failed(format!("Failed to wait for process: {e}"))),
                 )
                 .await;
             }
@@ -2078,7 +2084,7 @@ async fn wait_for_process(
 async fn send_run_result(
     output: &mut iced::futures::channel::mpsc::Sender<Message>,
     session_id: Uuid,
-    result: Result<i32, String>,
+    result: Result<i32, RunFailure>,
 ) {
     use iced::futures::SinkExt;
 
@@ -2599,7 +2605,9 @@ mod tests {
         assert_eq!(events[0], line("가"));
         assert!(
             events.iter().all(|e| match e {
-                OutputEvent::Line(t) | OutputEvent::Replace(t) => !t.contains('\u{FFFD}'),
+                OutputEvent::Line(t) | OutputEvent::EnvBanner(t) | OutputEvent::Replace(t) => {
+                    !t.contains('\u{FFFD}')
+                }
             }),
             "경계 분할이 U+FFFD로 새면 안 됨: {events:?}"
         );
@@ -2622,7 +2630,8 @@ mod tests {
     fn assembler_emitted_text_never_contains_cr() {
         let events = assemble(&[b"a\rb", b"c\rd\ne\r"], true);
         for event in &events {
-            let (OutputEvent::Line(t) | OutputEvent::Replace(t)) = event;
+            let (OutputEvent::Line(t) | OutputEvent::EnvBanner(t) | OutputEvent::Replace(t)) =
+                event;
             assert!(!t.contains('\r'), "CR leaked: {t:?}");
         }
     }
@@ -4052,6 +4061,7 @@ time.sleep(30)'";
                 for event in events {
                     match event {
                         crate::models::OutputEvent::Line(text)
+                        | crate::models::OutputEvent::EnvBanner(text)
                         | crate::models::OutputEvent::Replace(text) => {
                             reconstructed.push_str(text);
                             reconstructed.push('\n');
@@ -4108,6 +4118,69 @@ time.sleep(30)'";
     }
 
     #[tokio::test]
+    async fn a_newline_or_cr_in_an_env_value_does_not_split_the_banner() {
+        // PEM 키나 서비스 계정 JSON은 개행을 담아, 그대로 찍으면 배너가 화면 수십 줄을
+        // 차지한다. raw CR은 더 나쁘다 — `RunSession::normalize_line`이 마지막 `\r` 뒤만
+        // 남기므로 `Environment: ` 자체가 사라져, 사용자에게는 정체 모를 한 줄이 남는다.
+        // 그리고 배너가 반드시 `EnvBanner` 하나로 도착해야 MCP 읽기 경계가 그 줄을 가릴 수
+        // 있다 — `Line`으로 새면 마스킹 대상 기록에 들어가지 않아 값이 그대로 나간다.
+        use iced::futures::StreamExt;
+        use iced::futures::channel::mpsc;
+
+        let mut config = RunConfiguration {
+            name: "T".to_string(),
+            ..RunConfiguration::default()
+        };
+        config
+            .environment_variables
+            .insert("TOKEN".to_string(), "a\nSECRET=b".to_string());
+        config
+            .environment_variables
+            .insert("CARRIAGE".to_string(), "x\rSECRET=c".to_string());
+
+        let (mut tx, mut rx) = mpsc::channel(16);
+        send_command_info(&mut tx, Uuid::new_v4(), &config, "echo hi", &[], true).await;
+        drop(tx);
+
+        let mut lines: Vec<String> = Vec::new();
+        let mut banner_events: Vec<String> = Vec::new();
+        while let Some(msg) = rx.next().await {
+            if let Message::OutputReceived(_, events) = msg {
+                for event in events {
+                    match event {
+                        crate::models::OutputEvent::EnvBanner(text) => {
+                            banner_events.push(text.clone());
+                            lines.push(text);
+                        }
+                        crate::models::OutputEvent::Line(text)
+                        | crate::models::OutputEvent::Replace(text) => lines.push(text),
+                    }
+                }
+            }
+        }
+
+        assert_eq!(
+            banner_events.len(),
+            1,
+            "the banner must arrive as one EnvBanner event: {lines:?}"
+        );
+        let banner: Vec<&String> = lines
+            .iter()
+            .filter(|line| line.starts_with("Environment: "))
+            .collect();
+        assert_eq!(banner.len(), 1, "the banner must be one line: {lines:?}");
+        assert_eq!(
+            banner[0],
+            "Environment: CARRIAGE=x\\rSECRET=c; TOKEN=a\\nSECRET=b"
+        );
+        assert!(
+            !lines.iter().any(|line| !line.starts_with("Environment: ")
+                && (line.contains("SECRET=b") || line.contains("SECRET=c"))),
+            "no line outside the banner may carry the value: {lines:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn send_command_info_env_line_gated_by_show_env() {
         use iced::futures::StreamExt;
         use iced::futures::channel::mpsc;
@@ -4130,6 +4203,7 @@ time.sleep(30)'";
                     for event in events {
                         match event {
                             crate::models::OutputEvent::Line(text)
+                            | crate::models::OutputEvent::EnvBanner(text)
                             | crate::models::OutputEvent::Replace(text) => {
                                 out.push_str(&text);
                                 out.push('\n');

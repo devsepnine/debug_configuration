@@ -941,7 +941,10 @@ fn session_title(
     .align_y(Alignment::Center);
 
     if let Some(badge) = badge {
-        let is_failed = matches!(status, Some(SessionStatusKind::Failed(_)));
+        let is_failed = matches!(
+            status,
+            Some(SessionStatusKind::Failed(_) | SessionStatusKind::Errored)
+        );
         title = title
             .push(Space::new().width(8))
             .push(
@@ -968,7 +971,9 @@ fn session_status_dot_style(theme: &Theme, status: Option<SessionStatusKind>) ->
     let (color, alpha) = match status {
         Some(SessionStatusKind::Running) => (palette.success.base.color, 0.92),
         Some(SessionStatusKind::Succeeded) => (palette.background.base.text, 0.42),
-        Some(SessionStatusKind::Failed(_)) => (palette.danger.base.color, 0.88),
+        Some(SessionStatusKind::Failed(_) | SessionStatusKind::Errored) => {
+            (palette.danger.base.color, 0.88)
+        }
         Some(SessionStatusKind::Stopped) | None => (palette.background.base.text, 0.30),
     };
 

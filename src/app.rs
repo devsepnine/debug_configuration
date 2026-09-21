@@ -1,11 +1,11 @@
 use crate::messages::{ConfigurationDropPosition, Message, StdinBarKey, ViewMode};
 use crate::models::{
     ConfigTypeData, ConfigurationType, ExecuteMode, ExecuteModeType, KotlinLaunchMode,
-    KotlinLaunchModeType, LayoutId, PackageManager, RunConfiguration, RunSession, SearchState,
-    SessionStatusKind, WorkspaceTab,
+    KotlinLaunchModeType, LayoutId, PackageManager, RunConfiguration, RunFailure, RunSession,
+    SearchState, SessionStatusKind, WorkspaceTab,
 };
 use crate::services::{
-    AppSettings, McpPermission, UpdateOutcome, check_latest_release, export_text,
+    AppSettings, McpPermission, McpRequestLog, UpdateOutcome, check_latest_release, export_text,
     force_kill_process_tree, load_or_migrate_store, load_settings, mask_token, mcp_server,
     register_running_pid, run_configuration_stream, save_settings, save_to_store,
     terminate_session_process, unregister_running_pid,
@@ -439,6 +439,9 @@ pub struct RunConfigManager {
     mcp_token: Option<String>,
     /// MCP 리스너 상태 (설정 모달 표시용)
     mcp_status: McpServerStatus,
+    /// 변경성 툴의 중복 요청 흡수 창. HTTP 재시도가 프로세스를 두 번 띄우거나 구성을 두 번
+    /// 만들지 않게 한다.
+    mcp_request_log: McpRequestLog,
     file_dialog: FileDialogState,
 
     /// Node package script 캐시 (`config_id` 기준)
@@ -486,6 +489,11 @@ pub struct RunConfigManager {
     /// 초기 구성 로드(`ConfigurationsLoaded`)가 처리되었는지 여부. 로드가 끝나기 전에는
     /// Save를 막아, 빈/부실 목록이 저장소를 덮어써 데이터를 잃는 것을 방지한다.
     configs_ready: bool,
+    /// 초기 로드가 **실패로** 끝났는지. `configs_ready`와 갈라 두는 것은 두 쓰기 경로가 이
+    /// 상황을 다르게 판단해야 하기 때문이다 — 사람이 "Load failed"를 읽고 누르는 Save는
+    /// 덮어쓰기를 의도한 것일 수 있지만(그 동작은 `save_is_blocked_until_initial_load_completes`가
+    /// 못 박아 두었다), 화면을 읽지 않는 MCP 편집에는 그 판단의 근거가 없다.
+    configs_load_failed: bool,
     /// 사용 가능한 새 버전 정보. 없으면 `None`. 상태바 업데이트 버튼 표시에 사용한다.
     update_available: Option<AvailableUpdate>,
     /// 업데이트 확인이 진행 중인지. 상태바에 로딩 스피너를 표시하고
@@ -555,6 +563,7 @@ impl RunConfigManager {
             mcp_expose_env_values: settings.mcp_expose_env_values,
             mcp_token: None,
             mcp_status: McpServerStatus::default(),
+            mcp_request_log: McpRequestLog::default(),
             file_dialog: FileDialogState::default(),
             node_available_scripts: HashMap::new(),
             node_ui: NodeUiState::default(),
@@ -590,6 +599,7 @@ impl RunConfigManager {
             is_window_focused: true,
             last_file_path: last_file_path.clone(),
             configs_ready: false,
+            configs_load_failed: false,
             update_available: None,
             // 설정이 켜진 경우에만 아래에서 자동 체크 Task를 큐잉하므로 그에 맞춰 스피너 시작.
             is_checking_update: auto_check_updates,
@@ -698,6 +708,16 @@ impl RunConfigManager {
             Message::SettingsRegenerateMcpToken => self.handle_settings_regenerate_mcp_token(),
             Message::McpTokenLoaded(result) => self.handle_mcp_token_loaded(result),
             Message::Mcp(event) => self.handle_mcp_event(event),
+            Message::McpSessionInputWritten {
+                request,
+                session_id,
+                request_id,
+                line,
+                result,
+            } => {
+                self.handle_mcp_session_input_written(request, session_id, request_id, line, result)
+            }
+            Message::McpConfigurationsSaved(result) => self.handle_mcp_configurations_saved(result),
             Message::OpenExportModal => self.handle_open_export_modal(),
             Message::ConfirmExportModal => self.handle_confirm_export_modal(),
             Message::CancelExportModal => self.handle_cancel_export_modal(),
@@ -1433,8 +1453,7 @@ impl RunConfigManager {
 
     fn handle_add_configuration(&mut self) -> Task<Message> {
         self.configurations.push(RunConfiguration::default());
-        self.selected_config_index = Some(self.configurations.len() - 1);
-        self.sync_editor_select_state_for_selected_config();
+        self.select_configuration(self.configurations.len() - 1);
         self.status_message = String::from("New configuration added");
         Task::none()
     }
@@ -1461,6 +1480,13 @@ impl RunConfigManager {
                 && modal.config_id == config_id
             {
                 self.env_modal = None;
+            }
+            // 내보내기 모달의 선택 집합은 "현재 목록에 있는 id의 부분집합"이 불변식이다
+            // (전체 선택 체크박스가 `selected.len() == configurations.len()`으로 판정한다 —
+            // `export_modal::ExportModalState` 참고). GUI 삭제는 확인 모달을 여는
+            // `close_all_modals()`가 이를 우연히 지켜 주지만, MCP 삭제는 모달을 거치지 않는다.
+            if let Some(modal) = &mut self.export_modal {
+                modal.selected.remove(&config_id);
             }
 
             self.selected_config_index = if self.configurations.is_empty() {
@@ -2495,6 +2521,7 @@ impl RunConfigManager {
     ) -> Task<Message> {
         // 로드가 (성공/실패 무관하게) 끝났음을 표시 — 이 시점부터 Save가 허용된다.
         self.configs_ready = true;
+        self.configs_load_failed = result.is_err();
         match result {
             Ok(configs) => {
                 self.configurations = configs;
@@ -2525,8 +2552,10 @@ impl RunConfigManager {
     }
 
     fn handle_save_configurations(&mut self) -> Task<Message> {
-        // 초기 로드가 끝나기 전(또는 로드 실패로 빈 상태일 때) Save를 허용하면 빈/부실
-        // 목록이 저장소를 덮어써 데이터를 잃을 수 있다. 로드 완료 전에는 저장을 막는다.
+        // 초기 로드가 끝나기 전에 Save를 허용하면 빈 목록이 저장소를 덮어써 데이터를 잃는다.
+        // 로드가 **실패로** 끝난 뒤에는 막지 않는다 — 사용자는 상태바에서 실패를 읽었고,
+        // 손상된 저장소를 지금 목록으로 갈아 치우는 것이 의도일 수 있다. 그 판단의 근거가 없는
+        // MCP 편집 경로는 `edit_precondition`이 따로 막는다.
         if !self.configs_ready {
             self.status_message =
                 String::from("Still loading configurations; please wait before saving");
@@ -2676,7 +2705,7 @@ impl RunConfigManager {
                     .zip(session.output_lines.back().map(|(id, _)| *id))
             });
             // executor가 묶어 보낸 이벤트 배치 (process_output_loop의 coalescing —
-            // UI 메시지 폭주 방지). Line=추가, Replace=마지막 라인 교체(라이브 진행바).
+            // UI 메시지 폭주 방지).
             for event in events {
                 session.apply_output_event(event);
             }
@@ -2698,7 +2727,7 @@ impl RunConfigManager {
     fn handle_run_completed(
         &mut self,
         session_id: Uuid,
-        result: Result<i32, String>,
+        result: Result<i32, RunFailure>,
     ) -> Task<Message> {
         if let Some(session) = self.session_by_id_mut(session_id) {
             session.is_running = false;
@@ -2722,13 +2751,23 @@ impl RunConfigManager {
                         notify_run_finished(&config_name, Ok(code));
                     }
                 }
-                Err(error) => {
+                // 사유를 남기지 않는다 — `status_kind()`가 그것으로 `Stopped`와 `Errored`를
+                // 가르므로, 사유를 남기면 의도적인 중지가 실패로 굳는다. 상태 메시지도
+                // 건드리지 않는다: 중지를 확정한 `handle_stop_session`(그리고 MCP 경로가
+                // 덧붙인 `[MCP]` 표시)이 누가 멈췄는지까지 이미 써 놓았고, 여기서 덮으면
+                // 사용자가 앱에서 에이전트의 조작을 보는 유일한 줄이 사라진다. 알림도 없다 —
+                // 방금 요청한 중지를 실패로 알릴 이유가 없다.
+                Err(RunFailure::StoppedByUser) => {
+                    session.add_output_line("\nProcess stopped by user");
+                }
+                Err(RunFailure::Failed(reason)) => {
                     let config_name = session.config_name.clone();
-                    session.add_output_line(&format!("\nError: {error}"));
-                    self.status_message = format!("Failed: {error}");
+                    session.run_error = Some(reason.clone());
+                    session.add_output_line(&format!("\nError: {reason}"));
+                    self.status_message = format!("Failed: {reason}");
                     // 스폰/실행 실패도 백그라운드면 알림 (가장 중요한 실패 케이스)
                     if !self.is_window_focused {
-                        notify_run_finished(&config_name, Err(&error));
+                        notify_run_finished(&config_name, Err(&reason));
                     }
                 }
             }
@@ -3036,11 +3075,8 @@ impl RunConfigManager {
         use crate::models::StdinWriteError;
         match result {
             Ok(needs_local_echo) => {
-                if needs_local_echo && let Some(session) = self.session_by_id_mut(session_id) {
-                    session.add_output_line(&line);
-                    if session.search.is_some() {
-                        session.refresh_search_matches();
-                    }
+                if needs_local_echo {
+                    self.echo_stdin_locally(session_id, &line);
                 }
             }
             Err(StdinWriteError::Timeout) => {
@@ -3060,6 +3096,17 @@ impl RunConfigManager {
             }
         }
         Task::none()
+    }
+
+    /// 폴백 pipe(Windows <1809)로 보낸 입력을 세션 로그에 직접 표시한다 — 그 전송에는 터미널
+    /// 에코가 없어, 앱이 쓰지 않으면 보낸 입력이 어디에도 남지 않는다.
+    fn echo_stdin_locally(&mut self, session_id: Uuid, line: &str) {
+        if let Some(session) = self.session_by_id_mut(session_id) {
+            session.add_output_line(line);
+            if session.search.is_some() {
+                session.refresh_search_matches();
+            }
+        }
     }
 
     /// stdin 바 키(↑/↓)의 공통 진입점: 실제 포커스된 위젯 Id를 조회해 해석 메시지로
@@ -3326,7 +3373,7 @@ impl RunConfigManager {
 
     /// 세션 출력 버퍼를 비운다. 실행 중인 프로세스와 이후 출력에는 영향이 없고, 화면에
     /// 쌓인 로그만 클리어한다(재현 직전 초기화 등). 검색 매치 캐시의 라인 인덱스가
-    /// stale해지므로 함께 갱신한다 — `handle_rerun_session`의 clear 직후 처리와 동일.
+    /// stale해지므로 함께 갱신한다.
     fn handle_clear_session_output(&mut self, session_id: Uuid) -> Task<Message> {
         if let Some(session) = self.session_by_id_mut(session_id) {
             session.clear_output();
@@ -3735,79 +3782,86 @@ impl RunConfigManager {
         //     RunCompleted, old_id 키)는 더 이상 어떤 세션과도 매칭되지 않아 무시된다 —
         //     교차 배선(cross-wiring) 없음. 이전 프로세스는 이전 스트림의 terminate_and_reap가
         //     강제 종료한다. (잠깐 is_running=true인데 새 프로세스 시작 전인 transient는 무해)
-        if let Some(session) = self.sessions.iter_mut().find(|s| s.id == session_id) {
-            if session.is_running {
-                session.cancel_flag.store(true, Ordering::Relaxed);
-                self.status_message = String::from("Stopping session for restart...");
-            }
-
-            let config_name = session.config_name.clone();
-            let old_id = session.id;
-
-            if let Some(config) = self.configurations.iter().find(|c| c.name == config_name) {
-                let new_id = Uuid::new_v4();
-                session.id = new_id;
-                session.clear_output();
-                // 출력이 비워졌으니 검색 매치 캐시도 비운다 (stale 인덱스 방지).
-                session.refresh_search_matches();
-                session.is_running = true;
-                session.exit_code = None;
-                session.finished_at = None;
-                // 이전 실행의 PID는 더 이상 이 세션에 속하지 않는다. 새 프로세스가 PID를
-                // 보고하기 전 stale PID가 kill되지 않도록 추적을 해제하고 슬롯을 비운다.
-                if let Some(old_pid) = session.process_pid.take() {
-                    unregister_running_pid(old_pid);
-                }
-                session.started_at = SystemTime::now();
-                session.cancel_flag =
-                    std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-                let cancel_flag = session.cancel_flag.clone();
-                // rerun은 pane을 재사용하므로 마지막 관측 뷰포트를 초기 PTY 크기로 넘긴다.
-                let initial_viewport = session.pty_viewport;
-
-                for tab in &mut self.workspace_tabs {
-                    for pane in tab.pane_layout.panes.values_mut() {
-                        if pane.session_id == Some(old_id) {
-                            pane.session_id = Some(new_id);
-                        }
-                    }
-
-                    let layout_ids: Vec<LayoutId> = tab
-                        .layout_tree
-                        .collect_leaves()
-                        .into_iter()
-                        .map(|(id, _)| id)
-                        .collect();
-
-                    for layout_id in layout_ids {
-                        if let Some(tree_pane) = tab.layout_tree.get_pane_mut(layout_id)
-                            && tree_pane.session_id == Some(old_id)
-                        {
-                            tree_pane.session_id = Some(new_id);
-                        }
-                    }
-                }
-
-                self.status_message = format!("Rerunning: {}", config.name);
-
-                let config = config.clone();
-
-                return Task::run(
-                    run_configuration_stream(
-                        config,
-                        new_id,
-                        cancel_flag,
-                        self.show_environment_on_run,
-                        initial_viewport,
-                    ),
-                    |msg| msg,
-                );
-            }
-
+        // 구성 조회를 취소보다 먼저 한다. 순서가 뒤바뀌면 구성이 사라진 세션에서 프로세스만
+        // 죽여 놓고 "not found"로 끝나, 호출자에게는 아무 일도 일어나지 않은 것처럼 보인다.
+        let Some(position) = self.sessions.iter().position(|s| s.id == session_id) else {
+            return Task::none();
+        };
+        let config_name = self.sessions[position].config_name.clone();
+        let Some(config) = self
+            .configurations
+            .iter()
+            .find(|c| c.name == config_name)
+            .cloned()
+        else {
             self.status_message = format!("Configuration '{config_name}' not found");
+            return Task::none();
+        };
+
+        let session = &mut self.sessions[position];
+        if session.is_running {
+            session.cancel_flag.store(true, Ordering::Relaxed);
+            self.status_message = String::from("Stopping session for restart...");
         }
 
-        Task::none()
+        let new_id = Uuid::new_v4();
+        let old_id = session.id;
+        session.id = new_id;
+        // 출력을 지우지 않는다. 재실행은 사용자가 읽고 있는 화면이자 MCP 에이전트가 폴링하는
+        // 유일한 기록이므로, 여기서 비우면 실패 원인이 그대로 사라진다. 경계는 새 실행이 찍는
+        // 배너(`run_configuration_stream`의 `═══`+`Configuration:`)가 그리고, 오래된 줄은
+        // max_output_lines/바이트 예산이 밀어낸다. 버퍼를 건드리지 않으므로 검색 매치 캐시도
+        // 그대로 유효하다.
+        session.is_running = true;
+        session.exit_code = None;
+        session.run_error = None;
+        session.finished_at = None;
+        // 이전 실행의 PID는 더 이상 이 세션에 속하지 않는다. 새 프로세스가 PID를
+        // 보고하기 전 stale PID가 kill되지 않도록 추적을 해제하고 슬롯을 비운다.
+        if let Some(old_pid) = session.process_pid.take() {
+            unregister_running_pid(old_pid);
+        }
+        session.started_at = SystemTime::now();
+        session.cancel_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancel_flag = session.cancel_flag.clone();
+        // rerun은 pane을 재사용하므로 마지막 관측 뷰포트를 초기 PTY 크기로 넘긴다.
+        let initial_viewport = session.pty_viewport;
+
+        for tab in &mut self.workspace_tabs {
+            for pane in tab.pane_layout.panes.values_mut() {
+                if pane.session_id == Some(old_id) {
+                    pane.session_id = Some(new_id);
+                }
+            }
+
+            let layout_ids: Vec<LayoutId> = tab
+                .layout_tree
+                .collect_leaves()
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect();
+
+            for layout_id in layout_ids {
+                if let Some(tree_pane) = tab.layout_tree.get_pane_mut(layout_id)
+                    && tree_pane.session_id == Some(old_id)
+                {
+                    tree_pane.session_id = Some(new_id);
+                }
+            }
+        }
+
+        self.status_message = format!("Rerunning: {}", config.name);
+
+        Task::run(
+            run_configuration_stream(
+                config,
+                new_id,
+                cancel_flag,
+                self.show_environment_on_run,
+                initial_viewport,
+            ),
+            |msg| msg,
+        )
     }
 
     fn handle_stop_session(&mut self, session_id: Uuid) -> Task<Message> {
@@ -4797,7 +4851,10 @@ impl RunConfigManager {
         // 짧은 결과. 소요시간까지 담은 풀 라벨은 pane 타이틀이 표시한다.)
         // Windows 크래시 코드처럼 거대한 exit code("✕ exit -1073741819")도 고정 폭을
         // 넘지 않도록 표시 문자 수를 배지 폭에 맞춰 자른다 (no-wrap이라 넘치면 이름을 침범).
-        let is_failed = matches!(session.status_kind(), SessionStatusKind::Failed(_));
+        let is_failed = matches!(
+            session.status_kind(),
+            SessionStatusKind::Failed(_) | SessionStatusKind::Errored
+        );
         let badge_text = crate::utils::truncate_text(&session.status_badge_label_compact(), 11);
         let badge = text(badge_text)
             .size(10)
@@ -6209,6 +6266,45 @@ mod tests {
             app.session_by_id_mut(sid).unwrap().stdin_input.as_deref(),
             Some("typing")
         );
+    }
+
+    #[test]
+    fn a_user_stop_is_not_reported_as_a_failure() {
+        // 사용자 중지는 종료 코드를 남기지 못해 실행 실패와 같은 Err 경로로 보고된다. 사유를
+        // 세션에 남기면 의도적인 Stop이 `Errored`로 굳어, 배지는 빨간 `✕ error`가 되고 stop을
+        // 시킨 에이전트가 자기 요청을 실패로 읽는다.
+        let (mut app, ids) = manager_with_open_panes(&["a"]);
+        let sid = ids[0];
+        app.session_by_id_mut(sid).unwrap().is_running = true;
+
+        let _ = app.handle_stop_session(sid);
+        let _ = app.handle_run_completed(sid, Err(RunFailure::StoppedByUser));
+
+        let session = app.session_by_id_mut(sid).unwrap();
+        assert_eq!(session.run_error, None, "중지에는 사유를 남기지 않는다");
+        assert_eq!(session.status_kind(), SessionStatusKind::Stopped);
+    }
+
+    #[test]
+    fn a_run_that_could_not_start_keeps_its_reason() {
+        // StoppedByUser와 같은 경로로 오지만 이쪽은 실패다 — 사유가 남아야 `Errored`로 갈라진다.
+        let (mut app, ids) = manager_with_open_panes(&["a"]);
+        let sid = ids[0];
+        app.session_by_id_mut(sid).unwrap().is_running = true;
+
+        let _ = app.handle_run_completed(
+            sid,
+            Err(RunFailure::Failed(String::from(
+                "Failed to spawn process: not found",
+            ))),
+        );
+
+        let session = app.session_by_id_mut(sid).unwrap();
+        assert_eq!(
+            session.run_error.as_deref(),
+            Some("Failed to spawn process: not found")
+        );
+        assert_eq!(session.status_kind(), SessionStatusKind::Errored);
     }
 
     #[test]
