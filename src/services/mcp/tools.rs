@@ -204,7 +204,13 @@ static TOOLS: &[ToolSpec] = &[
                       Use since_line_id with the last_line_id from a previous call to stream only \
                       what was appended since. The run banner's environment variable values are \
                       replaced with a placeholder unless the app's Expose env values setting is \
-                      on; values a program prints itself are returned as printed.",
+                      on; values a program prints itself are returned as printed. The banner \
+                      exists at all only while the app's Show environment line on run setting is \
+                      on, so its absence does not mean the configuration has no environment \
+                      variables — get_configuration returns them, and list_configurations returns \
+                      the keys alone. When exposure is on the banner still shows a display form whose \
+                      newlines and carriage returns are escaped, so writing one of those values \
+                      back does not restore it; read values with get_configuration instead.",
         tier: McpPermission::ReadOnly,
         schema: || {
             json!({
@@ -588,7 +594,10 @@ fn type_data_schema() -> Value {
              types into it, so a stored value can be longer than the limit and copying that \
              type_data back is refused even when you changed nothing in it — leave type_data out \
              when you are not changing it, and a value that is already too long has to be \
-             shortened in the app."
+             shortened in the app. The limits bind what you send, not what you receive: responses \
+             carry stored values as they are, so a configuration holding an over-limit value \
+             returns it on every successful call including ones that do not touch it. \
+             list_configurations is the channel that carries no values at all."
         ),
     })
 }
@@ -2016,10 +2025,9 @@ mod tests {
         assert!(err.message.contains("working_directory"), "{}", err.message);
     }
 
-    /// 호출자 문자열이 상태바·디스크·이후 모든 응답으로 증폭되는 것을 막는 상한들. 한 요청은
-    /// body 상한(1 MiB)까지 실어 올 수 있으므로, 필드마다 상한이 없으면 그만큼이 앱 상태에 남는다.
     /// 스키마가 선언한 호출자 문자열 하나의 상한 계약. 종류는 셋뿐이고, 새 문자열 속성은 반드시
-    /// 어느 하나에 들어간다 — 빠지면 `every_caller_string_declares_its_bound`가 멈춘다.
+    /// 어느 하나에 들어간다 — 표에서 빠지면 `no_declared_string_is_missing_from_the_bound_table`이
+    /// 멈춘다.
     #[derive(Debug, Clone, Copy)]
     enum StringBound {
         /// 문자 수 상한. 스키마의 `maxLength`가 파서가 세는 값과 **같아야** 한다 — 갈리면 한쪽

@@ -96,6 +96,11 @@ impl RunConfigManager {
             // 거부도 상태바에 남긴다. stage 2까지는 거부 대상이 실행 툴이었지만 편집 툴이
             // 들어온 뒤로는 "권한 밖 삭제 시도"가 여기서 걸리며, 그것은 성공한 삭제보다 감사
             // 가치가 낮지 않다(보안 항목 8).
+            //
+            // 이 줄은 필요한 tier를 싣지 않는다 — 고칠 수 있는 쪽(호출자)에게 필요한 문구는
+            // 와이어 응답이 이미 싣고(`permission_denial`이 필요·현재 tier와 설정 위치를 준다),
+            // 이 줄은 자기 설정을 아는 사용자에게 "무엇이 시도됐고 막혔다"를 남기는 감사
+            // 기록이다.
             if let Some(tool) = op.tool_name() {
                 self.status_message =
                     format!("[MCP] Denied {tool}: beyond the current permission tier");
