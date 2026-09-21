@@ -4,6 +4,14 @@
 //! `server/discover`로 서버 세대를 프로브한 뒤 요청마다 `_meta` 봉투에 버전을 싣고,
 //! legacy(`2025-11-25`) 클라이언트는 `initialize` 핸드셰이크로 시작한다. 프로브에
 //! 답하지 못하면 클라이언트가 legacy로 폴백하므로 두 경로가 모두 열려 있어야 한다.
+//!
+//! **결과 계약의 출처**: 이 모듈이 지키는 결과 형태(필수 `resultType`, `tools/list`의
+//! `ttlMs`·`cacheScope`)는 공개 스펙 문서가 아니라 설치된 클라이언트 바이너리에서 읽은
+//! 검증기·스키마로 확정했다 — 그 응답을 받는 구현이 무엇을 요구하는지가 유일한 판정 기준이기
+//! 때문이다. **읽은 판본은 `@anthropic-ai/claude-code` 2.1.278**이다. 출처가 그 판본에 묶여
+//! 있으므로, 클라이언트를 올린 뒤에는 등록된 세션에서
+//! `tools/list`와 실패 호출을 한 번씩 실제로 관측한다(§검증 B23) — 단위 테스트는 우리가 적은
+//! 계약만 지키고 그 계약이 여전히 맞는지는 보지 않는다.
 
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -188,11 +196,11 @@ pub fn unsupported_version_error(requested: &str) -> JsonRpcError {
 
 /// `server/discover` 결과 — modern 클라이언트가 서버 세대를 판정하는 프로브 응답.
 ///
-/// `ttlMs`를 짧게(1분) 두는 이유: 사용자가 settings에서 권한 단계를 바꾸면 노출되는
-/// 툴 목록이 즉시 달라진다. 캐시가 길면 클라이언트가 낡은 목록을 계속 들고 있게 된다.
+/// 여기 실리는 것(지원 리비전 · capability · 서버 버전 · 설명)은 빌드마다 고정이라 캐시해도
+/// 되지만, 앱이 다른 버전으로 재시작한 직후를 짧게 잡기 위해 `ttlMs`를 1분으로 둔다.
+/// 값이 호출자와 무관하게 바이너리에만 달려 있으므로 `cacheScope`는 `public`이다.
 pub fn discover_result(server_version: &str) -> Value {
     json!({
-        "resultType": "complete",
         "supportedVersions": SUPPORTED_PROTOCOL_VERSIONS,
         "capabilities": { "tools": { "listChanged": false } },
         "_meta": {
@@ -229,8 +237,24 @@ const INSTRUCTIONS: &str = "Run/Debug configurations and their live terminal ses
     picked in the app's settings, so treat a missing tool as \"not permitted\" rather than \
     \"not supported\".";
 
-/// 성공 응답 봉투.
-pub fn success(id: Option<Value>, result: Value) -> Value {
+/// 성공 응답 봉투. 모든 결과에 `resultType: "complete"`를 싣는다.
+///
+/// 리비전 `2026-07-28` 클라이언트는 메서드와 무관하게 결과마다 이 필드를 요구하고 없으면
+/// 응답을 버린다. `2025-11-25` 클라이언트는 결과 스키마 검증을 아예 하지 않고 이 필드가 있으면
+/// 지운 뒤 통과시킨다. 그래서 무조건 싣는 것이 두 리비전 모두에 맞고 협상된 버전을 이 계층까지
+/// 끌고 올 필요도 없다. 메서드별 결과 빌더가 아니라 봉투가 챙기는 이유는 모든 성공 응답이
+/// 여기를 지나는 것이다 — 새 메서드가 빠뜨릴 수 없다.
+pub fn success(id: Option<Value>, mut result: Value) -> Value {
+    // modern 클라이언트는 `resultType`을 보기 **전에** 결과가 객체인지 보고 아니면 버린다.
+    // JSON-RPC가 허용하는 비객체 결과를 이 프로토콜에서는 쓸 수 없으므로, 아래 `if let`이
+    // 조용히 지나가는 모양을 테스트에서 세운다. 릴리스 빌드에서는 컴파일되지 않으므로 이 보증의
+    // 범위는 디버그 빌드와 테스트 스위트다 — 실제 클라이언트 경로는 §검증 B23이 본다.
+    // 값을 문구에 싣지 않는다 — 결과 payload에는 노출 설정에 따라 환경변수 값이 들어올 수 있고
+    // 이 단정은 디버그 빌드에서 그 문구를 stderr로 내보낸다.
+    debug_assert!(result.is_object(), "MCP 결과는 JSON 객체여야 한다");
+    if let Some(object) = result.as_object_mut() {
+        object.insert("resultType".to_owned(), json!("complete"));
+    }
     json!({ "jsonrpc": "2.0", "id": id, "result": result })
 }
 
@@ -241,6 +265,21 @@ pub fn failure(id: Option<Value>, error: &JsonRpcError) -> Value {
         body["data"] = data.clone();
     }
     json!({ "jsonrpc": "2.0", "id": id, "error": body })
+}
+
+/// `tools/list` 결과.
+///
+/// `ttlMs`(정수 ≥ 0)와 `cacheScope`는 이 메서드를 묶는 **두 리비전의 결과 스키마 모두**가 필수로
+/// 요구하며, `server/discover`와 달리 기본값 폴백이 없어 빠지면 결과가 검증에서 거절된다.
+/// 그래서 리비전에 따라 갈라 싣지 않는다.
+///
+/// `ttlMs: 0`인 이유: 노출되는 목록은 사용자가 settings에서 바꾸는 권한 단계를 따르는데
+/// 우리 capability는 `listChanged: false`여서 변경을 알릴 채널이 없다. 클라이언트는 쓸 때
+/// `expiresAt = now + ttlMs`를 기록하고 읽을 때 `expiresAt > now`인 항목만 서브하므로, 0은 그
+/// 항목이 한 번도 서브되지 않는다는 뜻이다. 목록이 호출자가 아니라 앱 설정 하나에만 달려 있으므로
+/// `cacheScope`는 `public`이다.
+pub fn tools_list_result(tools: Vec<Value>) -> Value {
+    json!({ "tools": tools, "ttlMs": 0, "cacheScope": "public" })
 }
 
 /// `tools/call` 성공 결과. 구조화 payload를 pretty JSON 텍스트 블록으로 싣는다.
@@ -406,11 +445,20 @@ mod tests {
     #[test]
     fn discover_advertises_both_revisions_and_tools() {
         let result = discover_result("1.2.3");
-        assert_eq!(result["resultType"], "complete");
         assert_eq!(result["supportedVersions"][0], PROTOCOL_MODERN);
         assert_eq!(result["supportedVersions"][1], PROTOCOL_LEGACY);
         assert!(result["capabilities"]["tools"].is_object());
         assert_eq!(result["_meta"][META_SERVER_INFO]["version"], "1.2.3");
+    }
+
+    /// modern 리비전(`2026-07-28`) 클라이언트는 결과마다 `resultType`을 요구하므로
+    /// 봉투가 그것을 싣는다 — 메서드별 결과 빌더가 각자 챙기는 형태로는 다음 메서드가 빠뜨린다.
+    #[test]
+    fn a_success_envelope_declares_the_complete_result_type() {
+        let envelope = success(Some(json!(1)), json!({ "tools": [] }));
+
+        assert_eq!(envelope["result"]["resultType"], "complete");
+        assert_eq!(envelope["result"]["tools"], json!([]));
     }
 
     #[test]
@@ -426,6 +474,27 @@ mod tests {
         let err = unsupported_version_error("x");
         let body = failure(Some(json!(1)), &err);
         assert!(body["error"]["data"]["supported"].is_array());
+    }
+
+    /// 비객체 결과는 `resultType`을 실을 자리가 없고 클라이언트도 그것을 먼저 거절한다. 봉투가
+    /// 조용히 지나가는 대신 여기서 세우는 것이 새 메서드에 대한 유일한 구조적 가드다.
+    ///
+    /// `debug_assertions`가 꺼진 프로파일에서는 그 단정이 컴파일되지 않아 `should_panic`이
+    /// 거짓으로 깨진다 — 지금 CI는 debug로만 테스트하지만 프로파일 하나가 그 전제를 바꾼다.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "JSON 객체여야 한다")]
+    fn a_non_object_result_is_a_bug_not_a_silent_pass() {
+        success(Some(json!(1)), json!("done"));
+    }
+
+    #[test]
+    fn the_tool_list_result_carries_the_cache_fields() {
+        let result = tools_list_result(vec![json!({ "name": "list_sessions" })]);
+
+        assert_eq!(result["tools"][0]["name"], "list_sessions");
+        assert_eq!(result["ttlMs"], 0);
+        assert_eq!(result["cacheScope"], "public");
     }
 
     #[test]

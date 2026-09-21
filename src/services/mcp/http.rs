@@ -6,7 +6,7 @@
 use super::protocol::{
     INTERNAL_ERROR, INVALID_PARAMS, JsonRpcError, METHOD_NOT_FOUND, Request, VersionCheck,
     check_protocol_version, discover_result, failure, initialize_result, parse_request, success,
-    tool_error, tool_result, unsupported_version_error,
+    tool_error, tool_result, tools_list_result, unsupported_version_error,
 };
 use super::{McpEvent, McpOp, McpOutcome, McpRequest, McpServerConfig, tools};
 use bytes::Bytes;
@@ -198,7 +198,7 @@ async fn dispatch(request: &Request, ctx: &ServerContext) -> Result<Value, JsonR
         )),
         "ping" => Ok(json!({})),
         "tools/list" => match bridge(ctx, McpOp::ListTools).await? {
-            McpOutcome::ToolList(tools) => Ok(json!({ "tools": tools })),
+            McpOutcome::ToolList(tools) => Ok(tools_list_result(tools)),
             other => Err(unexpected_outcome("tools/list", &other)),
         },
         "tools/call" => {
@@ -514,6 +514,59 @@ mod tests {
 
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["result"]["protocolVersion"], PROTOCOL_LEGACY);
+    }
+
+    /// modern 리비전의 결과 검증은 **메서드와 무관하게** `resultType`을 요구하고 없으면
+    /// 그 응답을 버린다. 한 메서드만 재는 테스트는 다음에 붙는 메서드를 놓치므로
+    /// `dispatch`의 모든 갈래를 함께 훑는다.
+    #[tokio::test]
+    async fn every_dispatched_result_declares_its_result_type() {
+        let server = TestServer::start(HashMap::from([
+            ("tools/list", McpOutcome::ToolList(vec![])),
+            (
+                "list_sessions",
+                McpOutcome::Payload(json!({ "sessions": [] })),
+            ),
+            (
+                "list_configurations",
+                McpOutcome::Failure("nothing loaded".to_owned()),
+            ),
+        ]))
+        .await;
+
+        let calls = [
+            request("server/discover", json!({})),
+            request("initialize", json!({ "protocolVersion": PROTOCOL_MODERN })),
+            request("ping", json!({})),
+            request("tools/list", json!({})),
+            request("tools/call", json!({ "name": "list_sessions" })),
+            request("tools/call", json!({ "name": "list_configurations" })),
+        ];
+
+        for call in calls {
+            let label = format!("{} {}", call["method"], call["params"]["name"]);
+            let (status, body) = server.call(call).await;
+
+            assert_eq!(status, StatusCode::OK, "{label}");
+            assert_eq!(body["result"]["resultType"], "complete", "{label}");
+        }
+    }
+
+    /// `tools/list`만 결과 스키마가 `ttlMs`·`cacheScope`를 기본값 폴백 없이 요구한다.
+    #[tokio::test]
+    async fn the_tool_list_carries_the_cache_fields_the_client_requires() {
+        let server = TestServer::start(HashMap::from([(
+            "tools/list",
+            McpOutcome::ToolList(vec![json!({ "name": "list_sessions" })]),
+        )]))
+        .await;
+
+        let (status, body) = server.call(request("tools/list", json!({}))).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["result"]["tools"][0]["name"], "list_sessions");
+        assert_eq!(body["result"]["ttlMs"], 0);
+        assert_eq!(body["result"]["cacheScope"], "public");
     }
 
     #[tokio::test]
