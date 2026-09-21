@@ -722,17 +722,58 @@ impl McpOp {
     }
 }
 
+/// 스키마의 `properties` 밖에 있는 키를 거절한다 — 스키마가 선언한 `additionalProperties: false`의
+/// 서버 쪽 집행이다. 이 함수는 그 키워드를 읽지 않고 무조건 닫으며, 선언이 실제로 닫혀 있는지는
+/// `every_tool_declares_a_closed_argument_object`가 지킨다.
+///
+/// 판정을 스키마에서 읽는 이유: 선언과 집행이 같은 원본을 쓰면 둘이 갈라질 수 없고 새 툴이
+/// 자동으로 덮인다. 편집 툴 셋은 `deny_unknown_fields`로도 같은 것을 막지만, 나머지 아홉은 아는
+/// 키만 꺼내 읽어 오타가 호출자의 의도를 조용히 기본값으로 접었다. 유실되는 것이 데이터가
+/// 아니라 의도이므로 응답만 보고는 알 수 없다.
+///
+/// 키를 절단해 싣는 것은 본문 상한 1 MiB를 통과한 키 하나가 그만큼의 오류 문구가 되는 것을
+/// 막기 위한 것이다(`truncate_parse_error`와 같은 증폭 종류이므로 같은 상한을 쓴다).
+fn reject_unknown_arguments(tool: &ToolSpec, args: &Value) -> Result<(), JsonRpcError> {
+    // 명시적 `null`은 부재와 같게 다룬다. `Request::arguments()`가 부재를 `{}`로 접으므로 여기서
+    // 갈라 놓으면 같은 호출이 클라이언트의 표기 습관에 따라 달라지고, `null`에는 버려질 의도가
+    // 없다. 의도를 담은 다른 비객체(문자열·배열·수)는 거절한다 — 그것을 통과시키면 무인자 툴 둘이
+    // 그대로 성공해, 이 함수가 막으려는 "의도가 조용히 버려진다"가 된다.
+    if args.is_null() {
+        return Ok(());
+    }
+    let Some(supplied) = args.as_object() else {
+        return Err(invalid_params(format!(
+            "{}: arguments must be an object",
+            tool.name
+        )));
+    };
+    let schema = (tool.schema)();
+    let declared = schema["properties"].as_object();
+
+    for key in supplied.keys() {
+        if !declared.is_some_and(|properties| properties.contains_key(key)) {
+            return Err(invalid_params(truncate_parse_error(&format!(
+                "{}: unknown argument `{key}`",
+                tool.name
+            ))));
+        }
+    }
+
+    Ok(())
+}
+
 /// `tools/call`의 이름과 인자를 작업으로 변환한다.
 ///
 /// 이름이 카탈로그에 없으면 `-32601`, 인자가 스키마에 맞지 않으면 `-32602`로 거부한다.
 /// 권한 검사는 여기서 하지 않는다 — 현재 권한은 앱 상태이므로 브리지 뒤에서 판정한다.
 pub fn parse_call(name: &str, args: &Value) -> Result<McpOp, JsonRpcError> {
-    if find(name).is_none() {
+    let Some(tool) = find(name) else {
         return Err(JsonRpcError::new(
             METHOD_NOT_FOUND,
             format!("Unknown tool: {name}"),
         ));
-    }
+    };
+    reject_unknown_arguments(tool, args)?;
 
     match name {
         "list_configurations" => Ok(McpOp::ListConfigurations),
@@ -866,8 +907,11 @@ fn truncate_regex_error(text: &str) -> String {
 
 /// 인자 객체를 타입으로 읽는다. 필드를 손으로 꺼내지 않는 것은 읽기 쪽(`configuration_detail`)이
 /// 구성을 통째로 직렬화하는 것과 같은 이유다 — 두 방향이 같은 serde 표현을 쓰면, 모델이 늘어날 때
-/// 한쪽만 뒤처지지 않는다. `deny_unknown_fields`가 스키마의 `additionalProperties: false`를
-/// 서버에서 실제로 집행하는 역할까지 겸한다.
+/// 한쪽만 뒤처지지 않는다.
+///
+/// `additionalProperties: false`의 집행은 분업이다: 최상위 키는 `reject_unknown_arguments`가
+/// 열두 툴 전부에서 막고, 여기 `deny_unknown_fields`는 그것이 볼 수 없는 **중첩** 필드
+/// (`type_data` 안)까지 같은 것을 막는다.
 fn parse_args<'de, T: Deserialize<'de>>(tool: &str, args: &'de Value) -> Result<T, JsonRpcError> {
     T::deserialize(args)
         .map_err(|e| invalid_params(format!("{tool}: {}", truncate_parse_error(&e.to_string()))))
@@ -1824,6 +1868,65 @@ mod tests {
 
             assert_eq!(err.code, INVALID_PARAMS, "{typo}");
             assert!(err.message.contains(typo), "{typo}: {}", err.message);
+        }
+    }
+
+    /// 집행의 원본이 스키마이므로(`reject_unknown_arguments`) 열두 스키마가 실제로 닫혀
+    /// 있는지가 그 집행의 전제다. 새 툴이 느슨한 스키마로 들어오면 여기서 걸린다.
+    #[test]
+    fn every_tool_declares_a_closed_argument_object() {
+        for tool in TOOLS {
+            let schema = (tool.schema)();
+
+            assert_eq!(schema["type"], "object", "{}", tool.name);
+            assert_eq!(schema["additionalProperties"], false, "{}", tool.name);
+            assert!(schema["properties"].is_object(), "{}", tool.name);
+        }
+    }
+
+    /// 선언이 집행되는지. 편집 툴 셋은 `deny_unknown_fields`가 이미 막았지만 나머지 아홉은
+    /// 아는 키만 꺼내 읽어 오타가 조용히 기본값으로 접혔다 — 와이어 실측에서
+    /// `read_session_output{tail_line: 1}`이 통과해 `DEFAULT_TAIL_LINES`가 서고, 응답에는
+    /// 그 사실이 없어 호출자가 자기 의도가 버려진 것을 알 방법이 없었다.
+    #[test]
+    fn an_unknown_argument_is_rejected_for_every_tool() {
+        for tool in TOOLS {
+            let err = parse_call(tool.name, &json!({ "tail_line": 1 }))
+                .expect_err("미지 인자는 거절돼야 한다");
+
+            assert_eq!(err.code, INVALID_PARAMS, "{}", tool.name);
+            assert!(
+                err.message.contains("tail_line"),
+                "{}: {}",
+                tool.name,
+                err.message
+            );
+        }
+    }
+
+    /// 명시적 `null`은 부재와 같게 지난다 — 부재를 `{}`로 접는 `Request::arguments()`와 갈라지면
+    /// 같은 호출이 클라이언트의 표기 습관에 따라 달라진다.
+    #[test]
+    fn null_arguments_are_treated_as_absent() {
+        assert!(parse_call("list_sessions", &Value::Null).is_ok());
+        assert!(parse_call("list_configurations", &Value::Null).is_ok());
+    }
+
+    /// 객체가 아닌 `arguments`는 키 집합이 없어 검사를 그냥 지났고, 무인자 툴 둘은 그대로
+    /// 성공했다 — 오타 하나가 접히는 것과 같은 종류의 조용한 유실이다.
+    #[test]
+    fn arguments_that_are_not_an_object_are_rejected() {
+        for tool in TOOLS {
+            let err = parse_call(tool.name, &json!("tail_line=1"))
+                .expect_err("객체가 아닌 인자는 거절돼야 한다");
+
+            assert_eq!(err.code, INVALID_PARAMS, "{}", tool.name);
+            assert!(
+                err.message.contains("must be an object"),
+                "{}: {}",
+                tool.name,
+                err.message
+            );
         }
     }
 
