@@ -197,7 +197,11 @@ pub struct SearchState {
 pub struct RunSession {
     /// 고유 세션 식별자
     pub id: Uuid,
-    /// 실행 중인 구성의 이름
+    /// 이 세션이 실행한 구성의 id. 재실행이 구성을 되찾는 기준이며 개명에 영향받지 않는다.
+    pub config_id: Uuid,
+    /// 세션 객체가 만들어진 시점의 구성 이름. 표시·로그와 `list_sessions` 응답, 출력 내보내기
+    /// 기본 파일명에만 쓰이며 구성을 지목하는 것은 `config_id`다 — 그래서 개명 뒤 이 값은
+    /// 낡는다. 재실행은 이 값을 갱신하지 않는다(`started_at`만 새로 찍는다).
     pub config_name: String,
     /// 세션 시작 시간
     pub started_at: SystemTime,
@@ -270,6 +274,7 @@ impl std::fmt::Debug for RunSession {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RunSession")
             .field("id", &self.id)
+            .field("config_id", &self.config_id)
             .field("config_name", &self.config_name)
             .field("started_at", &self.started_at)
             .field("output_lines_count", &self.output_lines.len())
@@ -286,13 +291,11 @@ impl std::fmt::Debug for RunSession {
 }
 
 impl RunSession {
-    /// 새로운 실행 세션을 생성
-    ///
-    /// # Arguments
-    /// * `config_name` - 실행할 구성의 이름
-    pub fn new(config_name: String) -> Self {
+    /// 새로운 실행 세션을 생성. 두 인자의 뜻은 같은 이름의 필드 doc에 있다.
+    pub fn new(config_id: Uuid, config_name: String) -> Self {
         Self {
             id: Uuid::new_v4(),
+            config_id,
             config_name,
             started_at: SystemTime::now(),
             output_lines: VecDeque::new(),
@@ -747,9 +750,15 @@ pub fn format_duration(duration: Duration) -> String {
 mod tests {
     use super::*;
 
+    /// 구성과 이어지지 않은 세션. 이 파일의 테스트는 출력·검색·상태 계산만 보므로 구성 id가
+    /// 무엇을 가리키는지는 판정에 들어오지 않는다(재실행 조회는 `app` 쪽 테스트가 본다).
+    fn session_for_test(config_name: &str) -> RunSession {
+        RunSession::new(Uuid::new_v4(), config_name.to_string())
+    }
+
     #[test]
     fn test_basic_output() {
-        let mut session = RunSession::new("test".to_string());
+        let mut session = session_for_test("test");
 
         session.add_output_line("Line 1");
         session.add_output_line("Line 2");
@@ -784,7 +793,7 @@ mod tests {
     #[test]
     fn custom_max_output_lines_caps_buffer() {
         // 세션별 max_output_lines를 작게 설정하면 그 한도로 evict된다(설정 주입 검증).
-        let mut session = RunSession::new("test".to_string());
+        let mut session = session_for_test("test");
         session.max_output_lines = 3;
         for i in 0..10 {
             session.add_output_line(&format!("line {i}"));
@@ -796,7 +805,7 @@ mod tests {
     fn evicting_a_banner_line_forgets_its_masking_record() {
         // 재실행이 출력을 지우지 않으므로 이 기록은 세션 수명 내내 쌓인다. 버려진 줄의 id를
         // 남겨 두면 마스킹 판정(선형 탐색)의 비용이 재실행 횟수만큼 늘어난다.
-        let mut session = RunSession::new("test".to_string());
+        let mut session = session_for_test("test");
         session.max_output_lines = 2;
         session.add_env_banner_line("Environment: API_TOKEN=secret");
         let banner_id = session.output_lines.front().expect("banner line").0;
@@ -809,7 +818,7 @@ mod tests {
 
     #[test]
     fn test_max_lines_limit() {
-        let mut session = RunSession::new("test".to_string());
+        let mut session = session_for_test("test");
 
         // DEFAULT_MAX_OUTPUT_LINES를 초과하는 라인 추가
         for i in 0..DEFAULT_MAX_OUTPUT_LINES + 100 {
@@ -875,7 +884,7 @@ mod tests {
 
     #[test]
     fn test_clear_output() {
-        let mut session = RunSession::new("test".to_string());
+        let mut session = session_for_test("test");
 
         session.add_output_line("Line 1");
         session.add_output_line("Line 2");
@@ -892,7 +901,7 @@ mod tests {
 
     #[test]
     fn total_bytes_tracks_current_lines() {
-        let mut session = RunSession::new("x".to_string());
+        let mut session = session_for_test("x");
         session.add_output_line("hello");
         session.add_output_line("world!");
         // 누적 바이트는 현재 보관 중인 줄들의 세그먼트 바이트 합과 정확히 일치해야 한다.
@@ -906,7 +915,7 @@ mod tests {
 
     #[test]
     fn long_line_is_truncated_with_marker() {
-        let mut session = RunSession::new("x".to_string());
+        let mut session = session_for_test("x");
         let huge = "a".repeat(200 * 1024); // 200KB > MAX_STORED_LINE_BYTES(64KB)
         session.add_output_line(&huge);
 
@@ -931,7 +940,7 @@ mod tests {
 
     #[test]
     fn byte_budget_evicts_before_line_cap() {
-        let mut session = RunSession::new("x".to_string());
+        let mut session = session_for_test("x");
         // 각 줄 64KB. 줄 수 상한(50000)엔 한참 못 미치지만 바이트 예산(16MiB)이 먼저 차서
         // 오래된 줄이 제거되어야 한다.
         let big = "x".repeat(64 * 1024);
@@ -953,7 +962,7 @@ mod tests {
 
     #[test]
     fn status_kind_reflects_state() {
-        let mut session = RunSession::new("x".to_string());
+        let mut session = session_for_test("x");
         assert_eq!(session.status_kind(), SessionStatusKind::Running);
 
         session.is_running = false;
@@ -971,7 +980,7 @@ mod tests {
     fn a_failure_without_an_exit_code_is_not_a_user_stop() {
         // 스폰 실패와 실행 중단은 종료 코드를 남기지 못한다. `Stopped`로 접히면 배지와 MCP
         // 응답 양쪽에서 "사용자가 멈춤"과 구별되지 않는다.
-        let mut session = RunSession::new("x".to_string());
+        let mut session = session_for_test("x");
         session.is_running = false;
         session.run_error = Some("Failed to spawn process: not found".to_string());
 
@@ -985,7 +994,7 @@ mod tests {
     #[test]
     fn an_exit_code_outranks_a_recorded_error() {
         // 프로세스가 코드를 남겼다면 그게 결과다 — 사유는 앞선 실행의 잔재일 수 있다.
-        let mut session = RunSession::new("x".to_string());
+        let mut session = session_for_test("x");
         session.is_running = false;
         session.run_error = Some("Run interrupted unexpectedly".to_string());
         session.exit_code = Some(3);
@@ -1004,7 +1013,7 @@ mod tests {
 
     #[test]
     fn replace_last_line_swaps_content_keeping_line_id() {
-        let mut session = RunSession::new("x".to_string());
+        let mut session = session_for_test("x");
         session.add_output_line("building 10%");
         let (id_before, _) = session.output_lines[0].clone();
         let bytes_before = session.total_bytes;
@@ -1025,7 +1034,7 @@ mod tests {
 
     #[test]
     fn replace_last_line_on_empty_appends() {
-        let mut session = RunSession::new("x".to_string());
+        let mut session = session_for_test("x");
         session.replace_last_line("hello");
         assert_eq!(session.output_lines.len(), 1);
         assert_eq!(line_text_at(&session, 0), "hello");
@@ -1034,7 +1043,7 @@ mod tests {
     #[test]
     fn replace_last_line_applies_cr_collapse_defense() {
         // 방어 대칭: Replace 텍스트에 \r가 섞여 와도 add와 동일하게 붕괴한다.
-        let mut session = RunSession::new("x".to_string());
+        let mut session = session_for_test("x");
         session.add_output_line("start");
         session.replace_last_line("10%\r99%\r");
         assert_eq!(line_text_at(&session, 0), "99%");
@@ -1043,7 +1052,7 @@ mod tests {
     #[test]
     fn apply_output_event_routes_line_and_replace() {
         use super::OutputEvent;
-        let mut session = RunSession::new("x".to_string());
+        let mut session = session_for_test("x");
         session.apply_output_event(&OutputEvent::Line(String::from("a")));
         session.apply_output_event(&OutputEvent::Line(String::from("b")));
         session.apply_output_event(&OutputEvent::Replace(String::from("B")));
@@ -1058,7 +1067,7 @@ mod tests {
 
         // MCP 마스킹은 이 기록만 보고 판정한다 — 이벤트가 일반 라인으로 들어가면 값이 그대로
         // 나가면서 나머지 테스트는 전부 초록으로 남는다.
-        let mut session = RunSession::new("x".to_string());
+        let mut session = session_for_test("x");
         session.apply_output_event(&OutputEvent::Line(String::from("Environment: FAKE=1")));
         session.apply_output_event(&OutputEvent::EnvBanner(String::from("Environment: T=s")));
 
@@ -1075,7 +1084,7 @@ mod tests {
     fn replacing_a_banner_line_drops_its_masking_record() {
         // 기록의 뜻은 "이 줄이 지금 배너를 담고 있다"다 — id를 재사용하는 교체가 지나가면
         // 그 줄은 더 이상 배너가 아니다.
-        let mut session = RunSession::new("x".to_string());
+        let mut session = session_for_test("x");
         session.add_env_banner_line("Environment: API_TOKEN=secret");
         let banner_id = session.output_lines[0].0;
 
@@ -1087,7 +1096,7 @@ mod tests {
     #[test]
     fn cr_collapses_progress_bar_to_final_state() {
         // cargo/npm 진행바 형태: 같은 줄을 \r로 되감아 재그림 → 최종 상태만 남는다.
-        let mut session = RunSession::new("x".to_string());
+        let mut session = session_for_test("x");
         session.add_output_line("Downloading 10%\rDownloading 55%\rDownloading 100%");
         assert_eq!(session.output_lines.len(), 1);
         assert_eq!(line_text_at(&session, 0), "Downloading 100%");
@@ -1095,7 +1104,7 @@ mod tests {
 
     #[test]
     fn cr_collapse_respects_newline_boundaries() {
-        let mut session = RunSession::new("x".to_string());
+        let mut session = session_for_test("x");
         session.add_output_line("a\rb\nc");
         assert_eq!(session.output_lines.len(), 2);
         assert_eq!(line_text_at(&session, 0), "b");
@@ -1106,11 +1115,11 @@ mod tests {
     fn trailing_bare_cr_preserves_last_content() {
         // 청크 경계/EOF가 \r 직후에 떨어진 경우 — 아직 덮어쓴 내용이 없으므로
         // 마지막 상태를 보존해야 한다 (빈 줄로 붕괴 금지).
-        let mut session = RunSession::new("x".to_string());
+        let mut session = session_for_test("x");
         session.add_output_line("Downloading 42%\r");
         assert_eq!(line_text_at(&session, 0), "Downloading 42%");
 
-        let mut session = RunSession::new("x".to_string());
+        let mut session = session_for_test("x");
         session.add_output_line("a\rb\r\r\r");
         assert_eq!(line_text_at(&session, 0), "b");
     }
@@ -1119,7 +1128,7 @@ mod tests {
     fn clear_output_drops_pending_scroll_target() {
         // Clear Log 시 1회성 점프 목표도 함께 버린다 — 남으면 빈 버퍼에서 소비되지
         // 못해 auto_scroll 판정을 계속 우회시킨다 (리뷰 회귀 테스트).
-        let mut session = RunSession::new("x".to_string());
+        let mut session = session_for_test("x");
         session.add_output_line("hello");
         session.scroll_target = Some(0);
         session.clear_output();
@@ -1130,7 +1139,7 @@ mod tests {
     fn cr_with_erase_sequence_keeps_clean_final_text() {
         // "\r\x1b[K" (줄 되감기 + 지우기) — 지우기 시퀀스는 ANSI 파서가 소비해
         // 최종 텍스트만 남는다.
-        let mut session = RunSession::new("x".to_string());
+        let mut session = session_for_test("x");
         session.add_output_line("building 3/10\r\x1b[Kbuilding 10/10 done");
         assert_eq!(session.output_lines.len(), 1);
         assert_eq!(line_text_at(&session, 0), "building 10/10 done");
@@ -1138,7 +1147,7 @@ mod tests {
 
     #[test]
     fn status_badge_includes_duration_for_all_terminal_states() {
-        let mut session = RunSession::new("x".to_string());
+        let mut session = session_for_test("x");
         session.is_running = false;
         session.finished_at = Some(session.started_at + Duration::from_millis(3400));
 
@@ -1152,7 +1161,7 @@ mod tests {
 
     #[test]
     fn compact_badge_stays_short_for_fixed_width_sidebar() {
-        let mut session = RunSession::new("x".to_string());
+        let mut session = session_for_test("x");
         // 실행 중: 경과시간만 (접두사 없음 — 고정 폭 배지에 맞춤).
         assert!(!session.status_badge_label_compact().starts_with("Running"));
 
@@ -1169,7 +1178,7 @@ mod tests {
 
     #[test]
     fn status_badge_shows_live_elapsed_while_running() {
-        let session = RunSession::new("x".to_string());
+        let session = session_for_test("x");
         let label = session.status_badge_label();
         // 경과 시간은 비결정적이므로 형식만 검증 ("Running <duration>").
         assert!(
@@ -1180,7 +1189,7 @@ mod tests {
 
     #[test]
     fn status_badge_without_finish_time_omits_duration() {
-        let mut session = RunSession::new("x".to_string());
+        let mut session = session_for_test("x");
         session.is_running = false;
         session.exit_code = Some(1);
         assert_eq!(session.status_badge_label(), "✕ exit 1");
@@ -1190,7 +1199,7 @@ mod tests {
 
     #[test]
     fn search_matches_substring_returns_line_and_char_ranges() {
-        let mut session = RunSession::new("x".to_string());
+        let mut session = session_for_test("x");
         session.add_output_line("Starting build");
         session.add_output_line("ERROR: boom"); // line 1
         session.add_output_line("warning: minor");
@@ -1217,7 +1226,7 @@ mod tests {
 
     #[test]
     fn search_matches_finds_multiple_non_overlapping_per_line() {
-        let mut session = RunSession::new("x".to_string());
+        let mut session = session_for_test("x");
         session.add_output_line("aXaXa"); // "a" at char 0, 2, 4
 
         let m = session.search_matches("a", false);
@@ -1229,7 +1238,7 @@ mod tests {
 
     #[test]
     fn search_matches_char_index_accounts_for_wide_chars() {
-        let mut session = RunSession::new("x".to_string());
+        let mut session = session_for_test("x");
         session.add_output_line("가나error다"); // "error" begins at char index 2
 
         let m = session.search_matches("error", false);
@@ -1239,7 +1248,7 @@ mod tests {
 
     #[test]
     fn search_matches_supports_regex_case_insensitive() {
-        let mut session = RunSession::new("x".to_string());
+        let mut session = session_for_test("x");
         session.add_output_line("error 12"); // line 0
         session.add_output_line("warn 3");
         session.add_output_line("ERROR 999"); // line 2
@@ -1264,7 +1273,7 @@ mod tests {
 
     #[test]
     fn stdin_history_dedupes_consecutive_and_caps() {
-        let mut session = RunSession::new("x".to_string());
+        let mut session = session_for_test("x");
         session.push_stdin_history("a");
         session.push_stdin_history("a"); // 연속 중복 → 스킵
         session.push_stdin_history("b");
@@ -1285,7 +1294,7 @@ mod tests {
 
     #[test]
     fn stdin_history_skips_empty_lines() {
-        let mut session = RunSession::new("x".to_string());
+        let mut session = session_for_test("x");
         session.push_stdin_history("");
         assert!(session.stdin_history.is_empty());
         session.push_stdin_history("a");
@@ -1295,7 +1304,7 @@ mod tests {
 
     #[test]
     fn stdin_history_navigation_walks_and_restores_draft() {
-        let mut session = RunSession::new("x".to_string());
+        let mut session = session_for_test("x");
         // 바 닫힘 → no-op.
         assert!(!session.navigate_stdin_history(true));
         // 바 열림 + 이력 없음 → no-op.
@@ -1369,7 +1378,7 @@ mod tests {
         ];
         for (query, regex) in queries {
             for cap in [1usize, 3, 8] {
-                let mut session = RunSession::new("x".to_string());
+                let mut session = session_for_test("x");
                 session.max_output_lines = cap;
                 session.search = Some(SearchState {
                     query: query.to_string(),
@@ -1426,7 +1435,7 @@ mod tests {
     fn incremental_search_handles_eviction_and_replace_edges() {
         // (a) 옛 마지막 줄 자체가 한 배치에서 evict — 캐시 전량 드랍 후 전 구간
         // 재스캔과 동치여야 한다.
-        let mut session = RunSession::new("x".to_string());
+        let mut session = session_for_test("x");
         session.max_output_lines = 2;
         session.search = Some(SearchState {
             query: String::from("m"),
@@ -1446,7 +1455,7 @@ mod tests {
 
         // (b) 배치 전 빈 버퍼 → anchor None → 전체 재스캔 폴백. 빈 버퍼 Replace는
         // add 폴백으로 새 id를 받는 케이스이기도 하다.
-        let mut session = RunSession::new("x".to_string());
+        let mut session = session_for_test("x");
         session.search = Some(SearchState {
             query: String::from("m"),
             ..Default::default()
@@ -1462,7 +1471,7 @@ mod tests {
         assert_eq!(session.search.as_ref().unwrap().matches.len(), 1);
 
         // Replace가 옛 마지막 줄의 매치를 바꾸는 케이스 — 캐시 꼬리 재스캔 검증.
-        let mut session = RunSession::new("x".to_string());
+        let mut session = session_for_test("x");
         session.search = Some(SearchState {
             query: String::from("hit"),
             ..Default::default()
@@ -1482,7 +1491,7 @@ mod tests {
 
         // MAX_STORED_LINE_BYTES 절단 라인 — 마커("…[truncated]")를 쿼리로 매칭해도
         // 증분과 전체가 동일해야 한다 (양쪽 다 저장된 세그먼트를 스캔하므로).
-        let mut session = RunSession::new("x".to_string());
+        let mut session = session_for_test("x");
         session.search = Some(SearchState {
             query: String::from("truncated"),
             ..Default::default()
@@ -1501,7 +1510,7 @@ mod tests {
 
         // 방어 분기: anchor는 Some인데 배치 후 버퍼가 빈 경우 — 클리어로 폴백.
         // (프로덕션 캡은 최소 1000이라 도달 불가; 캡 완화/테스트 직설정 대비 회귀 게이트.)
-        let mut session = RunSession::new("x".to_string());
+        let mut session = session_for_test("x");
         session.max_output_lines = 3;
         session.search = Some(SearchState {
             query: String::from("m"),
@@ -1521,7 +1530,7 @@ mod tests {
         assert_eq!(search.current, 0);
 
         // 검색 닫힘 → no-op (panic 없이).
-        let mut session = RunSession::new("x".to_string());
+        let mut session = session_for_test("x");
         session.add_output_line("m");
         let anchor = capture_anchor(&session);
         session.add_output_line("m2");
@@ -1531,7 +1540,7 @@ mod tests {
 
     #[test]
     fn stdin_history_edit_resets_navigation() {
-        let mut session = RunSession::new("x".to_string());
+        let mut session = session_for_test("x");
         session.push_stdin_history("a");
         session.push_stdin_history("b");
         session.stdin_input = Some(String::from("draft"));

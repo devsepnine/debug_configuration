@@ -192,8 +192,11 @@ static TOOLS: &[ToolSpec] = &[
         title: "List execution sessions",
         description: "List execution sessions with their status (running, succeeded, failed with \
                       exit code, stopped by the user, or errored when the run produced no exit \
-                      code at all — that reason is in the error field), start time, duration and \
-                      buffered output line count.",
+                      code at all — that reason is in the error field), start time, duration, \
+                      buffered output line count, and the configuration name recorded when the \
+                      session was created, which does not follow a later rename. No configuration \
+                      id is included, so keep the one list_configurations returns if you need to \
+                      address the configuration afterwards.",
         tier: McpPermission::ReadOnly,
         schema: || json!({ "type": "object", "properties": {}, "additionalProperties": false }),
     },
@@ -456,13 +459,17 @@ static TOOLS: &[ToolSpec] = &[
                     "name": {
                         "type": "string",
                         "maxLength": MAX_NAME_CHARS,
-                        "description": "New display name. Must not be a UUID. Renaming detaches \
-                                        the sessions already started from this configuration: \
-                                        rerun_session resolves the configuration by name, so \
-                                        their rerun fails and list_sessions keeps reporting the \
-                                        old name. Restoring the name reattaches them — and so \
-                                        does any other configuration that takes that name, \
-                                        because a session carries only the name.",
+                        "description": "New display name. Must not be a UUID. Sessions already \
+                                        started from this configuration stay attached across a \
+                                        rename because rerun_session resolves the configuration \
+                                        by id, but list_sessions keeps reporting the name the \
+                                        session was created with. No session response carries \
+                                        the configuration id, so a session on its own cannot be \
+                                        mapped back once the name differs — keep the \
+                                        configuration's own id (configuration_id in the create, \
+                                        update and delete responses, id in list_configurations \
+                                        and get_configuration) and pass it as configuration, \
+                                        which accepts a UUID.",
                     },
                     "working_directory": {
                         "type": "string",

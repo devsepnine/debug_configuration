@@ -3681,7 +3681,7 @@ time.sleep(30)'";
                 return;
             };
             assert_eq!(status, Ok(0));
-            let mut session = crate::models::RunSession::new(String::from("t"));
+            let mut session = crate::models::RunSession::new(Uuid::new_v4(), String::from("t"));
             let mut assembler = LineAssembler::new();
             let mut batch = EventBatch::default();
             assembler.push_bytes(raw.as_bytes(), &mut batch);

@@ -355,7 +355,7 @@ impl RunConfigManager {
         let restarted = self.sessions[position].id;
 
         if restarted == session_id {
-            // id가 그대로면 재실행이 시작되지 않았다(세션의 구성이 그 사이 삭제·개명된 경우).
+            // id가 그대로면 재실행이 시작되지 않았다(세션의 구성이 그 사이 삭제된 경우).
             let reason = scavenged_reason(&mut self.status_message);
             self.status_message = format!("[MCP] Failed to rerun '{config_name}': {reason}");
             request.respond(McpOutcome::Failure(format!(
@@ -1620,12 +1620,20 @@ mod tests {
         }
     }
 
+    /// 어떤 구성도 가리키지 않는 세션. 출력을 읽고 검색하는 테스트용이며, 재실행을 타는
+    /// 테스트는 `attach_first_session_to_first_configuration`으로 앱의 구성에 이어 준다.
     fn session_with_output(lines: &[&str]) -> RunSession {
-        let mut session = RunSession::new("build".to_string());
+        let mut session = RunSession::new(Uuid::new_v4(), "build".to_string());
         for line in lines {
             session.add_output_line(line);
         }
         session
+    }
+
+    /// 픽스처 세션을 앱의 구성에 잇는다. 재실행은 세션이 담은 구성 id로 조회하므로, 이 결합이
+    /// 없으면 재실행 경로가 "구성 없음"으로 끝나고 테스트가 그 경로를 보지 못한다.
+    fn attach_first_session_to_first_configuration(app: &mut RunConfigManager) {
+        app.sessions[0].config_id = app.configurations[0].id;
     }
 
     #[test]
@@ -2117,6 +2125,7 @@ mod tests {
         // 않는 세션을 폴링한다.
         let mut app = app_at_execute_tier();
         app.sessions = vec![session_with_output(&["old output"])];
+        attach_first_session_to_first_configuration(&mut app);
         let old_id = app.sessions[0].id;
 
         let payload = payload_of(respond_to(
@@ -2140,6 +2149,7 @@ mod tests {
         // 경계는 새 실행이 찍는 배너(`═══` + `Configuration:`)가 그린다.
         let mut app = app_at_execute_tier();
         app.sessions = vec![session_with_output(&["first run output"])];
+        attach_first_session_to_first_configuration(&mut app);
         let old_id = app.sessions[0].id;
 
         let _ = respond_to(
@@ -2151,6 +2161,10 @@ mod tests {
         );
 
         let new_id = app.sessions[0].id;
+        assert_ne!(
+            new_id, old_id,
+            "재실행이 시작되지 않으면 출력은 저절로 남으므로 아래 단정이 공허해진다"
+        );
         assert!(
             read_output(&mut app, new_id).contains("first run output"),
             "the previous run's output must survive a rerun"
@@ -2163,6 +2177,7 @@ mod tests {
         // 처음 읽는 에이전트는 이전 실행의 실패 출력을 새 실행의 것으로 읽는다.
         let mut app = app_at_execute_tier();
         app.sessions = vec![session_with_output(&["first run output"])];
+        attach_first_session_to_first_configuration(&mut app);
         let old_id = app.sessions[0].id;
         let boundary = app.sessions[0]
             .output_lines
@@ -2202,6 +2217,7 @@ mod tests {
     fn the_same_rerun_request_id_does_not_restart_twice() {
         let mut app = app_at_execute_tier();
         app.sessions = vec![session_with_output(&["old output"])];
+        attach_first_session_to_first_configuration(&mut app);
         let old_id = app.sessions[0].id;
 
         let first = payload_of(respond_to(
@@ -2230,7 +2246,7 @@ mod tests {
 
     #[test]
     fn rerun_without_its_configuration_is_a_failure() {
-        // 구성이 삭제·개명되면 재실행이 시작되지 않는다 — id가 그대로인 것이 그 신호다.
+        // 구성이 삭제되면 재실행이 시작되지 않는다 — id가 그대로인 것이 그 신호다.
         let mut app = app_at_execute_tier();
         app.sessions = vec![session_with_output(&["old output"])];
         app.configurations.clear();
@@ -2495,7 +2511,7 @@ mod tests {
     /// 앱이 배너를 찍는 것과 같은 순서로 세션을 만든다. 환경변수 줄만 `add_env_banner_line`으로
     /// 들어가야 마스킹 판정이 실제 경로(`send_command_info`의 `EnvBanner` 이벤트)와 같아진다.
     fn session_with_env_banner() -> RunSession {
-        let mut session = RunSession::new("build".to_string());
+        let mut session = RunSession::new(Uuid::new_v4(), "build".to_string());
         session.add_output_line("Configuration: build");
         session.add_env_banner_line("Environment: API_TOKEN=super-secret; MODE=debug");
         session.add_output_line("Command: echo hello");

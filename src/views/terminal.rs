@@ -2265,7 +2265,7 @@ mod tests {
 
     /// n개 라인("line 0"..)을 가진 세션. `keep`을 지정하면 그만큼만 보관(FIFO evict 유발).
     fn session_with_lines(n: usize, keep: Option<usize>) -> RunSession {
-        let mut session = RunSession::new("t".to_string());
+        let mut session = RunSession::new(Uuid::new_v4(), "t".to_string());
         if let Some(keep) = keep {
             session.max_output_lines = keep;
         }
@@ -3107,7 +3107,7 @@ mod flood_bench {
     /// 폭주 정지 지연 진단용 수치 측정 (통과/실패 없음 — --nocapture로 관찰).
     #[test]
     fn measure_flood_regime_costs() {
-        let mut session = RunSession::new("bench".to_string());
+        let mut session = RunSession::new(Uuid::new_v4(), "bench".to_string());
         session.max_output_lines = 50_000;
 
         // 캡 도달까지 4096-이벤트 배치 적용 (yes 폭주 시 청크당 이벤트 수 근사)

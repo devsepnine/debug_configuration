@@ -1544,8 +1544,10 @@ impl RunConfigManager {
 
     /// 새 세션을 생성하며 현재 설정값(출력 라인 한도·자동 스크롤 기본)을 주입한다.
     /// 설정은 생성 시점에 고정되므로 이미 실행 중인 세션에는 소급되지 않는다.
-    fn new_session(&self, config_name: String) -> RunSession {
-        let mut session = RunSession::new(config_name);
+    /// 구성 하나를 통째로 받는다 — id와 이름을 따로 받으면 서로 다른 구성의 짝을 넘기는 상태가
+    /// 표현 가능해지고, 그것이 D94가 고친 결함 부류다.
+    fn new_session(&self, config: &RunConfiguration) -> RunSession {
+        let mut session = RunSession::new(config.id, config.name.clone());
         session.max_output_lines = self.max_output_lines;
         session.auto_scroll = self.default_auto_scroll;
         session
@@ -1575,7 +1577,7 @@ impl RunConfigManager {
 
             let config = config.clone();
 
-            let session = self.new_session(config.name.clone());
+            let session = self.new_session(&config);
             let session_id = session.id;
             let cancel_flag = session.cancel_flag.clone();
 
@@ -1654,7 +1656,7 @@ impl RunConfigManager {
         let aspect = self.workspace_content_aspect();
         let mut tasks = Vec::new();
         for config in runnable {
-            let session = self.new_session(config.name.clone());
+            let session = self.new_session(&config);
             let session_id = session.id;
             let cancel_flag = session.cancel_flag.clone();
 
@@ -3787,11 +3789,16 @@ impl RunConfigManager {
         let Some(position) = self.sessions.iter().position(|s| s.id == session_id) else {
             return Task::none();
         };
-        let config_name = self.sessions[position].config_name.clone();
+        // 조회 기준은 이름이 아니라 구성 id다. 개명은 세션을 떼어 놓지 않고, 지워진 이름을
+        // 물려받은 다른 구성이 이 세션의 표적을 가로채지도 않는다. 이름은 실패 문구에만 쓰이며
+        // 세션 객체가 만들어진 시점의 값이므로, 그 뒤 개명이 있었다면 구성의 현재 이름과 다르다.
+        let session = &self.sessions[position];
+        let config_id = session.config_id;
+        let config_name = session.config_name.clone();
         let Some(config) = self
             .configurations
             .iter()
-            .find(|c| c.name == config_name)
+            .find(|c| c.id == config_id)
             .cloned()
         else {
             self.status_message = format!("Configuration '{config_name}' not found");
@@ -6619,11 +6626,22 @@ mod tests {
         assert_eq!(session.config_name, "a");
     }
 
+    /// `names`마다 구성 하나와 그 구성을 실행한 세션 하나를 만들고 세션 id를 돌려준다.
+    /// 재실행은 세션이 담은 구성 id로 조회하므로 구성을 함께 만들지 않으면 재실행을 부르는
+    /// 테스트가 "구성 없음"으로 조용히 끝난다.
     fn manager_with_sessions(names: &[&str]) -> (RunConfigManager, Vec<Uuid>) {
         let (mut app, _task) = RunConfigManager::new();
-        app.sessions = names
+        app.configurations = names
             .iter()
-            .map(|n| RunSession::new((*n).to_string()))
+            .map(|n| RunConfiguration {
+                name: (*n).to_string(),
+                ..RunConfiguration::default()
+            })
+            .collect();
+        app.sessions = app
+            .configurations
+            .iter()
+            .map(|config| RunSession::new(config.id, config.name.clone()))
             .collect();
         let ids = app.sessions.iter().map(|s| s.id).collect();
         (app, ids)
@@ -6780,6 +6798,36 @@ mod tests {
     }
 
     #[test]
+    fn a_session_the_app_started_reruns_after_a_rename() {
+        // 배선 테스트: 세션을 픽스처가 아니라 `handle_run_configuration`으로 만든다. 픽스처가
+        // 구성 id를 손으로 심으면 `new_session`이 그 값을 넘기지 않아도 조회 테스트는 초록이고,
+        // 그러면 D94의 사용자에게 보이는 효과 전체가 무단정으로 남는다.
+        let mut app = manager_with_configs(&["A"]);
+        let config_id = app.configurations[0].id;
+
+        let _ = app.handle_run_configuration(Some(0));
+
+        assert_eq!(app.sessions.len(), 1);
+        assert_eq!(
+            app.sessions[0].config_id, config_id,
+            "앱이 만든 세션이 그 구성의 id를 담아야 한다"
+        );
+        // `new_session`이 주입하는 나머지 둘. 구성 id만 단정하면 이 함수의 나머지 절반이
+        // 사라져도 스위트가 침묵한다(감사 mutation H가 그것을 실측했다).
+        assert_eq!(app.sessions[0].max_output_lines, app.max_output_lines);
+        assert_eq!(app.sessions[0].auto_scroll, app.default_auto_scroll);
+
+        let session_id = app.sessions[0].id;
+        app.configurations[0].name = String::from("A-renamed");
+        let _ = app.handle_rerun_session(session_id);
+
+        assert_ne!(
+            app.sessions[0].id, session_id,
+            "개명 뒤에도 앱이 만든 세션의 재실행이 시작돼야 한다"
+        );
+    }
+
+    #[test]
     fn run_compound_fans_out_to_member_sessions() {
         let mut app = manager_with_configs(&["A", "B", "Bundle"]);
         let a_id = app.configurations[0].id;
@@ -6814,6 +6862,10 @@ mod tests {
         let _ = app.handle_run_configuration(Some(2));
         assert_eq!(app.sessions.len(), 1); // 중첩 Compound와 누락 멤버는 건너뜀
         assert_eq!(app.sessions[0].config_name, "A");
+        assert_eq!(
+            app.sessions[0].config_id, a_id,
+            "compound 멤버 세션도 그 멤버 구성의 id를 담는다"
+        );
     }
 
     #[test]
@@ -7010,23 +7062,6 @@ mod tests {
         assert!(app.sessions[0].search.as_ref().unwrap().matches.is_empty());
     }
 
-    fn manager_with_named_sessions(names: &[&str]) -> RunConfigManager {
-        let (mut app, _task) = RunConfigManager::new();
-        // 재실행이 이름으로 구성을 찾으므로 동일 이름의 구성도 함께 만든다.
-        app.configurations = names
-            .iter()
-            .map(|n| RunConfiguration {
-                name: (*n).to_string(),
-                ..RunConfiguration::default()
-            })
-            .collect();
-        app.sessions = names
-            .iter()
-            .map(|n| RunSession::new((*n).to_string()))
-            .collect();
-        app
-    }
-
     #[test]
     fn stop_all_cancels_only_running_sessions() {
         let (mut app, _ids) = manager_with_sessions(&["a", "b", "c"]);
@@ -7039,7 +7074,7 @@ mod tests {
 
     #[test]
     fn rerun_failed_reruns_only_nonzero_exit_sessions() {
-        let mut app = manager_with_named_sessions(&["ok", "fail"]);
+        let mut app = manager_with_sessions(&["ok", "fail"]).0;
         app.sessions[0].is_running = false;
         app.sessions[0].exit_code = Some(0);
         app.sessions[1].is_running = false;
@@ -7062,7 +7097,7 @@ mod tests {
 
     #[test]
     fn rerun_all_reruns_every_session() {
-        let mut app = manager_with_named_sessions(&["a", "b"]);
+        let mut app = manager_with_sessions(&["a", "b"]).0;
         app.sessions[0].is_running = false;
         app.sessions[0].exit_code = Some(0);
         app.sessions[1].is_running = false;
@@ -7075,11 +7110,94 @@ mod tests {
 
     #[test]
     fn rerun_failed_with_no_failures_is_noop() {
-        let mut app = manager_with_named_sessions(&["a"]);
+        let mut app = manager_with_sessions(&["a"]).0;
         // 실행 중 세션만 있음 (실패 없음)
         let _ = app.handle_rerun_failed_sessions();
         assert!(app.sessions[0].is_running);
         assert!(app.status_message.contains("No failed"));
+    }
+
+    #[test]
+    fn a_rerun_follows_a_renamed_configuration() {
+        // 세션이 구성을 이름으로만 기억하면 개명이 그 세션을 고아로 만든다 — 재실행이
+        // 옛 이름을 찾지 못해 실패하고, 사용자가 기다린 프로그램을 다시 띄울 방법이 없다.
+        let mut app = manager_with_sessions(&["a"]).0;
+        let session_id = app.sessions[0].id;
+        let before_rerun = SystemTime::now();
+        app.configurations[0].name = String::from("a-renamed");
+
+        let _ = app.handle_rerun_session(session_id);
+
+        assert_ne!(
+            app.sessions[0].id, session_id,
+            "재실행은 개명된 구성을 그대로 따라가야 한다"
+        );
+        assert_eq!(
+            app.sessions[0].config_name, "a",
+            "표시 이름은 세션 객체가 만들어진 시점의 값으로 남는다"
+        );
+        assert!(
+            app.status_message.contains("a-renamed"),
+            "골라진 것이 개명된 구성임을 상태바가 보여 준다: {}",
+            app.status_message
+        );
+        // 이름이 낡는 이유로 가이드가 드는 비대칭이다 — 재실행은 `started_at`은 새로 찍고
+        // `config_name`은 건드리지 않는다. 한쪽만 단정하면 다른 쪽이 조용히 사라진다.
+        assert!(
+            app.sessions[0].started_at >= before_rerun,
+            "재실행은 시작 시각을 새로 찍는다"
+        );
+    }
+
+    #[test]
+    fn a_rerun_refuses_another_configuration_that_took_the_name() {
+        // 이름으로 조회하면 되돌리기와 이름 재사용이 구별되지 않는다. 같은 이름의 다른 구성이
+        // 표적을 가로채면, 사용자가 기다린 프로그램 대신 그 구성이 실행된다.
+        let mut app = manager_with_sessions(&["a"]).0;
+        let session_id = app.sessions[0].id;
+        app.configurations.clear();
+        app.configurations.push(RunConfiguration {
+            name: String::from("a"),
+            ..RunConfiguration::default()
+        });
+
+        let _ = app.handle_rerun_session(session_id);
+
+        assert_eq!(
+            app.sessions[0].id, session_id,
+            "이름을 물려받은 구성은 그 세션의 재실행 표적이 아니다"
+        );
+        assert!(
+            app.status_message.contains("not found"),
+            "{}",
+            app.status_message
+        );
+    }
+
+    #[test]
+    fn a_lost_configurations_rerun_names_the_session_creation_time_name() {
+        // 실패 문구가 어느 이름을 싣는지를 고정한다. 개명 → 재실행 → 삭제를 거치면 세션이
+        // 만들어질 때의 이름("a")과 마지막 실행 시점의 이름("b")이 갈리므로, 문구가 "a"를
+        // 실어야 가이드와 `config_name` doc의 주장이 성립한다.
+        let mut app = manager_with_sessions(&["a"]).0;
+        let session_id = app.sessions[0].id;
+        app.configurations[0].name = String::from("b");
+        let _ = app.handle_rerun_session(session_id);
+        let restarted = app.sessions[0].id;
+        assert_ne!(restarted, session_id, "개명 뒤 재실행이 시작돼야 한다");
+
+        // 목록을 비우지 않고 **무관한 구성만** 남긴다. 비우면 문구의 이름이 세션에서 온 것인지
+        // 살아남은 목록에서 온 것인지 구별되지 않는다 — 생존자의 이름이 "z"이므로 구별된다.
+        app.configurations = vec![RunConfiguration {
+            name: String::from("z"),
+            ..RunConfiguration::default()
+        }];
+        let _ = app.handle_rerun_session(restarted);
+
+        assert_eq!(
+            app.status_message, "Configuration 'a' not found",
+            "문구는 세션이 만들어질 때의 이름을 싣는다"
+        );
     }
 
     /// 주어진 세션을 담은 `pane_grid::Pane` 핸들을 찾는다 (클릭 시뮬레이션용).
