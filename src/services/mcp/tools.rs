@@ -205,15 +205,17 @@ static TOOLS: &[ToolSpec] = &[
         title: "Read session output",
         description: "Read a session's terminal output as plain text with ANSI styling removed. \
                       Use since_line_id with the last_line_id from a previous call to stream only \
-                      what was appended since. The run banner's environment variable values are \
-                      replaced with a placeholder unless the app's Expose env values setting is \
-                      on; values a program prints itself are returned as printed. The banner \
-                      exists at all only while the app's Show environment line on run setting is \
-                      on, so its absence does not mean the configuration has no environment \
-                      variables — get_configuration returns them, and list_configurations returns \
-                      the keys alone. When exposure is on the banner still shows a display form whose \
-                      newlines and carriage returns are escaped, so writing one of those values \
-                      back does not restore it; read values with get_configuration instead.",
+                      what was appended since. The run banner's environment variables are \
+                      hidden unless the app's Expose env values setting is on, and the whole \
+                      banner line is replaced with `Environment: <hidden>`, keys included, \
+                      because a value can itself contain `; key=`; values a program prints itself \
+                      are returned as printed. The banner exists at all only while the app's \
+                      Show environment line on run setting is on, so its absence does not mean \
+                      the configuration has no environment variables — get_configuration returns \
+                      them, and list_configurations returns the keys alone. When exposure is on \
+                      the banner still shows a display form whose newlines and carriage returns \
+                      are escaped, so writing one of those values back does not restore it; \
+                      read values with get_configuration instead.",
         tier: McpPermission::ReadOnly,
         schema: || {
             json!({

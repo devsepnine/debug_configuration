@@ -305,8 +305,11 @@ compound인 경우다(중첩 실행을 하지 않는다). 그래서 `sessions`�
 `Expose environment variable values`가 꺼져 있으면(기본):
 
 - `get_configuration`의 환경변수 **값**이 `<hidden>`으로 바뀐다. 키는 그대로 보인다
-- `read_session_output`에서 실행 배너(`Environment: …`)의 값이 가려진다. 가려지는 줄은
-  **텍스트 모양이 아니라 앱이 찍을 때 기록한 줄 id**로 판정한다 → 프로그램이 스스로 찍은
+- `read_session_output`에서 실행 배너(`Environment: …`)가 가려진다. **입도가 위 항목과 다르다** —
+  `get_configuration`은 값만 가리고 키를 남기지만, 배너는 줄 전체가 `Environment: <hidden>`으로
+  바뀌어 키까지 사라진다. 값 자체가 `; k=`를 담을 수 있어 `k=v; k=v`를 쌍으로 쪼개면 키로
+  인쇄되는 바이트가 비밀에서 나오기 때문이고, 키 목록은 `list_configurations`가 준다. 가려지는
+  줄은 **텍스트 모양이 아니라 앱이 찍을 때 기록한 줄 id**로 판정한다 → 프로그램이 스스로 찍은
   `Environment: …` 줄은 사용자 출력이므로 가려지지 않는다
 - `search_session_output`은 가려진 줄을 결과와 `total_matches`에서 **모두** 뺀다. 가려진
   값을 검색해서 존재를 확인할 수 없다. 같은 이유로 "가려진 줄 N개" 같은 카운트를 응답에
