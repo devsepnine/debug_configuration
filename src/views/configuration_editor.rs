@@ -3,6 +3,7 @@ use crate::models::{
     ConfigTypeData, ConfigurationType, ExecuteMode, ExecuteModeType, KotlinLaunchMode,
     KotlinLaunchModeType, NodeCommand, PackageManager, RunConfiguration,
 };
+use crate::services::McpPermission;
 use crate::utils::{
     ICON_CLOSE, ICON_COPY, ICON_DELETE, ICON_EDIT, ICON_FOLDER_OPEN, ICON_REFRESH, to_relative_path,
 };
@@ -759,11 +760,25 @@ pub fn view_env_modal<'a>(props: EnvModalView<'a>) -> Element<'a, Message> {
 }
 
 /// 앱 설정 모달 뷰 모델 (app의 staging 상태를 참조로 전달).
+///
+/// `mcp_masked_token` · `mcp_add_command` · `mcp_status`는 staging이 아니라 **적용된**
+/// 상태에서 온다. 토큰과 리스너는 Confirm과 무관하게 존재하므로, 실행 중인 서버의 실제
+/// 주소를 보여주는 것이 등록 명령을 복사하는 사용자에게 맞다.
 pub struct SettingsModalView<'a> {
     pub show_environment: bool,
     pub max_output_lines_text: &'a str,
     pub default_auto_scroll: bool,
     pub auto_check_updates: bool,
+    pub mcp_enabled: bool,
+    pub mcp_port_text: &'a str,
+    pub mcp_permission: McpPermission,
+    pub mcp_expose_env_values: bool,
+    /// 마스킹된 토큰. `None`이면 아직 발급/로드되지 않았다.
+    pub mcp_masked_token: Option<String>,
+    /// 토큰이 마스킹된 `claude mcp add` 명령 (Copy 버튼은 실제 토큰을 클립보드에 넣는다).
+    pub mcp_add_command: String,
+    /// 리스너 상태 한 줄.
+    pub mcp_status: String,
 }
 
 /// 앱 설정 모달 (반투명 배경 + 중앙 다이얼로그). env 모달과 동일한 오버레이/스타일을
@@ -808,6 +823,28 @@ pub fn view_settings_modal(props: SettingsModalView<'_>) -> Element<'_, Message>
             .on_toggle(Message::SettingsToggleAutoCheckUpdates)
             .size(18)
             .text_size(13),
+        Space::new().height(4),
+        settings_section_label("AI (MCP)"),
+        checkbox(props.mcp_enabled)
+            .label("Enable local MCP server")
+            .on_toggle(Message::SettingsToggleMcpEnabled)
+            .size(18)
+            .text_size(13),
+        settings_hint(
+            "Lets an AI agent on this machine read your configurations and session output over \
+             http://127.0.0.1. Requires the token below.",
+        ),
+        mcp_permission_row(props.mcp_permission),
+        mcp_port_row(props.mcp_port_text),
+        checkbox(props.mcp_expose_env_values)
+            .label("Expose environment variable values")
+            .on_toggle(Message::SettingsToggleMcpExposeEnv)
+            .size(18)
+            .text_size(13),
+        settings_hint("Off: names are shared, values are replaced with <hidden>."),
+        mcp_status_row(props.mcp_status),
+        mcp_command_row(props.mcp_add_command, props.mcp_masked_token.is_some()),
+        mcp_token_row(props.mcp_masked_token),
     ]
     .spacing(14);
 
@@ -828,7 +865,14 @@ pub fn view_settings_modal(props: SettingsModalView<'_>) -> Element<'_, Message>
     let dialog_content = column![
         header,
         Space::new().height(18),
-        body,
+        scrollable(body.padding(Padding::new(0.0).right(10.0)))
+            .height(Length::Fill)
+            .direction(scrollable::Direction::Vertical(
+                scrollable::Scrollbar::default()
+                    .width(4)
+                    .scroller_width(4.0)
+                    .spacing(2.0),
+            )),
         Space::new().height(22),
         footer,
     ]
@@ -837,8 +881,8 @@ pub fn view_settings_modal(props: SettingsModalView<'_>) -> Element<'_, Message>
 
     let dialog = container(dialog_content)
         .padding(18)
-        .max_width(460)
-        .max_height(330)
+        .max_width(560)
+        .max_height(600)
         .width(Length::Fill)
         .height(Length::Fill)
         .style(modal_dialog_style);
@@ -848,6 +892,128 @@ pub fn view_settings_modal(props: SettingsModalView<'_>) -> Element<'_, Message>
             .padding(40)
             .style(modal_backdrop_style),
     )
+}
+
+/// 설정 모달 안의 섹션 구분 라벨.
+fn settings_section_label(title: &str) -> Element<'_, Message> {
+    text(title)
+        .size(11)
+        .color(Color::from_rgba8(255, 255, 255, 0.45))
+        .into()
+}
+
+/// 토글 아래 붙는 설명 한 줄. 권한이 무엇을 허용하는지 앱에서 바로 읽히게 한다.
+fn settings_hint(body: &str) -> Element<'_, Message> {
+    text(body)
+        .size(11)
+        .color(Color::from_rgba8(255, 255, 255, 0.45))
+        .into()
+}
+
+/// 라벨 + 우측 컨트롤 한 줄 (Max output lines row와 같은 배치).
+fn settings_field_row<'a>(
+    label: &'a str,
+    control: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    row![
+        text(label).size(13),
+        Space::new().width(Length::Fill),
+        control.into(),
+    ]
+    .align_y(Alignment::Center)
+    .spacing(10)
+    .into()
+}
+
+/// 권한 단계 선택. 세 단계는 포함 관계이므로 목록이 아니라 순서가 보이는 segmented
+/// 버튼으로 노출한다.
+fn mcp_permission_row(current: McpPermission) -> Element<'static, Message> {
+    let mut selector = row![].spacing(4).align_y(Alignment::Center);
+    for permission in McpPermission::ALL {
+        let entry = button(text(permission.label()).size(12)).padding([5, 10]);
+        selector = selector.push(if permission == current {
+            entry.style(modal_primary_button_style)
+        } else {
+            entry
+                .on_press(Message::SettingsMcpPermissionChanged(permission))
+                .style(modal_secondary_button_style)
+        });
+    }
+    settings_field_row("Permission", selector)
+}
+
+fn mcp_port_row(port_text: &str) -> Element<'_, Message> {
+    // placeholder는 기본 포트 힌트 — services::mcp::DEFAULT_PORT 변경 시 함께 갱신.
+    let input = text_input("47355", port_text)
+        .on_input(Message::SettingsMcpPortChanged)
+        .padding([6, 10])
+        .size(13)
+        .width(Length::Fixed(140.0));
+    settings_field_row("Port", input)
+}
+
+fn mcp_status_row(status: String) -> Element<'static, Message> {
+    settings_field_row("Status", text(status).size(12))
+}
+
+/// 토큰 행. 표시는 항상 마스킹되고, 실제 값은 Copy 버튼으로만 나간다.
+fn mcp_token_row(masked_token: Option<String>) -> Element<'static, Message> {
+    let (label, copy, regenerate) = match masked_token {
+        Some(masked) => (
+            masked,
+            Some(Message::SettingsCopyMcpToken),
+            Some(Message::SettingsRegenerateMcpToken),
+        ),
+        // 토큰은 MCP를 처음 켤 때 생성된다 — 그때까지 복사할 것이 없다.
+        None => (String::from("Not created yet"), None, None),
+    };
+    let controls = row![
+        text(label).size(12).font(iced::Font::MONOSPACE),
+        icon_button(ICON_COPY, copy),
+        icon_button(ICON_REFRESH, regenerate),
+    ]
+    .spacing(4)
+    .align_y(Alignment::Center);
+    settings_field_row("Token", controls)
+}
+
+/// 등록 명령 행. 여기 보이는 명령의 토큰은 마스킹돼 있고, Copy가 실제 토큰을 넣는다.
+fn mcp_command_row(command: String, token_ready: bool) -> Element<'static, Message> {
+    let copy = token_ready.then_some(Message::SettingsCopyMcpCommand);
+    column![
+        row![
+            settings_section_label("Register with Claude Code"),
+            Space::new().width(Length::Fill),
+            icon_button(ICON_COPY, copy),
+        ]
+        .align_y(Alignment::Center),
+        container(
+            text(command)
+                .size(11)
+                .font(iced::Font::MONOSPACE)
+                .color(Color::from_rgba8(255, 255, 255, 0.70))
+        )
+        .padding(8)
+        .width(Length::Fill)
+        .style(mcp_command_box_style),
+    ]
+    .spacing(6)
+    .into()
+}
+
+fn mcp_command_box_style(theme: &Theme) -> container::Style {
+    let palette = theme.extended_palette();
+    container::Style {
+        background: Some(Background::Color(Color {
+            a: 0.06,
+            ..palette.background.base.text
+        })),
+        border: Border {
+            radius: 6.0.into(),
+            ..Default::default()
+        },
+        ..Default::default()
+    }
 }
 
 /// 구성 삭제 확인 모달 뷰 모델.

@@ -231,6 +231,43 @@ open /Applications/RunConfigManager.app
 - **Open**: JSON 構成ファイルを開いて現在の構成を置き換える
 - **Save**: 現在のファイルに保存、パスがない場合は保存先を選択
 
+## AI 連携 (MCP)
+
+アプリがローカル MCP サーバーを開き、外部の AI エージェント (Claude Code などの MCP
+クライアント) が構成の一覧・実行・セッション出力の読み取り・構成の編集を行えるようにする。
+アプリ自身が LLM を呼び出すことはない。
+
+既定はオフかつ読み取り専用で、自分で有効化するまでリスナーは起動しない。
+
+1. `Settings` → `AI (MCP)` → `Enable local MCP server`、`Permission` を選び `OK`
+2. `Register with Claude Code` 行のコピーアイコン (実際のトークンが入る。画面表示は
+   マスクされている) でコマンドをコピーして実行する:
+
+```bash
+claude mcp add --transport http runconfig http://127.0.0.1:47355/mcp \
+  -H "Authorization: Bearer <token>"
+```
+
+| 段階 | ツール |
+|---|---|
+| `Read only` (既定) | 構成の一覧・詳細、セッション一覧、セッション出力の読み取り・検索 |
+| `Execute` | + 実行、停止、再実行、stdin への 1 行送信 |
+| `Edit` | + 構成の作成・更新・削除 |
+
+- ループバック専用 (`127.0.0.1`)、Bearer トークン必須、ループバック以外の `Origin` は拒否
+- トークンは `~/.run_config_mcp_token` にあり (unix では `0600`)、設定ファイルには入らない。
+  Windows ではユーザープロファイルの ACL に依存する
+- 登録コマンドをシェルに貼り付けるとトークンがシェル履歴に残る。その行を削除するか、登録後に
+  `Token` 行の再生成アイコンで無効化する
+- `Expose environment variable values` を有効にしない限り、環境変数の値は `<hidden>` に
+  マスクされる
+- `Execute` は事実上任意のコマンド実行、`Edit` は確認ダイアログなしで保存データを変更する。
+  必要な範囲までしか上げないこと
+- 変更を伴う呼び出しはアプリのステータスバーに `[MCP]` 接頭辞で記録される
+
+ツールごとの挙動・リトライ規則 (`request_id`)・入力上限・エラーコードの全体は
+[docs/MCP.md](docs/MCP.md) (韓国語) を参照。
+
 ## データ保存場所
 
 構成ファイルは OS 別の設定ディレクトリに自動保存されます:

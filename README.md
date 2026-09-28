@@ -234,6 +234,44 @@ This removes the `com.apple.quarantine` attribute that triggers the Gatekeeper c
 - **Open**: Open a JSON configuration file and replace the current configurations
 - **Save**: Save configurations to the current file, or choose a file when no path is set
 
+## AI Integration (MCP)
+
+The app can host a local MCP server so an external AI agent (Claude Code and other MCP
+clients) can list configurations, run them, read session output and edit configurations.
+The app never calls an LLM itself.
+
+The defaults are off and read-only — nothing listens until you turn it on.
+
+1. `Settings` → `AI (MCP)` → `Enable local MCP server`, choose a `Permission` tier, `OK`
+2. Press the copy button on the `Register with Claude Code` row — it copies the command
+   with the real token in it (the one shown on screen is masked) — and run it:
+
+```bash
+claude mcp add --transport http runconfig http://127.0.0.1:47355/mcp \
+  -H "Authorization: Bearer <token>"
+```
+
+| Tier | Tools |
+|---|---|
+| `Read only` (default) | list/get configurations, list sessions, read and search session output |
+| `Execute` | + run, stop, rerun, send one line to stdin |
+| `Edit` | + create, update, delete configurations |
+
+- Loopback only (`127.0.0.1`), bearer token required, non-loopback `Origin` rejected
+- The token lives in `~/.run_config_mcp_token` (`0600` on unix) and never in the settings
+  file. On Windows it relies on the user-profile ACL
+- Pasting the registration command into a shell leaves the token in shell history — clear
+  that line, or regenerate the token afterwards (the refresh button on the `Token` row) to
+  invalidate it
+- Environment variable values are masked as `<hidden>` unless you enable
+  `Expose environment variable values`
+- `Execute` is arbitrary command execution and `Edit` changes saved data with no
+  confirmation dialog. Raise the tier only as far as you need it
+- Every mutating call is stamped into the app's status bar with an `[MCP]` prefix
+
+Full reference — tool-by-tool behavior, retry semantics (`request_id`), input limits and
+error codes: [docs/MCP.md](docs/MCP.md) (Korean).
+
 ## Data Storage Location
 
 Configuration files are automatically saved in the OS-specific settings directory:

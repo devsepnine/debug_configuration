@@ -16,7 +16,8 @@ debug_configuration/
 │   ├── app.rs               # 메인 애플리케이션 상태 및 update/view/subscription 로직
 │   ├── app/
 │   │   ├── chrome.rs        # 윈도우 chrome/상태바 스타일 헬퍼
-│   │   └── env_modal.rs     # 환경변수 모달 상태/핸들러
+│   │   ├── env_modal.rs     # 환경변수 모달 상태/핸들러
+│   │   └── mcp.rs           # MCP 요청 핸들러 (툴별 처리, 권한 게이트, 감사 문구)
 │   ├── messages.rs          # Elm Architecture 메시지 타입 정의
 │   ├── ansi.rs              # ANSI 색상 코드 파싱
 │   ├── utils.rs             # 공통 유틸 (Node Runtime 감지, package.json 파싱, 아이콘)
@@ -29,6 +30,13 @@ debug_configuration/
 │   ├── services/
 │   │   ├── mod.rs           # 서비스 모듈 재export
 │   │   ├── executor.rs      # 프로세스 실행 및 명령어 빌드, PID 추적
+│   │   ├── mcp/             # 로컬 MCP 서버 (docs/MCP.md)
+│   │   │   ├── mod.rs       # 공개 표면: 서버 스트림, McpRequest/McpOutcome, McpPermission
+│   │   │   ├── http.rs      # hyper 리스너, Origin·Bearer·body 상한
+│   │   │   ├── protocol.rs  # JSON-RPC 2.0, discover/initialize, 버전 네고시에이션
+│   │   │   ├── tools.rs     # 툴 카탈로그·스키마·인자 파싱, 권한 필터
+│   │   │   ├── token.rs     # Bearer 토큰 생성·로드·퍼미션(0600)
+│   │   │   └── dedup.rs     # request_id 중복 흡수 창
 │   │   ├── storage.rs       # 구성 파일 저장/로드 (버전 envelope), AppSettings
 │   │   └── update_check.rs  # GitHub Releases 최신 버전 확인
 │   ├── views/
@@ -107,6 +115,17 @@ debug_configuration/
 - **프로세스 제어**: 재실행, 중지, graceful shutdown
 - **세션 이동**: 드래그 앤 드롭으로 Pane 간 이동
 
+### MCP 서버
+
+앱이 `127.0.0.1`에 로컬 MCP 서버를 열어 외부 AI 에이전트가 구성 조회·실행·출력 읽기·구성
+편집을 하게 한다. 기본값은 꺼짐·Read only이며 앱이 LLM을 호출하지는 않는다.
+
+요청은 hyper 리스너 → mpsc → iced subscription → `update` 루프로 들어와 GUI 버튼과 같은
+핸들러를 재사용한다. 상태를 update 루프가 단독 소유하므로 락이 없고 두 경로의 동작이 갈라질
+수 없다.
+
+설정·보안 경계·툴 표면·재시도 규칙은 [MCP 연동 가이드](MCP.md)에 있다.
+
 ### Pane 레이아웃 시스템
 
 - **동적 분할**: 수평/수직 분할 지원
@@ -138,6 +157,10 @@ ctrlc = { version = "3.5", features = ["termination"] }
 rfd = "0.17"
 notify-rust = "4.18.0"                                  # OS 데스크톱 알림 (실행 완료/업데이트 알림)
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }  # GitHub Releases 업데이트 체크
+hyper = { version = "1", default-features = false, features = ["server", "http1"] }           # 로컬 MCP 서버
+hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
+http-body-util = "0.1"
+bytes = "1"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

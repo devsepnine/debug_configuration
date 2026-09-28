@@ -1,4 +1,5 @@
 mod executor;
+mod mcp;
 mod self_update;
 mod storage;
 mod update_check;
@@ -8,6 +9,12 @@ pub use executor::{
     kill_all_running_processes, prewarm_shell_detection, register_running_pid, resize_session_pty,
     run_configuration_stream, terminate_session_process, unregister_running_pid,
     write_session_stdin,
+};
+pub use mcp::{
+    CreateConfigurationArgs, DedupLookup, DedupScope, DeleteConfigurationArgs, MAX_SEARCH_MATCHES,
+    MCP_DEDUP_MAX_ENTRIES, MCP_DEDUP_WINDOW, McpEvent, McpOp, McpOutcome, McpPermission,
+    McpRequest, McpRequestLog, McpServerConfig, UpdateConfigurationArgs, load_or_create_token,
+    mask_token, regenerate_token, server as mcp_server, tools_for as mcp_tools_for,
 };
 pub use self_update::{RelaunchPlan, cleanup_stale_update_artifacts, download_and_apply};
 pub use storage::{

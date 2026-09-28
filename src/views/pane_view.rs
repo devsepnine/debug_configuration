@@ -1,5 +1,5 @@
 use crate::messages::Message;
-use crate::models::{Pane, RunSession, SessionStatusKind};
+use crate::models::{Pane, RunSession, SessionStatusKind, compile_search_regex};
 use crate::utils::{
     ICON_ARROW_DOWN_FILL, ICON_ARROW_DOWN_LINE, ICON_CLOSE, ICON_ERASER, ICON_MORE,
     ICON_PANE_MAXIMIZE, ICON_PANE_RESTORE, ICON_REFRESH, ICON_SAVE, ICON_SEARCH, ICON_STOP,
@@ -797,13 +797,8 @@ fn view_session_search_bar(session: &RunSession) -> Element<'_, Message> {
     // 캐시된 매치 수 사용 (매 프레임 재스캔 방지; app의 update에서 갱신됨).
     let total = search.matches.len();
     // 정규식 모드에서 패턴이 잘못됐는지 가벼운 유효성 검사(표시용; 컴파일 1회).
-    // 매칭 경로와 동일한 빌더(case_insensitive)를 써 유효성 판정을 일치시킨다.
-    let invalid_regex = search.regex
-        && !search.query.is_empty()
-        && regex::RegexBuilder::new(&search.query)
-            .case_insensitive(true)
-            .build()
-            .is_err();
+    let invalid_regex =
+        search.regex && !search.query.is_empty() && compile_search_regex(&search.query).is_err();
     let count_text = if search.query.is_empty() {
         String::new()
     } else if invalid_regex {
@@ -946,7 +941,10 @@ fn session_title(
     .align_y(Alignment::Center);
 
     if let Some(badge) = badge {
-        let is_failed = matches!(status, Some(SessionStatusKind::Failed(_)));
+        let is_failed = matches!(
+            status,
+            Some(SessionStatusKind::Failed(_) | SessionStatusKind::Errored)
+        );
         title = title
             .push(Space::new().width(8))
             .push(
@@ -973,7 +971,9 @@ fn session_status_dot_style(theme: &Theme, status: Option<SessionStatusKind>) ->
     let (color, alpha) = match status {
         Some(SessionStatusKind::Running) => (palette.success.base.color, 0.92),
         Some(SessionStatusKind::Succeeded) => (palette.background.base.text, 0.42),
-        Some(SessionStatusKind::Failed(_)) => (palette.danger.base.color, 0.88),
+        Some(SessionStatusKind::Failed(_) | SessionStatusKind::Errored) => {
+            (palette.danger.base.color, 0.88)
+        }
         Some(SessionStatusKind::Stopped) | None => (palette.background.base.text, 0.30),
     };
 

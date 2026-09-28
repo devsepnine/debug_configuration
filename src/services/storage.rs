@@ -1,4 +1,5 @@
 use crate::models::RunConfiguration;
+use crate::services::mcp::McpPermission;
 use crate::utils::DIALOG_CANCELLED;
 use rfd::AsyncFileDialog;
 use serde::{Deserialize, Serialize};
@@ -34,6 +35,19 @@ pub struct AppSettings {
     /// 마지막 창 좌상단 위치 `(x, y)` (logical px). 멀티 모니터에서 음수 좌표도 유효하다.
     #[serde(default)]
     pub window_position: Option<(f32, f32)>,
+    /// 설정: 로컬 MCP 서버를 띄울지 여부. 기본 off — 리스너는 사용자가 명시적으로 켤 때만
+    /// 열린다(임의 명령 실행 권한까지 열 수 있는 표면이므로 opt-in).
+    #[serde(default)]
+    pub mcp_enabled: bool,
+    /// 설정: MCP 서버 리스닝 포트 (`127.0.0.1` 고정)
+    #[serde(default = "default_mcp_port")]
+    pub mcp_port: u16,
+    /// 설정: MCP 클라이언트에 허용할 권한 단계
+    #[serde(default)]
+    pub mcp_permission: McpPermission,
+    /// 설정: MCP 응답에 환경변수 **값**을 실을지 여부. 기본 off(키만 노출).
+    #[serde(default)]
+    pub mcp_expose_env_values: bool,
 }
 
 /// serde 기본값 헬퍼: bool 필드의 기본은 `true` (켜짐). `#[derive(Default)]`의
@@ -47,6 +61,11 @@ fn default_max_output_lines() -> usize {
     crate::models::DEFAULT_MAX_OUTPUT_LINES
 }
 
+/// serde 기본값 헬퍼: MCP 포트 기본값 (서버 모듈과 단일 출처 공유).
+fn default_mcp_port() -> u16 {
+    crate::services::mcp::DEFAULT_PORT
+}
+
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
@@ -58,6 +77,10 @@ impl Default for AppSettings {
             auto_check_updates: true,
             window_size: None,
             window_position: None,
+            mcp_enabled: false,
+            mcp_port: default_mcp_port(),
+            mcp_permission: McpPermission::default(),
+            mcp_expose_env_values: false,
         }
     }
 }
@@ -120,6 +143,15 @@ pub fn save_settings(settings: &AppSettings) {
 
 /// 현재 구성 파일 스키마 버전. 디스크 포맷이 호환 불가하게 바뀔 때마다 +1 하고
 /// `migrate_config_file`에 변환 단계를 추가한다.
+///
+/// `ConfigTypeData`와 그 안의 `ExecuteMode`·`KotlinLaunchMode`에 필드를 **더하는** 변경도
+/// 여기서 +1 해야 한다. 세 열거형은
+/// `deny_unknown_fields`이므로(사유는 `ConfigTypeData`의 doc) 새 필드가 든 파일을 옛 앱이
+/// 읽지 못하는데,
+/// 버전을 올리지 않으면 그 실패가 `migrate_config_file`의 "이 앱이 지원하는 버전보다 새 파일"
+/// 게이트를 통과해 원인 없는 `Deserialization error`로 나타난다 — 사용자에게는 구성이 전부
+/// 사라진 것으로 보이고, 화면에는 무엇을 해야 하는지가 없다. 최상위 필드는 이 제약을 받지
+/// 않는다(`parse_config_file` 참조).
 const CURRENT_CONFIG_VERSION: u32 = 1;
 
 /// 디스크에 저장되는 구성 파일 형식 (버전 envelope).
@@ -135,10 +167,15 @@ struct ConfigFile {
 
 /// 버전 envelope을 현재 스키마로 마이그레이션.
 ///
-/// 현재까지의 변경은 구조 수준에서 forward-compatible(미지 필드 무시, 누락 옵션 기본값)
-/// 하므로 데이터 변환은 없다. 예: `Compound.workspace`(Option, serde default) 추가는 구·신
-/// 버전 양방향 호환된다. 향후 호환 불가 변경 시 버전별 변환을 여기에 추가한다.
-/// 앱이 지원하는 버전보다 새 파일은 손상시키지 않도록 명확한 에러로 거부한다.
+/// 지금까지 데이터 변환이 없는 것은 변경들이 최상위에서 양방향 호환이었기 때문이다(미지 필드
+/// 무시, 누락 옵션 기본값). 그 성질은 `type_data` 안에서는 성립하지 않는다 — `ConfigTypeData`가
+/// `deny_unknown_fields`이므로 거기 필드를 더하는 변경은 옛 앱이 새 파일을 읽지 못하게 만들고,
+/// 따라서 `CURRENT_CONFIG_VERSION`을 함께 올려야 한다. 예로 들려 있던 `Compound.workspace`
+/// 추가는 그 속성이 붙기 전의 일이다.
+///
+/// 앱이 지원하는 버전보다 새 파일은 손상시키지 않도록 명확한 에러로 거부한다. 버전을 올려야 하는
+/// 이유가 이것이다 — 옛 앱은 어느 쪽이든 그 파일을 읽지 못하지만, 버전이 올라 있으면 무엇을
+/// 해야 하는지 아는 에러를 낸다.
 fn migrate_config_file(file: ConfigFile) -> Result<Vec<RunConfiguration>, String> {
     if file.version > CURRENT_CONFIG_VERSION {
         return Err(format!(
@@ -155,7 +192,8 @@ fn migrate_config_file(file: ConfigFile) -> Result<Vec<RunConfiguration>, String
 fn parse_config_file(content: &str) -> Result<Vec<RunConfiguration>, String> {
     let trimmed = content.trim_start_matches('\u{FEFF}').trim_start();
     if trimmed.starts_with('[') {
-        // 구버전: 버전 없는 베어 배열 (제거된 config_type 등 미지 필드는 serde가 무시)
+        // 구버전: 버전 없는 베어 배열. 최상위의 미지 필드(제거된 `config_type` 등)는 serde가
+        // 무시하지만 `type_data` 안은 다르다 — `ConfigTypeData`의 `deny_unknown_fields`가 거절한다.
         serde_json::from_str(trimmed).map_err(|e| format!("Deserialization error: {e}"))
     } else {
         let file: ConfigFile =
@@ -440,6 +478,30 @@ mod tests {
         assert!(settings.auto_check_updates);
         assert!(settings.window_size.is_none());
         assert!(settings.window_position.is_none());
+        // MCP는 기본 off + 읽기 전용으로 로드되어야 한다 — 구버전 설정 파일을 쓰는
+        // 사용자가 업그레이드만으로 리스너나 편집 권한을 얻어선 안 된다.
+        assert!(!settings.mcp_enabled);
+        assert_eq!(settings.mcp_permission, McpPermission::ReadOnly);
+        assert!(!settings.mcp_expose_env_values);
+        assert_eq!(settings.mcp_port, crate::services::mcp::DEFAULT_PORT);
+    }
+
+    #[test]
+    fn app_settings_mcp_fields_round_trip() {
+        let settings = AppSettings {
+            mcp_enabled: true,
+            mcp_port: 51000,
+            mcp_permission: McpPermission::Edit,
+            mcp_expose_env_values: true,
+            ..AppSettings::default()
+        };
+        let json = serde_json::to_string(&settings).unwrap();
+        let back: AppSettings = serde_json::from_str(&json).unwrap();
+
+        assert!(back.mcp_enabled);
+        assert_eq!(back.mcp_port, 51000);
+        assert_eq!(back.mcp_permission, McpPermission::Edit);
+        assert!(back.mcp_expose_env_values);
     }
 
     #[test]

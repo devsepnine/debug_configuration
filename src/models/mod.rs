@@ -8,6 +8,6 @@ pub use configuration::{
 };
 pub use pane::{LayoutId, Pane, WorkspaceTab};
 pub use session::{
-    DEFAULT_MAX_OUTPUT_LINES, OutputEvent, RunSession, SearchMatch, SearchState, SessionStatusKind,
-    StdinWriteError,
+    DEFAULT_MAX_OUTPUT_LINES, OutputEvent, RunFailure, RunSession, SearchMatch, SearchState,
+    SessionStatusKind, StdinWriteError, compile_search_regex,
 };

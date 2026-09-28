@@ -82,6 +82,12 @@ mod tests {
     use crate::app::{AvailableUpdate, RunConfigManager};
     use crate::models::RunSession;
     use crate::services::UpdateDownload;
+    use uuid::Uuid;
+
+    /// 실행 중 세션 하나. 이 파일의 테스트는 라이브 세션의 **개수**만 보므로 구성과 잇지 않는다.
+    fn running_session() -> RunSession {
+        RunSession::new(Uuid::new_v4(), "x".to_string())
+    }
 
     fn download() -> UpdateDownload {
         UpdateDownload {
@@ -139,7 +145,7 @@ mod tests {
         // 실행 중에도 모달은 열린다 — 조용한 상태바 거부는 "반응 없음"으로 읽혔다.
         // (Update 버튼 비활성/사유 표시는 뷰가 라이브 세션 수로 처리한다.)
         let mut app = manager_with_update(true);
-        app.sessions.push(RunSession::new("x".to_string())); // is_running=true로 생성
+        app.sessions.push(running_session()); // is_running=true로 생성
         let _ = app.handle_request_install_update();
         assert!(app.confirm_update_modal.is_some());
         assert!(!app.is_updating);
@@ -150,7 +156,7 @@ mod tests {
         // 모달이 열린 사이 세션이 시작된 경우 — 확정해도 설치를 시작하지 않는다.
         let mut app = manager_with_update(true);
         let _ = app.handle_request_install_update();
-        app.sessions.push(RunSession::new("x".to_string()));
+        app.sessions.push(running_session());
         let _ = app.handle_confirm_install_update();
         assert!(app.confirm_update_modal.is_none());
         assert!(!app.is_updating);
@@ -186,7 +192,7 @@ mod tests {
         // 가드를 타지 않는다. (테스트 빌드의 handle_open_url은 실제로 열지 않고
         // 상태 메시지 계약만 수행한다.)
         let mut app = manager_with_update(false);
-        app.sessions.push(RunSession::new("x".to_string()));
+        app.sessions.push(running_session());
         let _ = app.handle_request_install_update();
         let _ = app.handle_confirm_install_update();
         assert!(app.confirm_update_modal.is_none());

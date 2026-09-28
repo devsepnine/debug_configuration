@@ -1,7 +1,8 @@
 use crate::models::{
     ConfigurationType, ExecuteModeType, KotlinLaunchModeType, NodeCommand, PackageManager,
-    RunConfiguration,
+    RunConfiguration, RunFailure, StdinWriteError,
 };
+use crate::services::{McpEvent, McpPermission, McpRequest};
 use crate::widgets::pane_grid;
 use iced::window;
 use std::path::PathBuf;
@@ -201,6 +202,38 @@ pub enum Message {
     SettingsToggleAutoScroll(bool),
     /// 설정: 시작 시 업데이트 자동 확인 토글
     SettingsToggleAutoCheckUpdates(bool),
+    /// 설정: 로컬 MCP 서버 활성화 토글
+    SettingsToggleMcpEnabled(bool),
+    /// 설정: MCP 서버 포트 입력 변경 (raw 문자열; Confirm 시 파싱·클램프)
+    SettingsMcpPortChanged(String),
+    /// 설정: MCP 권한 단계 선택
+    SettingsMcpPermissionChanged(McpPermission),
+    /// 설정: MCP 응답에 환경변수 값 노출 토글
+    SettingsToggleMcpExposeEnv(bool),
+    /// 설정: MCP Bearer 토큰을 클립보드로 복사
+    SettingsCopyMcpToken,
+    /// 설정: `claude mcp add` 등록 명령을 클립보드로 복사
+    SettingsCopyMcpCommand,
+    /// 설정: MCP Bearer 토큰 재발급 (기존 토큰은 즉시 무효)
+    SettingsRegenerateMcpToken,
+
+    /// MCP Bearer 토큰 로드/생성 결과 (파일 I/O이므로 Task로 수행)
+    McpTokenLoaded(Result<String, String>),
+    /// 로컬 MCP 서버 이벤트 (리스너 상태 변화 · 처리할 요청)
+    Mcp(McpEvent),
+    /// MCP가 보낸 stdin 한 줄의 쓰기 결과. 요청을 그대로 실어 보내, 쓰기가 끝난 뒤에
+    /// 응답한다 — 제출 즉시 성공으로 답하면 끊어진 stdin이 호출자에게 "전달됨"으로 보인다.
+    McpSessionInputWritten {
+        request: McpRequest,
+        session_id: Uuid,
+        /// 호출자가 실어 보낸 중복 흡수 키. 하드 실패 시 기록을 지워야 하므로 결과까지 따라온다.
+        request_id: Option<String>,
+        line: String,
+        result: Result<bool, StdinWriteError>,
+    },
+    /// MCP 편집 툴이 발행한 저장의 완료. `ConfigurationsSaved`와 따로 두는 것은 성공 시
+    /// 상태바를 덮지 않기 위해서다 — 그 자리에는 방금 남긴 `[MCP]` 감사 줄이 있어야 한다.
+    McpConfigurationsSaved(Result<PathBuf, String>),
 
     /// Editor focus 이동 (`true`면 역방향)
     MoveEditorFocus(bool),
@@ -249,7 +282,7 @@ pub enum Message {
     /// 프로세스 출력 수신 (세션 ID, 출력 이벤트 배치 — Line=추가, Replace=마지막 라인 교체)
     OutputReceived(Uuid, Vec<crate::models::OutputEvent>),
     /// 프로세스 실행 완료 (세션 ID, 종료 코드 또는 에러 메시지)
-    RunCompleted(Uuid, Result<i32, String>),
+    RunCompleted(Uuid, Result<i32, RunFailure>),
     /// 터미널 뷰포트 크기 변경 (세션 ID, cols, rows) — PTY resize로 전달 (변경 시에만 발행)
     SessionViewportResized(Uuid, u16, u16),
 

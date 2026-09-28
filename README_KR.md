@@ -228,6 +228,41 @@ open /Applications/RunConfigManager.app
 - **Open**: JSON 구성 파일을 열어 현재 구성을 교체
 - **Save**: 현재 파일에 저장하거나, 경로가 없으면 저장 위치 선택
 
+## AI 연동 (MCP)
+
+앱이 로컬 MCP 서버를 열어, 외부 AI 에이전트(Claude Code 등 MCP 클라이언트)가 구성 조회 ·
+실행 · 세션 출력 읽기 · 구성 편집을 하게 할 수 있다. 앱이 LLM을 호출하지는 않는다.
+
+기본값은 꺼짐 · 읽기 전용이다 — 직접 켤 때까지 리스너가 뜨지 않는다.
+
+1. `Settings` → `AI (MCP)` → `Enable local MCP server`, `Permission` 단계 선택, `OK`
+2. `Register with Claude Code` 행의 복사 아이콘(실제 토큰이 박힌다 — 화면에 보이는 것은
+   마스킹)으로 명령을 복사해 실행한다:
+
+```bash
+claude mcp add --transport http runconfig http://127.0.0.1:47355/mcp \
+  -H "Authorization: Bearer <token>"
+```
+
+| 단계 | 툴 |
+|---|---|
+| `Read only` (기본) | 구성 목록·상세, 세션 목록, 세션 출력 읽기·검색 |
+| `Execute` | + 실행, 중지, 재실행, stdin 한 줄 전송 |
+| `Edit` | + 구성 생성·수정·삭제 |
+
+- 루프백 전용(`127.0.0.1`), Bearer 토큰 필수, 루프백이 아닌 `Origin`은 거부
+- 토큰은 `~/.run_config_mcp_token`에 있고(unix `0600`) 설정 파일에는 들어가지 않는다.
+  Windows는 사용자 프로필 디렉터리 ACL에 의존한다
+- 등록 명령을 터미널에 붙이면 토큰이 셸 히스토리에 남는다 — 그 줄을 지우거나, 등록 후
+  `Token` 행의 재생성 아이콘으로 무효화한다
+- `Expose environment variable values`를 켜지 않으면 환경변수 값이 `<hidden>`으로 가려진다
+- `Execute`는 사실상 임의 명령 실행이고, `Edit`은 확인 모달 없이 저장된 데이터를 바꾼다.
+  필요한 만큼만 올린다
+- 변경성 호출은 앱 상태바에 `[MCP]` 접두사로 남는다
+
+툴별 동작 · 재시도 규칙(`request_id`) · 입력 상한 · 오류 코드 전체는
+[docs/MCP.md](docs/MCP.md)에 있다.
+
 ## 데이터 저장 위치
 
 구성 파일은 운영체제별 설정 디렉토리에 자동 저장됩니다:

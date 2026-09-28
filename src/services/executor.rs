@@ -1,11 +1,12 @@
 use crate::messages::Message;
 use crate::models::{
     ConfigTypeData, ExecuteMode, KotlinLaunchMode, NodeCommand, OutputEvent, PackageManager,
-    RunConfiguration,
+    RunConfiguration, RunFailure,
 };
 use iced::stream;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
+use std::path::Path;
 use std::sync::{
     Arc, LazyLock, Mutex,
     atomic::{AtomicBool, Ordering},
@@ -507,10 +508,29 @@ impl Drop for CompletionGuard {
         if self.armed {
             let _ = self.output.try_send(Message::RunCompleted(
                 self.session_id,
-                Err(String::from("Run interrupted unexpectedly")),
+                Err(RunFailure::Failed(String::from(
+                    "Run interrupted unexpectedly",
+                ))),
             ));
         }
     }
+}
+
+/// 스폰 전에 작업 디렉터리를 확인한다.
+///
+/// PTY 경로는 이 검사를 대신해 주지 않는다 — `portable_pty::CommandBuilder::cwd`는 값이
+/// 디렉터리가 아니면 **버리고** `$HOME`으로 접으므로, 없는 경로로 실행하면 프로세스가 사용자의
+/// 홈에서 돌고 세션은 그 명령이 거기서 낸 결과를 보고한다. 배너가 설정된 경로를 단언하고 있어
+/// 어디서 돌았는지가 감춰진다: `rm -rf build`처럼 상대 경로를 쓰는 명령이 의도한 프로젝트 밖에서
+/// 돈다. 비-PTY 폴백은 `Command::current_dir`가 `ENOENT`로 실패하므로 두 경로가 갈려 있었다.
+fn verify_working_directory(directory: &str) -> Result<(), String> {
+    if Path::new(directory).is_dir() {
+        return Ok(());
+    }
+
+    Err(format!(
+        "Working directory does not exist or is not a directory: {directory}"
+    ))
 }
 
 pub fn run_configuration_stream(
@@ -540,6 +560,15 @@ pub fn run_configuration_stream(
             )
             .await;
 
+            // 배너가 단언한 디렉터리에서 실제로 돌 수 없으면 여기서 세운다(사유는
+            // `verify_working_directory`). 배너 뒤에 두는 것은 어느 경로가 틀렸는지를 사용자와
+            // 호출자가 함께 보게 하기 위한 것이다.
+            if let Err(reason) = verify_working_directory(&config.working_directory) {
+                send_run_result(&mut output, session_id, Err(RunFailure::Failed(reason))).await;
+                completion.disarm();
+                return;
+            }
+
             // 기본 경로: PTY(unix)/ConPTY(Windows 10 1809+) — 진짜 터미널로 색·진행바·
             // 프롬프트가 살아난다. PtyUnavailable(unix: openpty 실패, windows: ConPTY
             // 부재/openpty 실패)만 pipe로 폴백하고, spawn 실패는 명령 문제라 폴백 없이
@@ -556,7 +585,7 @@ pub fn run_configuration_stream(
                         return;
                     }
                     Err(PtySpawnError::Spawn(e)) => {
-                        send_run_result(&mut output, session_id, Err(e)).await;
+                        send_run_result(&mut output, session_id, Err(RunFailure::Failed(e))).await;
                         completion.disarm();
                         return;
                     }
@@ -594,7 +623,7 @@ pub fn run_configuration_stream(
                     send_run_result(
                         &mut output,
                         session_id,
-                        Err(format!("Failed to spawn process: {e}")),
+                        Err(RunFailure::Failed(format!("Failed to spawn process: {e}"))),
                     )
                     .await;
                 }
@@ -1132,6 +1161,16 @@ fn spawn_in_pty(
     })
 }
 
+/// 배너 한 줄에 실을 조각. 개행을 이스케이프 형태로 되돌려 배너가 한 줄에 머물게 한다.
+///
+/// 환경변수 값은 실제 개행을 담을 수 있다 — `env_string`의 파싱이 `\n`을 개행으로 풀어 준다.
+/// PEM 키나 서비스 계정 JSON이 배너를 화면 절반까지 늘리는 것을 막는 표시용 정리이고,
+/// 역이스케이프로 원값이 복원되는 것은 보장하지 않는다. MCP 읽기 경계의 마스킹은 이 형태에
+/// 기대지 않는다 — `RunSession::add_env_banner_line`이 배너가 만든 줄 id를 전부 기록한다.
+fn single_line(fragment: &str) -> String {
+    fragment.replace('\n', "\\n").replace('\r', "\\r")
+}
+
 async fn send_command_info(
     output: &mut iced::futures::channel::mpsc::Sender<Message>,
     session_id: Uuid,
@@ -1142,17 +1181,20 @@ async fn send_command_info(
 ) {
     use iced::futures::SinkExt;
 
-    let mut command_info = String::new();
-    command_info.push_str("═══════════════════════════════════════════════════════\n");
-    let _ = writeln!(command_info, "Configuration: {}", config.name);
-    let _ = writeln!(command_info, "Type: {:?}", config.config_type());
-    let _ = writeln!(
-        command_info,
-        "Working Directory: {}",
-        config.working_directory
-    );
+    let mut head = String::new();
+    head.push_str("═══════════════════════════════════════════════════════\n");
+    let _ = writeln!(head, "Configuration: {}", config.name);
+    let _ = writeln!(head, "Type: {:?}", config.config_type());
+    let _ = writeln!(head, "Working Directory: {}", config.working_directory);
+
+    let mut tail = String::new();
+    let _ = writeln!(tail, "Command: {command_str}");
+    tail.push_str("═══════════════════════════════════════════════════════\n");
+
+    let mut events = lines_to_events(&head);
     // 환경변수는 더 이상 Command 문자열에 보이지 않으므로 별도 라인으로 표시해 가시성 유지.
-    // 단, 설정에서 끄면(show_env=false) 출력하지 않는다.
+    // 단, 설정에서 끄면(show_env=false) 출력하지 않는다. `Line`이 아니라 `EnvBanner`로 보내는
+    // 이유는 그 variant의 문서에 있다 — 이 줄이 배너라는 사실을 아는 곳은 여기뿐이다.
     if show_env && (!config.environment_variables.is_empty() || !extra_env.is_empty()) {
         let mut pairs: Vec<(String, String)> = config
             .environment_variables
@@ -1163,18 +1205,15 @@ async fn send_command_info(
         pairs.extend(extra_env.iter().cloned());
         let rendered = pairs
             .iter()
-            .map(|(k, v)| format!("{k}={v}"))
+            .map(|(k, v)| format!("{}={}", single_line(k), single_line(v)))
             .collect::<Vec<_>>()
             .join("; ");
-        let _ = writeln!(command_info, "Environment: {rendered}");
+        events.push(OutputEvent::EnvBanner(format!("Environment: {rendered}")));
     }
-    let _ = writeln!(command_info, "Command: {command_str}");
-    command_info.push_str("═══════════════════════════════════════════════════════\n");
+    events.extend(lines_to_events(&tail));
+
     let _ = output
-        .send(Message::OutputReceived(
-            session_id,
-            lines_to_events(&command_info),
-        ))
+        .send(Message::OutputReceived(session_id, events))
         .await;
 }
 
@@ -1205,15 +1244,10 @@ async fn handle_pty_process(
     {
         PtyLoopEnd::Cancelled { exit_taken } => {
             terminate_and_reap_pty(pty.pid, &mut pty.exit_rx, exit_taken).await;
-            send_run_result(
-                output,
-                session_id,
-                Err(String::from("Process stopped by user")),
-            )
-            .await;
+            send_run_result(output, session_id, Err(RunFailure::StoppedByUser)).await;
         }
         PtyLoopEnd::Completed(result) => {
-            send_run_result(output, session_id, result).await;
+            send_run_result(output, session_id, result.map_err(RunFailure::Failed)).await;
         }
     }
 }
@@ -1578,12 +1612,7 @@ async fn handle_spawned_process(
     if cancelled {
         // 시그널 전송 후 반드시 wait로 reap (Unix 좀비 방지) + SIGTERM 무시 시 SIGKILL 에스컬레이션.
         terminate_and_reap(&mut child).await;
-        send_run_result(
-            output,
-            session_id,
-            Err(String::from("Process stopped by user")),
-        )
-        .await;
+        send_run_result(output, session_id, Err(RunFailure::StoppedByUser)).await;
     } else {
         wait_for_process(output, session_id, &mut child, &cancel_flag).await;
     }
@@ -1813,17 +1842,21 @@ struct EventBatch {
 
 impl EventBatch {
     fn push(&mut self, event: OutputEvent) {
+        // `EnvBanner`가 병합 대상에 없는 것은 이 조립기를 지나지 않기 때문이다 — 배너는
+        // PTY 루프가 시작되기 전에 `send_command_info`가 따로 보낸다.
         if let OutputEvent::Replace(new_text) = &event
-            && let Some(last) = self.events.last_mut()
+            && let Some(OutputEvent::Line(text) | OutputEvent::Replace(text)) =
+                self.events.last_mut()
         {
-            let (OutputEvent::Line(text) | OutputEvent::Replace(text)) = last;
             self.bytes = self.bytes.saturating_sub(text.len()) + new_text.len();
             // 직전 이벤트의 종류(Line/Replace)는 유지한 채 내용만 최신으로.
             *text = new_text.clone();
             return;
         }
         self.bytes += match &event {
-            OutputEvent::Line(text) | OutputEvent::Replace(text) => text.len(),
+            OutputEvent::Line(text) | OutputEvent::EnvBanner(text) | OutputEvent::Replace(text) => {
+                text.len()
+            }
         };
         self.events.push(event);
     }
@@ -2055,7 +2088,7 @@ async fn wait_for_process(
             send_run_result(
                 output,
                 session_id,
-                Err(String::from("Process stopped by user")),
+                Err(RunFailure::StoppedByUser),
             )
             .await;
         }
@@ -2067,7 +2100,7 @@ async fn wait_for_process(
                 send_run_result(
                     output,
                     session_id,
-                    Err(format!("Failed to wait for process: {e}")),
+                    Err(RunFailure::Failed(format!("Failed to wait for process: {e}"))),
                 )
                 .await;
             }
@@ -2078,7 +2111,7 @@ async fn wait_for_process(
 async fn send_run_result(
     output: &mut iced::futures::channel::mpsc::Sender<Message>,
     session_id: Uuid,
-    result: Result<i32, String>,
+    result: Result<i32, RunFailure>,
 ) {
     use iced::futures::SinkExt;
 
@@ -2454,6 +2487,95 @@ fn resolve_java_executable(jdk_path: Option<&String>) -> String {
 mod tests {
     use super::*;
 
+    // ---- 작업 디렉터리 선행 검사 ----
+
+    /// 순수 술어가 아니라 **배선**을 잰다 — 검사가 `run_configuration_stream`에서 빠지면 세 스폰
+    /// 경로가 그대로 돌아가고, `CommandBuilder::cwd`가 없는 디렉터리를 버리고 `$HOME`으로 접으므로
+    /// 배너가 단언한 경로와 프로세스의 실제 cwd가 갈린 채 세션이 그 명령의 결과로 끝난다.
+    ///
+    /// 없는 디렉터리에서는 스폰이 일어나지 않으므로 이 테스트는 프로세스도 파일도 만들지 않는다.
+    /// 없는 경로는 UUID로 만들어 머신 상태와 무관하게 없다.
+    #[tokio::test]
+    async fn a_run_in_a_missing_directory_fails_before_spawning() {
+        use iced::futures::StreamExt;
+
+        let missing = std::env::temp_dir().join(format!("run-config-absent-{}", Uuid::new_v4()));
+        let config = RunConfiguration {
+            working_directory: missing.to_string_lossy().into_owned(),
+            ..RunConfiguration::default()
+        };
+        let session_id = Uuid::new_v4();
+
+        let messages: Vec<Message> = run_configuration_stream(
+            config,
+            session_id,
+            Arc::new(AtomicBool::new(false)),
+            false,
+            None,
+        )
+        .collect()
+        .await;
+
+        assert!(
+            !messages
+                .iter()
+                .any(|message| matches!(message, Message::ProcessStarted(..))),
+            "스폰이 일어났다: {messages:?}"
+        );
+
+        // 배너보다 **뒤**라는 순서도 계약이다 — 어느 경로가 틀렸는지를 사용자와 호출자가 함께
+        // 보는 것이 그 순서의 목적이므로, 단정하지 않으면 가드를 배너 앞으로 옮겨도 스위트가
+        // 초록인 채 그 목적만 사라진다.
+        let banner = messages
+            .iter()
+            .position(|message| matches!(message, Message::OutputReceived(..)))
+            .expect("배너가 먼저 나가야 한다");
+        let completed: Vec<usize> = messages
+            .iter()
+            .enumerate()
+            .filter(|(_, message)| matches!(message, Message::RunCompleted(..)))
+            .map(|(at, _)| at)
+            .collect();
+
+        // 완료가 **정확히 하나**여야 `completion.disarm()`이 고정된다 — 빼먹으면 가드가
+        // `CompletionGuard`의 Drop 보고를 뒤에 하나 더 붙인다.
+        assert_eq!(
+            completed.len(),
+            1,
+            "완료 메시지가 하나여야 한다: {messages:?}"
+        );
+        assert!(banner < completed[0], "배너가 완료보다 앞이어야 한다");
+
+        match &messages[completed[0]] {
+            Message::RunCompleted(_, Err(RunFailure::Failed(reason))) => {
+                assert!(reason.contains("Working directory"), "{reason}");
+            }
+            other => panic!("실패로 끝나야 한다: {other:?}"),
+        }
+    }
+
+    /// 두 입력은 머신 상태에 의존하지 않도록 골랐다 — 임시 디렉터리는 존재하고, UUID를 붙인
+    /// 하위 경로는 존재하지 않는다.
+    #[test]
+    fn a_missing_working_directory_fails_the_check() {
+        let existing = std::env::temp_dir();
+        let missing = existing.join(format!("run-config-absent-{}", Uuid::new_v4()));
+        let missing = missing.to_string_lossy().to_string();
+
+        assert!(verify_working_directory(&existing.to_string_lossy()).is_ok());
+
+        let reason =
+            verify_working_directory(&missing).expect_err("없는 디렉터리는 스폰 전에 걸러야 한다");
+        assert!(reason.contains(&missing), "{reason}");
+    }
+
+    /// 빈 값도 같은 검사에 걸린다. `CommandBuilder::cwd`의 필터는 빈 문자열도 버리므로 빈 값의
+    /// 실제 동작은 없는 디렉터리와 같았다 — 비-PTY 경로만 `ENOENT`로 실패했다.
+    #[test]
+    fn an_empty_working_directory_is_refused() {
+        assert!(verify_working_directory("").is_err());
+    }
+
     // ---- LineAssembler: CR/LF 조립 매트릭스 ----
 
     /// 바이트를 한 번에 밀어넣고 배치 이벤트를 꺼내는 헬퍼.
@@ -2599,7 +2721,9 @@ mod tests {
         assert_eq!(events[0], line("가"));
         assert!(
             events.iter().all(|e| match e {
-                OutputEvent::Line(t) | OutputEvent::Replace(t) => !t.contains('\u{FFFD}'),
+                OutputEvent::Line(t) | OutputEvent::EnvBanner(t) | OutputEvent::Replace(t) => {
+                    !t.contains('\u{FFFD}')
+                }
             }),
             "경계 분할이 U+FFFD로 새면 안 됨: {events:?}"
         );
@@ -2622,7 +2746,8 @@ mod tests {
     fn assembler_emitted_text_never_contains_cr() {
         let events = assemble(&[b"a\rb", b"c\rd\ne\r"], true);
         for event in &events {
-            let (OutputEvent::Line(t) | OutputEvent::Replace(t)) = event;
+            let (OutputEvent::Line(t) | OutputEvent::EnvBanner(t) | OutputEvent::Replace(t)) =
+                event;
             assert!(!t.contains('\r'), "CR leaked: {t:?}");
         }
     }
@@ -3556,7 +3681,7 @@ time.sleep(30)'";
                 return;
             };
             assert_eq!(status, Ok(0));
-            let mut session = crate::models::RunSession::new(String::from("t"));
+            let mut session = crate::models::RunSession::new(Uuid::new_v4(), String::from("t"));
             let mut assembler = LineAssembler::new();
             let mut batch = EventBatch::default();
             assembler.push_bytes(raw.as_bytes(), &mut batch);
@@ -4052,6 +4177,7 @@ time.sleep(30)'";
                 for event in events {
                     match event {
                         crate::models::OutputEvent::Line(text)
+                        | crate::models::OutputEvent::EnvBanner(text)
                         | crate::models::OutputEvent::Replace(text) => {
                             reconstructed.push_str(text);
                             reconstructed.push('\n');
@@ -4108,6 +4234,69 @@ time.sleep(30)'";
     }
 
     #[tokio::test]
+    async fn a_newline_or_cr_in_an_env_value_does_not_split_the_banner() {
+        // PEM 키나 서비스 계정 JSON은 개행을 담아, 그대로 찍으면 배너가 화면 수십 줄을
+        // 차지한다. raw CR은 더 나쁘다 — `RunSession::normalize_line`이 마지막 `\r` 뒤만
+        // 남기므로 `Environment: ` 자체가 사라져, 사용자에게는 정체 모를 한 줄이 남는다.
+        // 그리고 배너가 반드시 `EnvBanner` 하나로 도착해야 MCP 읽기 경계가 그 줄을 가릴 수
+        // 있다 — `Line`으로 새면 마스킹 대상 기록에 들어가지 않아 값이 그대로 나간다.
+        use iced::futures::StreamExt;
+        use iced::futures::channel::mpsc;
+
+        let mut config = RunConfiguration {
+            name: "T".to_string(),
+            ..RunConfiguration::default()
+        };
+        config
+            .environment_variables
+            .insert("TOKEN".to_string(), "a\nSECRET=b".to_string());
+        config
+            .environment_variables
+            .insert("CARRIAGE".to_string(), "x\rSECRET=c".to_string());
+
+        let (mut tx, mut rx) = mpsc::channel(16);
+        send_command_info(&mut tx, Uuid::new_v4(), &config, "echo hi", &[], true).await;
+        drop(tx);
+
+        let mut lines: Vec<String> = Vec::new();
+        let mut banner_events: Vec<String> = Vec::new();
+        while let Some(msg) = rx.next().await {
+            if let Message::OutputReceived(_, events) = msg {
+                for event in events {
+                    match event {
+                        crate::models::OutputEvent::EnvBanner(text) => {
+                            banner_events.push(text.clone());
+                            lines.push(text);
+                        }
+                        crate::models::OutputEvent::Line(text)
+                        | crate::models::OutputEvent::Replace(text) => lines.push(text),
+                    }
+                }
+            }
+        }
+
+        assert_eq!(
+            banner_events.len(),
+            1,
+            "the banner must arrive as one EnvBanner event: {lines:?}"
+        );
+        let banner: Vec<&String> = lines
+            .iter()
+            .filter(|line| line.starts_with("Environment: "))
+            .collect();
+        assert_eq!(banner.len(), 1, "the banner must be one line: {lines:?}");
+        assert_eq!(
+            banner[0],
+            "Environment: CARRIAGE=x\\rSECRET=c; TOKEN=a\\nSECRET=b"
+        );
+        assert!(
+            !lines.iter().any(|line| !line.starts_with("Environment: ")
+                && (line.contains("SECRET=b") || line.contains("SECRET=c"))),
+            "no line outside the banner may carry the value: {lines:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn send_command_info_env_line_gated_by_show_env() {
         use iced::futures::StreamExt;
         use iced::futures::channel::mpsc;
@@ -4130,6 +4319,7 @@ time.sleep(30)'";
                     for event in events {
                         match event {
                             crate::models::OutputEvent::Line(text)
+                            | crate::models::OutputEvent::EnvBanner(text)
                             | crate::models::OutputEvent::Replace(text) => {
                                 out.push_str(&text);
                                 out.push('\n');
