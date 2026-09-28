@@ -138,15 +138,16 @@ claude mcp add --transport http runconfig http://127.0.0.1:47355/mcp \
 또는 **정확한** 이름이다. `type_data`가 타입별 필드를 그대로 싣는다 — 편집 툴에 넘길
 `type_data`는 이 응답에서 복사해 고치는 것이 정해진 사용법이다.
 
-**`list_sessions`** — 세션별 `state` · `exit_code` · `error` · `started_at_unix_ms` ·
-`duration_ms` · `line_count`.
+**`list_sessions`** — 세션별 `session_id` · `config_id` · `config_name` · `state` · `exit_code` ·
+`error` · `started_at_unix_ms` · `duration_ms` · `line_count`. 나머지 세션 툴이 인자로 받는
+`session_id`를 에이전트가 얻는 곳이 이 응답이다.
 
 `state` 값: `running` · `succeeded` · `failed`(종료 코드 있음) · `stopped`(사용자·에이전트가
 중지) · `errored`(종료 코드가 아예 없는 실패 — 사유는 `error` 필드).
 
 **`read_session_output(session_id, tail_lines?, since_line_id?)`** — ANSI를 제거한 평문.
-`tail_lines` 기본 200줄, 최대 5000줄. 응답은 `text` · `last_line_id` · `buffered_lines` ·
-`returned_lines` · `omitted_lines`.
+`tail_lines` 기본 200줄, 최대 5000줄. 응답은 `session_id` · `config_id` · `config_name` ·
+`state` · `text` · `last_line_id` · `buffered_lines` · `returned_lines` · `omitted_lines`.
 
 이어 읽기: 앞선 호출의 `last_line_id`를 `since_line_id`로 넘기면 그 뒤에 추가된 줄만 온다.
 줄 id는 버퍼 축출을 넘어 안정적이지만, 제자리에서 덮어써지는 줄(진행 표시줄)은 id를 유지한다.
@@ -156,7 +157,8 @@ claude mcp add --transport http runconfig http://127.0.0.1:47355/mcp \
 읽는다. 새 값이 `null`이면 앞선 커서를 그대로 둔다.
 
 **`search_session_output(session_id, query, regex?)`** — 대소문자 무시 부분 문자열이 기본,
-`regex: true`면 정규식. 응답은 `total_matches` · `matched_lines` · `truncated`.
+`regex: true`면 정규식. 응답은 `session_id` · `config_id` · `query` · `regex` ·
+`total_matches` · `matched_lines` · `truncated`.
 
 매치는 줄 단위로 접힌다 — 한 줄에 여러 번 맞으면 항목 하나에 `match_count`가 올라간다.
 그래서 두 수가 다른 것을 센다: `total_matches`는 **매치 개수**, `matched_lines`와 `truncated`가
@@ -437,11 +439,10 @@ MCP 요청은 GUI 버튼과 같은 update 루프 안에서 처리되고, 실행�
   따라간다. 다만 `config_name`은 **세션 객체가 만들어진 시점**의 값이고 재실행은 그 값을
   갱신하지 않으므로(`started_at`만 새로 찍는다) 개명 뒤에는 낡은 이름을 계속 보고한다.
   **그 이름만으로 구성을 되찾을 수는 없다** — 낡은 이름은 아무것도 가리키지 않거나 그 이름을
-  물려받은 **다른** 구성을 가리킨다. 세션을 돌려주는 응답 어디에도 구성 id가 실리지 않으므로
-  세션만 쥐고는 되이을 수 없다. **회복 경로는 구성 id다** — 그 id는 구성 조회와 편집 응답이
-  싣고(`list_configurations`·`get_configuration`의 `id`, 편집 응답의 `configuration_id`)
-  `configuration` 인자가 UUID를 받으므로, 실행 시점에 적어 두면 개명 뒤에도 그 구성을 지목할
-  수 있다
+  물려받은 **다른** 구성을 가리킨다. **지목은 구성 id로 한다** — 세션을 돌려주는 응답은
+  어디에나 `config_id`를 싣고 `configuration` 인자가 UUID를 받으므로, 세션에서 꺼낸 id를
+  넘기면 개명 뒤에도 정확히 지목된다. 구성 id는 구성 조회·편집 응답에도 실려 있다 —
+  `list_configurations`·`get_configuration`은 `id`로, 편집 응답은 `configuration_id`로.
 - **삭제는 살아 있는 세션·페인을 정리하지 않는다.** 프로세스는 계속 돌고 페인은 열려 있고,
   그 세션의 `rerun_session`은 `Configuration '<세션 객체가 만들어질 때의 이름>' not found`로 계속
   실패한다(재실행은 그 이름을 갱신하지 않으므로 마지막 실행 시점의 이름과도 다를 수 있다).

@@ -1111,6 +1111,7 @@ impl RunConfigManager {
         match find_session(&self.sessions, session_id) {
             Some(session) => json!({
                 "session_id": session_id,
+                "config_id": session.config_id,
                 "config_name": session.config_name,
                 "state": state_name(session.status_kind()),
                 "exit_code": session.exit_code,
@@ -1122,6 +1123,7 @@ impl RunConfigManager {
             // 응답 모양을 두 가지로 다뤄야 한다.
             None => json!({
                 "session_id": session_id,
+                "config_id": Value::Null,
                 "config_name": Value::Null,
                 "state": "removed",
                 "exit_code": Value::Null,
@@ -1453,6 +1455,7 @@ fn configuration_detail(config: &RunConfiguration, expose_env: bool) -> Result<V
 fn session_summary(session: &RunSession) -> Value {
     json!({
         "session_id": session.id,
+        "config_id": session.config_id,
         "config_name": session.config_name,
         "state": state_name(session.status_kind()),
         "exit_code": session.exit_code,
@@ -1487,6 +1490,7 @@ fn session_output(
 
     json!({
         "session_id": session.id,
+        "config_id": session.config_id,
         "config_name": session.config_name,
         "state": state_name(session.status_kind()),
         "buffered_lines": session.output_lines.len(),
@@ -1542,6 +1546,7 @@ fn session_search(session: &RunSession, query: &str, regex: bool, expose_env: bo
 
     json!({
         "session_id": session.id,
+        "config_id": session.config_id,
         "query": query,
         "regex": regex,
         "total_matches": matches.len(),
@@ -1742,6 +1747,9 @@ mod tests {
         assert_eq!(summary["duration_ms"], 1_500);
         assert_eq!(summary["line_count"], 2);
         assert!(summary["started_at_unix_ms"].is_u64());
+        // config_id는 세션이 담은 구성 id 그대로다 — 이름이 낡았어도 이 값으로 지목한다(D144).
+        // json!(Uuid)가 Value::String이므로 이 등가 단정이 와이어 타입까지 고정한다.
+        assert_eq!(summary["config_id"], json!(session.config_id));
     }
 
     #[test]
@@ -1779,7 +1787,10 @@ mod tests {
 
     #[test]
     fn output_of_an_empty_session_is_empty() {
-        let payload = session_output(&session_with_output(&[]), 10, None, false);
+        let session = session_with_output(&[]);
+        // 읽기 응답도 세션 응답이다(D144) — config_id가 빠지면 회복 경로 문장이 무방비가 된다.
+        let payload = session_output(&session, 10, None, false);
+        assert_eq!(payload["config_id"], json!(session.config_id), "{payload}");
         assert_eq!(payload["text"], "");
         assert_eq!(payload["returned_lines"], 0);
         assert!(payload["last_line_id"].is_null());
@@ -2082,8 +2093,13 @@ mod tests {
 
         assert_eq!(app.sessions.len(), 2);
         assert_eq!(payload["sessions"].as_array().expect("array").len(), 2);
+        // Index는 없는 키를 Null로 돌려주므로 is_null로는 부재를 못 잡는다(D145) — 키가
+        // null로라도 생기면 "id가 하나 있다"로 읽는 호출자가 생긴다.
         assert!(
-            payload["session_id"].is_null(),
+            !payload
+                .as_object()
+                .expect("object")
+                .contains_key("session_id"),
             "a single id would hide the other session: {payload}"
         );
     }
@@ -2141,6 +2157,12 @@ mod tests {
         assert_eq!(payload["session_id"], json!(new_id));
         assert_eq!(payload["previous_session_id"], json!(old_id));
         assert_eq!(payload["state"], "running");
+        // 세션 응답의 계약(D144): 지목은 이 id로 한다. Some arm은 실제 id를 싣는다.
+        assert_eq!(
+            payload["config_id"],
+            json!(app.sessions[0].config_id),
+            "{payload}"
+        );
     }
 
     #[test]
@@ -2416,6 +2438,11 @@ mod tests {
 
         assert!(app.sessions.is_empty(), "the retry must not run it again");
         assert_eq!(payload["sessions"][0]["state"], "removed");
+        // 지워진 세션의 키 형태는 살아 있는 것과 같다(D11). serde_json의 Index는 없는 키를
+        // Null로 돌려주므로 값 단정만으로는 존재를 못 잡는다 — `changed` 단정과 같은 수로.
+        let removed = payload["sessions"][0].as_object().expect("object");
+        assert!(removed.get("config_id").is_some(), "{payload}");
+        assert!(removed["config_id"].is_null(), "{payload}");
         assert_eq!(payload["deduplicated"], true);
     }
 
@@ -2639,6 +2666,8 @@ mod tests {
 
         // 금지 조항을 실행 가능한 형태로 고정한다: 마스킹 여부에 따라 값이 달라지는 카운트가
         // 응답에 하나라도 생기면 위 oracle이 그대로 되살아난다. 키를 늘리는 변경은 여기서 멈춘다.
+        // config_id는 세션이 만들어진 시점에 정해지는 값이라 마스킹과 무관하다(D144) — 그래서
+        // 예외가 아니라 기대 배열에 정확히 한 번 들어간다.
         let mut keys: Vec<&str> = payload
             .as_object()
             .expect("object")
@@ -2649,6 +2678,7 @@ mod tests {
         assert_eq!(
             keys,
             [
+                "config_id",
                 "matched_lines",
                 "query",
                 "regex",

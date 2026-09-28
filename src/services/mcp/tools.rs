@@ -194,9 +194,9 @@ static TOOLS: &[ToolSpec] = &[
                       exit code, stopped by the user, or errored when the run produced no exit \
                       code at all — that reason is in the error field), start time, duration, \
                       buffered output line count, and the configuration name recorded when the \
-                      session was created, which does not follow a later rename. No configuration \
-                      id is included, so keep the one list_configurations returns if you need to \
-                      address the configuration afterwards.",
+                      session was created, which does not follow a later rename. The response \
+                      also carries the configuration id, which survives renames and addresses \
+                      the configuration in the tools that take one.",
         tier: McpPermission::ReadOnly,
         schema: || json!({ "type": "object", "properties": {}, "additionalProperties": false }),
     },
@@ -465,13 +465,10 @@ static TOOLS: &[ToolSpec] = &[
                                         started from this configuration stay attached across a \
                                         rename because rerun_session resolves the configuration \
                                         by id, but list_sessions keeps reporting the name the \
-                                        session was created with. No session response carries \
-                                        the configuration id, so a session on its own cannot be \
-                                        mapped back once the name differs — keep the \
-                                        configuration's own id (configuration_id in the create, \
-                                        update and delete responses, id in list_configurations \
-                                        and get_configuration) and pass it as configuration, \
-                                        which accepts a UUID.",
+                                        session was created with. Every response that returns a \
+                                        session also carries the configuration id, so pass that \
+                                        as configuration (a UUID) when the name no longer \
+                                        matches.",
                     },
                     "working_directory": {
                         "type": "string",
