@@ -3,7 +3,7 @@ use crate::models::{
     RunConfiguration, RunFailure, SpringBootBuildTool, StdinWriteError,
 };
 use crate::services::{McpEvent, McpPermission, McpRequest};
-use crate::utils::SpringModuleScan;
+use crate::utils::CandidateScan;
 use crate::widgets::pane_grid;
 use iced::window;
 use std::path::PathBuf;
@@ -157,12 +157,20 @@ pub enum Message {
     SpringBootModuleChanged(String),
     /// `@SpringBootApplication` 모듈 감지 시작
     DetectSpringBootModules,
+    /// Kotlin main class 감지 시작
+    DetectKotlinMainClasses,
+    /// Kotlin main class 감지 완료 (구성 id, 스캔한 작업 디렉터리, 결과 또는 실패 사유)
+    KotlinMainClassesScanned(Uuid, String, Result<CandidateScan, String>),
+    /// Kotlin JAR 산출물 감지 시작
+    DetectKotlinJars,
+    /// Kotlin JAR 감지 완료 (구성 id, 스캔한 작업 디렉터리, 결과 또는 실패 사유)
+    KotlinJarsScanned(Uuid, String, Result<CandidateScan, String>),
     /// 모듈 감지 완료 (구성 id, 스캔한 작업 디렉터리, 요청 시점의 빌드 도구, 결과 또는 실패 사유)
     SpringBootModulesScanned(
         Uuid,
         String,
         SpringBootBuildTool,
-        Result<SpringModuleScan, String>,
+        Result<CandidateScan, String>,
     ),
     /// JAR 파일 경로 변경
     SpringBootJarPathChanged(String),

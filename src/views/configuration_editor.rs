@@ -23,8 +23,8 @@ use uuid::Uuid;
 pub struct EditorLoadingState {
     pub file_dialog: FileDialogLoadingState,
     pub node: NodeLoadingState,
-    /// Spring Boot 모듈 감지 스캔이 진행 중인지
-    pub spring_boot_detecting: bool,
+    /// 후보(Spring 모듈·Kotlin main class·JAR) 감지 스캔이 진행 중인지
+    pub detecting_candidates: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -61,6 +61,8 @@ pub struct EditorSelectState {
     pub kotlin_launch_mode: combo_box::State<KotlinLaunchModeType>,
     pub spring_build_tool: combo_box::State<SpringBootBuildTool>,
     pub spring_boot_module: combo_box::State<String>,
+    pub kotlin_main_class: combo_box::State<String>,
+    pub kotlin_jar: combo_box::State<String>,
     pub jdk: combo_box::State<String>,
 }
 
@@ -77,6 +79,8 @@ impl EditorSelectState {
             kotlin_launch_mode: combo_box::State::new(KotlinLaunchModeType::ALL.to_vec()),
             spring_build_tool: combo_box::State::new(SpringBootBuildTool::ALL.to_vec()),
             spring_boot_module: combo_box::State::new(Vec::new()),
+            kotlin_main_class: combo_box::State::new(Vec::new()),
+            kotlin_jar: combo_box::State::new(Vec::new()),
             jdk: combo_box::State::new(vec![String::from("Default (system)")]),
         }
     }
@@ -100,6 +104,14 @@ impl EditorSelectState {
 
     pub fn set_spring_boot_modules(&mut self, modules: Vec<String>) {
         self.spring_boot_module = combo_box::State::new(modules);
+    }
+
+    pub fn set_kotlin_main_classes(&mut self, classes: Vec<String>) {
+        self.kotlin_main_class = combo_box::State::new(classes);
+    }
+
+    pub fn set_kotlin_jars(&mut self, jars: Vec<String>) {
+        self.kotlin_jar = combo_box::State::new(jars);
     }
 }
 
@@ -196,6 +208,7 @@ pub fn view_configuration_editor<'a>(
             select_state,
             loading.file_dialog.kotlin_jar,
             loading.file_dialog.kotlin_jdk,
+            loading.detecting_candidates,
         ),
         ConfigTypeData::SpringBoot {
             build_tool,
@@ -219,7 +232,7 @@ pub fn view_configuration_editor<'a>(
             select_state,
             loading.file_dialog.spring_boot_jar,
             loading.file_dialog.spring_boot_jdk,
-            loading.spring_boot_detecting,
+            loading.detecting_candidates,
         ),
         ConfigTypeData::Compound { members, workspace } => {
             view_compound_fields(members, workspace.as_deref(), configurations, index)
@@ -2214,6 +2227,7 @@ fn view_kotlin_fields<'a>(
     select_state: &'a EditorSelectState,
     is_loading_kotlin_jar: bool,
     is_loading_kotlin_jdk: bool,
+    is_detecting_candidates: bool,
 ) -> Element<'a, Message> {
     let mut col =
         column![view_kotlin_launch_mode_row(launch_mode, select_state)].width(Length::Fill);
@@ -2225,14 +2239,23 @@ fn view_kotlin_fields<'a>(
         } => {
             col = col
                 .push(Space::new().height(10))
-                .push(view_kotlin_main_class_row(main_class))
+                .push(view_kotlin_main_class_row(
+                    main_class,
+                    select_state,
+                    is_detecting_candidates,
+                ))
                 .push(Space::new().height(10))
                 .push(view_kotlin_classpath_row(classpath));
         }
         KotlinLaunchMode::Jar { jar_path } => {
             col = col
                 .push(Space::new().height(10))
-                .push(view_kotlin_jar_path_row(jar_path, is_loading_kotlin_jar));
+                .push(view_kotlin_jar_path_row(
+                    jar_path,
+                    select_state,
+                    is_loading_kotlin_jar,
+                    is_detecting_candidates,
+                ));
         }
     }
 
@@ -2274,29 +2297,62 @@ fn view_kotlin_launch_mode_row<'a>(
     )
 }
 
-fn view_kotlin_main_class_row(main_class: &str) -> iced::widget::Row<'_, Message> {
-    view_editor_row(
-        "Main Class:",
-        editor_input("com.example.MainKt", main_class)
-            .on_input(Message::KotlinMainClassChanged)
-            .into(),
-    )
+fn view_kotlin_main_class_row<'a>(
+    main_class: &'a String,
+    select_state: &'a EditorSelectState,
+    is_detecting: bool,
+) -> iced::widget::Row<'a, Message> {
+    let picker = candidate_picker(
+        &select_state.kotlin_main_class,
+        main_class,
+        "com.example.MainKt",
+        "Search main class",
+        Message::KotlinMainClassChanged,
+    );
+    let input = column![
+        row![
+            container(picker).width(Length::Fill),
+            detect_button(is_detecting, Message::DetectKotlinMainClasses)
+        ]
+        .spacing(10)
+        .align_y(Alignment::Center),
+        hint_text(String::from(
+            "The refresh button scans .kt/.java sources for top-level main functions. \
+             Objects with @JvmStatic main and .kts scripts are not detected."
+        )),
+    ]
+    .spacing(4)
+    .width(Length::Fill);
+
+    view_editor_row("Main Class:", input.into())
 }
 
 fn view_kotlin_classpath_row(classpath: &str) -> iced::widget::Row<'_, Message> {
-    view_editor_row(
-        "Classpath:",
-        editor_input("build/libs/*:libs/*", classpath)
-            .on_input(Message::KotlinClasspathChanged)
-            .into(),
-    )
+    let input = column![
+        editor_input("build/libs/*:libs/*", classpath).on_input(Message::KotlinClasspathChanged),
+        hint_text(String::from(
+            "Dependencies are not detected - list compiled classes and dependency jars here."
+        )),
+    ]
+    .spacing(4)
+    .width(Length::Fill);
+
+    view_editor_row("Classpath:", input.into())
 }
 
-fn view_kotlin_jar_path_row(
-    jar_path: &str,
+fn view_kotlin_jar_path_row<'a>(
+    jar_path: &'a String,
+    select_state: &'a EditorSelectState,
     is_loading_kotlin_jar: bool,
-) -> iced::widget::Row<'_, Message> {
-    let path_input = editor_input("Path to .jar", jar_path).on_input(Message::KotlinJarPathChanged);
+    is_detecting: bool,
+) -> iced::widget::Row<'a, Message> {
+    let picker = candidate_picker(
+        &select_state.kotlin_jar,
+        jar_path,
+        "Path to .jar",
+        "Search JAR",
+        Message::KotlinJarPathChanged,
+    );
 
     let mut browse_btn = icon_button(ICON_FOLDER_OPEN, None)
         .padding(0)
@@ -2309,8 +2365,9 @@ fn view_kotlin_jar_path_row(
 
     row![
         container(text("JAR Path:").size(12).style(editor_label_style)).width(Length::Fixed(136.0)),
-        path_input,
+        container(picker).width(Length::Fill),
         browse_btn,
+        detect_button(is_detecting, Message::DetectKotlinJars),
     ]
     .spacing(10)
     .align_y(Alignment::Center)
@@ -2485,52 +2542,69 @@ fn view_spring_boot_jar_path_row(
     .width(Length::Fill)
 }
 
+/// 감지한 후보가 있으면 목록에서 고르고(직접 타이핑도 그대로 반영), 없으면 일반 입력을 보여준다.
+///
+/// 입력과 목록 선택이 같은 메시지를 내므로 어느 쪽으로 바꿔도 모델에는 같은 값이 들어간다.
+fn candidate_picker<'a>(
+    options: &'a combo_box::State<String>,
+    value: &'a String,
+    input_placeholder: &'a str,
+    combo_placeholder: &'a str,
+    on_change: fn(String) -> Message,
+) -> Element<'a, Message> {
+    if options.options().is_empty() {
+        editor_input(input_placeholder, value)
+            .on_input(on_change)
+            .into()
+    } else {
+        editor_combo_box(options, combo_placeholder, Some(value), on_change)
+            .on_input(on_change)
+            .into()
+    }
+}
+
+/// 후보 감지 버튼. 스캔이 진행 중이면 누를 수 없다.
+fn detect_button(is_detecting: bool, message: Message) -> iced::widget::Button<'static, Message> {
+    icon_button(ICON_REFRESH, (!is_detecting).then_some(message))
+        .padding(0)
+        .width(34)
+        .height(34)
+}
+
+fn hint_text(body: String) -> iced::widget::Text<'static, Theme> {
+    text(body).size(11).style(editor_label_style)
+}
+
 fn view_spring_boot_module_row<'a>(
     module: &'a String,
     build_tool: &SpringBootBuildTool,
     select_state: &'a EditorSelectState,
     is_detecting: bool,
 ) -> iced::widget::Row<'a, Message> {
-    // 후보가 없으면 자유 입력, 있으면 목록에서 고르되 직접 타이핑도 그대로 반영한다.
-    let picker: Element<'a, Message> = if select_state.spring_boot_module.options().is_empty() {
-        editor_input(":app", module)
-            .on_input(Message::SpringBootModuleChanged)
-            .into()
-    } else {
-        editor_combo_box(
-            &select_state.spring_boot_module,
-            "Search module",
-            Some(module),
-            Message::SpringBootModuleChanged,
-        )
-        .on_input(Message::SpringBootModuleChanged)
-        .into()
-    };
-
-    let mut detect_btn = icon_button(ICON_REFRESH, None)
-        .padding(0)
-        .width(34)
-        .height(34);
-    if !is_detecting {
-        detect_btn = detect_btn.on_press(Message::DetectSpringBootModules);
-    }
-
+    let picker = candidate_picker(
+        &select_state.spring_boot_module,
+        module,
+        ":app",
+        "Search module",
+        Message::SpringBootModuleChanged,
+    );
     let format_hint = match build_tool {
         SpringBootBuildTool::Maven => "Maven -pl value, e.g. app/api or :artifactId.",
         SpringBootBuildTool::Gradle => "Gradle project path, e.g. :app or :services:api.",
         _ => "Gradle project path (e.g. :app) or Maven -pl value (e.g. app/api).",
     };
     let input = column![
-        row![container(picker).width(Length::Fill), detect_btn]
-            .spacing(10)
-            .align_y(Alignment::Center),
-        text(format!(
+        row![
+            container(picker).width(Length::Fill),
+            detect_button(is_detecting, Message::DetectSpringBootModules)
+        ]
+        .spacing(10)
+        .align_y(Alignment::Center),
+        hint_text(format!(
             "{format_hint} Leave empty to run the working directory's project. Use the refresh \
              button to find modules with @SpringBootApplication; needed when a multi-module \
              root has modules without a main class."
-        ))
-        .size(11)
-        .style(editor_label_style),
+        )),
     ]
     .spacing(4)
     .width(Length::Fill);

@@ -11,8 +11,8 @@ use crate::services::{
     save_to_store, terminate_session_process, unregister_running_pid,
 };
 use crate::utils::{
-    DIALOG_CANCELLED, ICON_DELETE, ICON_PLAY, ICON_REFRESH, ICON_STOP, SpringModuleFlavor,
-    SpringModuleScan,
+    CandidateScan, DIALOG_CANCELLED, ICON_DELETE, ICON_PLAY, ICON_REFRESH, ICON_STOP,
+    SpringModuleFlavor,
 };
 use crate::views::shared::icon_tooltip;
 use crate::views::{
@@ -43,11 +43,14 @@ use uuid::Uuid;
 mod chrome;
 mod confirm_delete_modal;
 mod confirm_update_modal;
+mod detected_candidates;
 mod env_modal;
 mod export_modal;
 mod import_modal;
 mod mcp;
 mod settings_modal;
+
+use self::detected_candidates::{CandidateKind, DetectedCandidates};
 
 use confirm_delete_modal::ConfirmDeleteModalState;
 use confirm_update_modal::ConfirmUpdateModalState;
@@ -367,7 +370,7 @@ fn node_paths(config: &RunConfiguration) -> Option<(Uuid, String, String)> {
 fn resolve_and_scan_spring_boot_modules(
     root: &str,
     tool: SpringBootBuildTool,
-) -> Result<SpringModuleScan, String> {
+) -> Result<CandidateScan, String> {
     if !std::path::Path::new(root.trim()).is_dir() {
         return Err(String::from(
             "Set a valid working directory before detecting modules",
@@ -395,6 +398,40 @@ async fn scan_spring_boot_modules_task(
             .await
             .unwrap_or_else(|err| Err(format!("Module scan failed: {err}")));
     Message::SpringBootModulesScanned(config_id, scanned_root, tool, result)
+}
+
+/// Kotlin 후보(main class·JAR)를 작업 디렉터리에서 스캔한다. 디렉터리 확인도 여기서 해
+/// update 핸들러가 파일시스템을 건드리지 않게 한다.
+fn scan_kotlin_candidates(root: &str, kind: CandidateKind) -> Result<CandidateScan, String> {
+    let path = std::path::Path::new(root);
+    if root.trim().is_empty() || !path.is_dir() {
+        return Err(String::from(
+            "Set a valid working directory before detecting",
+        ));
+    }
+    Ok(match kind {
+        CandidateKind::KotlinMainClass => crate::utils::scan_kotlin_main_classes(path),
+        CandidateKind::KotlinJar => crate::utils::scan_jar_artifacts(path),
+        CandidateKind::SpringModule => {
+            return Err(String::from("Spring modules are scanned separately"));
+        }
+    })
+}
+
+/// `scan_spring_boot_modules_task`와 같은 이유로 `spawn_blocking`에서 실행한다.
+async fn scan_kotlin_candidates_task(
+    config_id: Uuid,
+    root: String,
+    kind: CandidateKind,
+) -> Message {
+    let scanned_root = root.clone();
+    let result = tokio::task::spawn_blocking(move || scan_kotlin_candidates(&root, kind))
+        .await
+        .unwrap_or_else(|err| Err(format!("Scan failed: {err}")));
+    match kind {
+        CandidateKind::KotlinJar => Message::KotlinJarsScanned(config_id, scanned_root, result),
+        _ => Message::KotlinMainClassesScanned(config_id, scanned_root, result),
+    }
 }
 
 /// 모듈 표기 방식. Jar는 모듈을 쓰지 않으므로 없다.
@@ -504,11 +541,11 @@ pub struct RunConfigManager {
     editor_select_state: EditorSelectState,
     /// Node 프로젝트에서 발견된 `package.json` 목록 (`config_id` -> 상대 경로 리스트)
     node_available_package_jsons: HashMap<Uuid, Vec<String>>,
-    /// 구성별로 감지한 Spring Boot 실행 모듈 후보. 표기가 빌드 도구별이라 도구나 작업
-    /// 디렉터리가 바뀌면 비운다.
-    spring_boot_available_modules: HashMap<Uuid, Vec<String>>,
-    /// 모듈 감지 스캔이 진행 중인지 (버튼 중복 클릭 방지)
-    is_detecting_spring_boot_modules: bool,
+    /// 구성별로 감지한 후보(Spring 모듈·Kotlin main class·JAR). 표기가 빌드 도구·작업
+    /// 디렉터리에 묶여 있어 그 값이 바뀌면 비운다.
+    detected_candidates: DetectedCandidates,
+    /// 후보 감지 스캔이 진행 중인지 (버튼 중복 클릭 방지, 한 번에 하나)
+    is_detecting_candidates: bool,
     /// 시스템에서 감지된 Node.js Runtime 목록 (label, path)
     available_node_runtimes: Vec<(String, String)>,
     /// 시스템에서 감지된 JDK 목록 (label, path)
@@ -629,8 +666,8 @@ impl RunConfigManager {
             node_ui: NodeUiState::default(),
             editor_select_state: EditorSelectState::new(),
             node_available_package_jsons: HashMap::new(),
-            spring_boot_available_modules: HashMap::new(),
-            is_detecting_spring_boot_modules: false,
+            detected_candidates: DetectedCandidates::default(),
+            is_detecting_candidates: false,
             available_node_runtimes: vec![("Default (system)".to_string(), "node".to_string())],
             available_jdks: vec![("Default (system)".to_string(), "java".to_string())],
             sessions: vec![],
@@ -851,6 +888,10 @@ impl RunConfigManager {
             | Message::SpringBootBuildToolChanged(_)
             | Message::SpringBootModuleChanged(_)
             | Message::DetectSpringBootModules
+            | Message::DetectKotlinMainClasses
+            | Message::KotlinMainClassesScanned(..)
+            | Message::DetectKotlinJars
+            | Message::KotlinJarsScanned(..)
             | Message::SpringBootModulesScanned(..)
             | Message::SpringBootJarPathChanged(_)
             | Message::BrowseSpringBootJarPath
@@ -1059,6 +1100,26 @@ impl RunConfigManager {
                 self.handle_spring_boot_module_changed(value)
             }
             Message::DetectSpringBootModules => self.handle_detect_spring_boot_modules(),
+            Message::DetectKotlinMainClasses => {
+                self.handle_detect_kotlin_candidates(CandidateKind::KotlinMainClass)
+            }
+            Message::DetectKotlinJars => {
+                self.handle_detect_kotlin_candidates(CandidateKind::KotlinJar)
+            }
+            Message::KotlinMainClassesScanned(config_id, root, result) => self
+                .handle_kotlin_candidates_scanned(
+                    CandidateKind::KotlinMainClass,
+                    config_id,
+                    &root,
+                    result,
+                ),
+            Message::KotlinJarsScanned(config_id, root, result) => self
+                .handle_kotlin_candidates_scanned(
+                    CandidateKind::KotlinJar,
+                    config_id,
+                    &root,
+                    result,
+                ),
             Message::SpringBootModulesScanned(config_id, root, tool, result) => {
                 self.handle_spring_boot_modules_scanned(config_id, &root, tool, result)
             }
@@ -1577,7 +1638,7 @@ impl RunConfigManager {
             // 구성별 Node 캐시도 함께 제거 (UUID는 재사용되지 않으므로 누수 방지).
             self.node_available_scripts.remove(&config_id);
             self.node_available_package_jsons.remove(&config_id);
-            self.spring_boot_available_modules.remove(&config_id);
+            self.detected_candidates.forget(config_id);
             // 삭제된 구성을 참조하던 Compound 멤버에서도 제거 (댕글링 참조 방지).
             for other in &mut self.configurations {
                 if let Some(members) = other.type_data.compound_members_mut() {
@@ -1639,9 +1700,7 @@ impl RunConfigManager {
             if let Some(pkgs) = self.node_available_package_jsons.get(&source_id).cloned() {
                 self.node_available_package_jsons.insert(new_id, pkgs);
             }
-            if let Some(modules) = self.spring_boot_available_modules.get(&source_id).cloned() {
-                self.spring_boot_available_modules.insert(new_id, modules);
-            }
+            self.detected_candidates.copy(source_id, new_id);
 
             let new_idx = idx + 1;
             self.configurations.insert(new_idx, clone);
@@ -1934,7 +1993,7 @@ impl RunConfigManager {
             );
 
             // 새 SpringBoot 데이터는 Auto·빈 모듈로 시작하므로 이전 후보(표기가 다를 수 있음)를 버린다.
-            self.spring_boot_available_modules.remove(&config_id);
+            self.detected_candidates.forget(config_id);
 
             if let Some(config) = self.configurations.get_mut(index) {
                 config.type_data = match config_type {
@@ -2190,8 +2249,8 @@ impl RunConfigManager {
                 if is_node {
                     self.load_node_scripts(config_id, &path);
                 }
-                // 이전 디렉터리에서 찾은 모듈 후보는 새 디렉터리에서 의미가 없다.
-                self.forget_spring_boot_modules_of_selected_config();
+                // 이전 디렉터리에서 감지한 후보(모듈·main class·JAR)는 새 디렉터리에서 의미가 없다.
+                self.forget_detected_candidates_of_selected_config();
 
                 self.status_message = format!("Working directory set: {path}");
             }
@@ -2449,7 +2508,7 @@ impl RunConfigManager {
             *spring_boot.build_tool = tool;
         }
         // 모듈 후보의 표기(Gradle `:a:b` / Maven `a/b`)는 도구에 묶여 있어 도구가 바뀌면 낡는다.
-        self.forget_spring_boot_modules_of_selected_config();
+        self.forget_detected_candidates_of_selected_config();
 
         Task::none()
     }
@@ -2510,18 +2569,18 @@ impl RunConfigManager {
         Task::none()
     }
 
-    fn forget_spring_boot_modules_of_selected_config(&mut self) {
+    fn forget_detected_candidates_of_selected_config(&mut self) {
         if let Some(config) = self
             .selected_config_index
             .and_then(|index| self.configurations.get(index))
         {
-            self.spring_boot_available_modules.remove(&config.id);
+            self.detected_candidates.forget(config.id);
             self.sync_editor_select_state_for_selected_config();
         }
     }
 
     fn handle_detect_spring_boot_modules(&mut self) -> Task<Message> {
-        if self.is_detecting_spring_boot_modules {
+        if self.is_detecting_candidates {
             return Task::none();
         }
         let Some(config) = self
@@ -2539,7 +2598,7 @@ impl RunConfigManager {
         }
         let (config_id, root, tool) = (config.id, config.working_directory.clone(), *build_tool);
 
-        self.is_detecting_spring_boot_modules = true;
+        self.is_detecting_candidates = true;
         self.status_message = String::from("Scanning for @SpringBootApplication modules...");
         Task::perform(
             scan_spring_boot_modules_task(config_id, root, tool),
@@ -2552,9 +2611,9 @@ impl RunConfigManager {
         config_id: Uuid,
         root: &str,
         requested_tool: SpringBootBuildTool,
-        result: Result<SpringModuleScan, String>,
+        result: Result<CandidateScan, String>,
     ) -> Task<Message> {
-        self.is_detecting_spring_boot_modules = false;
+        self.is_detecting_candidates = false;
         // 스캔 중에 구성이 지워지거나 다른 타입·도구·작업 디렉터리로 바뀌었으면 결과의 표기가
         // 더는 맞지 않는다. 선택된 구성이 아니라 id로 찾아 엉뚱한 구성에 쓰지 않는다.
         let Some(index) = self.configurations.iter().position(|c| {
@@ -2578,7 +2637,10 @@ impl RunConfigManager {
                 return Task::none();
             }
         };
-        let SpringModuleScan { modules, truncated } = scan;
+        let CandidateScan {
+            items: modules,
+            truncated,
+        } = scan;
         let mut message = match modules.as_slice() {
             [] => format!("No @SpringBootApplication module found under {root}"),
             [only] if only.is_empty() => String::from(
@@ -2605,8 +2667,122 @@ impl RunConfigManager {
         }
 
         self.status_message = message;
-        self.spring_boot_available_modules
-            .insert(config_id, modules);
+        self.detected_candidates
+            .set(config_id, CandidateKind::SpringModule, modules);
+        self.sync_editor_select_state_for_selected_config();
+        Task::none()
+    }
+
+    /// 이 종류의 후보가 의미 있는 launch mode인지 (Main class 모드의 main class, Jar 모드의 JAR).
+    fn kotlin_mode_matches(type_data: &ConfigTypeData, kind: CandidateKind) -> bool {
+        matches!(
+            (type_data, kind),
+            (
+                ConfigTypeData::Kotlin {
+                    launch_mode: KotlinLaunchMode::MainClass { .. },
+                    ..
+                },
+                CandidateKind::KotlinMainClass,
+            ) | (
+                ConfigTypeData::Kotlin {
+                    launch_mode: KotlinLaunchMode::Jar { .. },
+                    ..
+                },
+                CandidateKind::KotlinJar,
+            )
+        )
+    }
+
+    fn handle_detect_kotlin_candidates(&mut self, kind: CandidateKind) -> Task<Message> {
+        if self.is_detecting_candidates {
+            return Task::none();
+        }
+        let Some(config) = self
+            .selected_config_index
+            .and_then(|index| self.configurations.get(index))
+        else {
+            return Task::none();
+        };
+        if !Self::kotlin_mode_matches(&config.type_data, kind) {
+            return Task::none();
+        }
+        let (config_id, root) = (config.id, config.working_directory.clone());
+
+        self.is_detecting_candidates = true;
+        self.status_message = match kind {
+            CandidateKind::KotlinJar => String::from("Scanning build outputs for JAR files..."),
+            _ => String::from("Scanning sources for main functions..."),
+        };
+        Task::perform(
+            scan_kotlin_candidates_task(config_id, root, kind),
+            std::convert::identity,
+        )
+    }
+
+    fn handle_kotlin_candidates_scanned(
+        &mut self,
+        kind: CandidateKind,
+        config_id: Uuid,
+        root: &str,
+        result: Result<CandidateScan, String>,
+    ) -> Task<Message> {
+        self.is_detecting_candidates = false;
+        // 스캔 중에 구성이 지워지거나 다른 디렉터리·launch mode로 바뀌었으면 결과가 더는 맞지
+        // 않는다. 선택된 구성이 아니라 id로 찾아 엉뚱한 구성에 쓰지 않는다.
+        let Some(index) = self.configurations.iter().position(|c| {
+            c.id == config_id
+                && c.working_directory == root
+                && Self::kotlin_mode_matches(&c.type_data, kind)
+        }) else {
+            self.status_message = String::from("Scan discarded because the configuration changed");
+            return Task::none();
+        };
+
+        let scan = match result {
+            Ok(scan) => scan,
+            Err(reason) => {
+                self.status_message = reason;
+                return Task::none();
+            }
+        };
+        let CandidateScan { items, truncated } = scan;
+        let noun = match kind {
+            CandidateKind::KotlinJar => "JAR",
+            _ => "main class",
+        };
+        let mut message = match items.as_slice() {
+            [] => match kind {
+                CandidateKind::KotlinJar => {
+                    format!("No JAR found in build/libs or target under {root}")
+                }
+                _ => format!("No main function found under {root}"),
+            },
+            [only] => format!("Found {noun} {only}"),
+            many => format!("Found {} candidates - pick one from the list", many.len()),
+        };
+        if truncated {
+            message.push_str(" (scan limit reached; some may be missing)");
+        }
+
+        // 후보가 하나뿐이고 사용자가 아직 값을 넣지 않았을 때만 채운다 — 입력한 값을 덮지 않는다.
+        if let [only] = items.as_slice() {
+            let type_data = &mut self.configurations[index].type_data;
+            let target = match kind {
+                CandidateKind::KotlinJar => type_data.kotlin_jar_path_mut(),
+                _ => type_data
+                    .kotlin_main_class_mut()
+                    .map(|fields| fields.main_class),
+            };
+            if let Some(target) = target
+                && target.trim().is_empty()
+            {
+                target.clone_from(only);
+                message = format!("{noun} set to {only}");
+            }
+        }
+
+        self.status_message = message;
+        self.detected_candidates.set(config_id, kind, items);
         self.sync_editor_select_state_for_selected_config();
         Task::none()
     }
@@ -2899,7 +3075,7 @@ impl RunConfigManager {
             config.working_directory = dir.to_string();
         }
         // 다른 디렉터리의 후보 목록은 의미가 없다.
-        self.forget_spring_boot_modules_of_selected_config();
+        self.forget_detected_candidates_of_selected_config();
 
         if is_node {
             self.load_node_scripts(config_id, dir);
@@ -2921,7 +3097,7 @@ impl RunConfigManager {
                 self.env_bulk_inputs.clear();
                 self.node_available_scripts.clear();
                 self.node_available_package_jsons.clear();
-                self.spring_boot_available_modules.clear();
+                self.detected_candidates.clear();
                 self.env_modal = None;
                 // 내보내기 모달의 선택 집합은 교체 전 구성의 id라 stale — 닫아서
                 // "선택했다고 믿은 것과 다른 것을 내보내는" 사고를 막는다.
@@ -4695,33 +4871,32 @@ impl RunConfigManager {
     }
 
     fn sync_editor_select_state_for_selected_config(&mut self) {
-        let (scripts, package_jsons, spring_boot_modules) = self
+        let selected_id = self
             .selected_config_index
             .and_then(|idx| self.configurations.get(idx))
-            .map_or_else(
-                || (Vec::new(), Vec::new(), Vec::new()),
-                |config| {
-                    (
-                        self.node_available_scripts
-                            .get(&config.id)
-                            .cloned()
-                            .unwrap_or_default(),
-                        self.node_available_package_jsons
-                            .get(&config.id)
-                            .cloned()
-                            .unwrap_or_default(),
-                        self.spring_boot_available_modules
-                            .get(&config.id)
-                            .cloned()
-                            .unwrap_or_default(),
-                    )
-                },
-            );
+            .map(|config| config.id);
+        let candidates = |kind: CandidateKind| {
+            selected_id
+                .map(|id| self.detected_candidates.get(id, kind).to_vec())
+                .unwrap_or_default()
+        };
+        let scripts = selected_id
+            .and_then(|id| self.node_available_scripts.get(&id).cloned())
+            .unwrap_or_default();
+        let package_jsons = selected_id
+            .and_then(|id| self.node_available_package_jsons.get(&id).cloned())
+            .unwrap_or_default();
+        let spring_boot_modules = candidates(CandidateKind::SpringModule);
+        let kotlin_main_classes = candidates(CandidateKind::KotlinMainClass);
+        let kotlin_jars = candidates(CandidateKind::KotlinJar);
 
         self.editor_select_state.set_node_scripts(scripts);
         self.editor_select_state.set_package_jsons(package_jsons);
         self.editor_select_state
             .set_spring_boot_modules(spring_boot_modules);
+        self.editor_select_state
+            .set_kotlin_main_classes(kotlin_main_classes);
+        self.editor_select_state.set_kotlin_jars(kotlin_jars);
     }
 
     fn view_status_bar(
@@ -5386,8 +5561,7 @@ impl RunConfigManager {
                                     self.selected_config_index,
                                     env_bulk_text,
                                     EditorLoadingState {
-                                        spring_boot_detecting: self
-                                            .is_detecting_spring_boot_modules,
+                                        detecting_candidates: self.is_detecting_candidates,
                                         file_dialog: FileDialogLoadingState {
                                             folder: self.file_dialog.is_loading_folder,
                                             script_file: self.file_dialog.is_loading_script_file,
@@ -6111,9 +6285,9 @@ mod tests {
         app
     }
 
-    fn scan_of(modules: &[&str]) -> SpringModuleScan {
-        SpringModuleScan {
-            modules: modules.iter().map(|m| (*m).to_string()).collect(),
+    fn scan_of(modules: &[&str]) -> CandidateScan {
+        CandidateScan {
+            items: modules.iter().map(|m| (*m).to_string()).collect(),
             truncated: false,
         }
     }
@@ -6131,7 +6305,7 @@ mod tests {
     fn a_single_detected_module_fills_an_empty_module() {
         let mut app = gradle_boot_app("/work");
         let id = app.configurations[0].id;
-        app.is_detecting_spring_boot_modules = true;
+        app.is_detecting_candidates = true;
 
         let _ = app.handle_spring_boot_modules_scanned(
             id,
@@ -6141,8 +6315,11 @@ mod tests {
         );
 
         assert_eq!(module_of(&mut app), ":app");
-        assert_eq!(app.spring_boot_available_modules[&id], vec![":app"]);
-        assert!(!app.is_detecting_spring_boot_modules);
+        assert_eq!(
+            app.detected_candidates.get(id, CandidateKind::SpringModule),
+            vec![":app"]
+        );
+        assert!(!app.is_detecting_candidates);
         assert!(app.status_message.contains(":app"));
     }
 
@@ -6160,7 +6337,10 @@ mod tests {
         );
 
         assert_eq!(module_of(&mut app), ":mine");
-        assert_eq!(app.spring_boot_available_modules[&id], vec![":app"]);
+        assert_eq!(
+            app.detected_candidates.get(id, CandidateKind::SpringModule),
+            vec![":app"]
+        );
     }
 
     #[test]
@@ -6176,7 +6356,12 @@ mod tests {
         );
 
         assert_eq!(module_of(&mut app), "");
-        assert_eq!(app.spring_boot_available_modules[&id].len(), 2);
+        assert_eq!(
+            app.detected_candidates
+                .get(id, CandidateKind::SpringModule)
+                .len(),
+            2
+        );
         assert!(app.status_message.contains('2'));
     }
 
@@ -6205,8 +6390,8 @@ mod tests {
             id,
             "/work",
             SpringBootBuildTool::Gradle,
-            Ok(SpringModuleScan {
-                modules: Vec::new(),
+            Ok(CandidateScan {
+                items: Vec::new(),
                 truncated: true,
             }),
         );
@@ -6227,7 +6412,10 @@ mod tests {
         );
 
         assert_eq!(module_of(&mut app), "");
-        assert!(!app.spring_boot_available_modules.contains_key(&id));
+        assert!(
+            !app.detected_candidates
+                .contains(id, CandidateKind::SpringModule)
+        );
     }
 
     #[test]
@@ -6250,7 +6438,10 @@ mod tests {
         );
 
         assert_eq!(module_of(&mut app), "");
-        assert!(!app.spring_boot_available_modules.contains_key(&id));
+        assert!(
+            !app.detected_candidates
+                .contains(id, CandidateKind::SpringModule)
+        );
         assert!(
             app.status_message.contains("discarded"),
             "{}",
@@ -6262,7 +6453,7 @@ mod tests {
     fn a_stale_scan_result_replaces_the_scanning_status() {
         let mut app = gradle_boot_app("/work");
         let id = app.configurations[0].id;
-        app.is_detecting_spring_boot_modules = true;
+        app.is_detecting_candidates = true;
         app.status_message = String::from("Scanning for @SpringBootApplication modules...");
 
         let _ = app.handle_spring_boot_modules_scanned(
@@ -6272,7 +6463,7 @@ mod tests {
             Ok(scan_of(&[":app"])),
         );
 
-        assert!(!app.is_detecting_spring_boot_modules);
+        assert!(!app.is_detecting_candidates);
         assert!(
             !app.status_message.contains("Scanning"),
             "{}",
@@ -6313,7 +6504,7 @@ mod tests {
     fn a_failed_scan_reports_its_reason_instead_of_no_modules() {
         let mut app = gradle_boot_app("/work");
         let id = app.configurations[0].id;
-        app.is_detecting_spring_boot_modules = true;
+        app.is_detecting_candidates = true;
 
         let _ = app.handle_spring_boot_modules_scanned(
             id,
@@ -6322,9 +6513,12 @@ mod tests {
             Err(String::from("Module scan failed: boom")),
         );
 
-        assert!(!app.is_detecting_spring_boot_modules);
+        assert!(!app.is_detecting_candidates);
         assert_eq!(app.status_message, "Module scan failed: boom");
-        assert!(!app.spring_boot_available_modules.contains_key(&id));
+        assert!(
+            !app.detected_candidates
+                .contains(id, CandidateKind::SpringModule)
+        );
     }
 
     #[test]
@@ -6339,7 +6533,7 @@ mod tests {
         );
 
         assert_eq!(module_of(&mut app), "");
-        assert!(app.spring_boot_available_modules.is_empty());
+        assert!(app.detected_candidates.is_empty());
     }
 
     #[test]
@@ -6370,16 +6564,22 @@ mod tests {
     fn changing_the_build_tool_or_directory_forgets_detected_modules() {
         let mut app = gradle_boot_app("/work");
         let id = app.configurations[0].id;
-        app.spring_boot_available_modules
-            .insert(id, vec![String::from(":app")]);
+        app.detected_candidates
+            .set(id, CandidateKind::SpringModule, vec![String::from(":app")]);
 
         let _ = app.handle_spring_boot_build_tool_changed(SpringBootBuildTool::Maven);
-        assert!(!app.spring_boot_available_modules.contains_key(&id));
+        assert!(
+            !app.detected_candidates
+                .contains(id, CandidateKind::SpringModule)
+        );
 
-        app.spring_boot_available_modules
-            .insert(id, vec![String::from("app")]);
+        app.detected_candidates
+            .set(id, CandidateKind::SpringModule, vec![String::from("app")]);
         let _ = app.handle_working_directory_changed("/other");
-        assert!(!app.spring_boot_available_modules.contains_key(&id));
+        assert!(
+            !app.detected_candidates
+                .contains(id, CandidateKind::SpringModule)
+        );
     }
 
     #[test]
@@ -6389,7 +6589,7 @@ mod tests {
 
         let _ = app.handle_detect_spring_boot_modules();
 
-        assert!(app.is_detecting_spring_boot_modules);
+        assert!(app.is_detecting_candidates);
     }
 
     #[test]
@@ -6423,7 +6623,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
 
         // pom.xml이 있으니 Maven 표기(`app`)로 나와야 한다.
-        assert_eq!(auto.unwrap().modules, vec!["app"]);
+        assert_eq!(auto.unwrap().items, vec!["app"]);
     }
 
     #[test]
@@ -6436,7 +6636,7 @@ mod tests {
             .unwrap()
             .build_tool = SpringBootBuildTool::Jar;
         let _ = jar.handle_detect_spring_boot_modules();
-        assert!(!jar.is_detecting_spring_boot_modules);
+        assert!(!jar.is_detecting_candidates);
         assert!(jar.status_message.contains("JAR"));
     }
 
@@ -6444,27 +6644,276 @@ mod tests {
     fn browsing_to_another_directory_or_switching_type_forgets_detected_modules() {
         let mut app = gradle_boot_app("/work");
         let id = app.configurations[0].id;
-        app.spring_boot_available_modules
-            .insert(id, vec![String::from(":app")]);
+        app.detected_candidates
+            .set(id, CandidateKind::SpringModule, vec![String::from(":app")]);
         let _ = app.handle_working_directory_selected(Ok(String::from("/other")));
-        assert!(!app.spring_boot_available_modules.contains_key(&id));
+        assert!(
+            !app.detected_candidates
+                .contains(id, CandidateKind::SpringModule)
+        );
 
-        app.spring_boot_available_modules
-            .insert(id, vec![String::from(":app")]);
+        app.detected_candidates
+            .set(id, CandidateKind::SpringModule, vec![String::from(":app")]);
         let _ = app.handle_type_changed(&ConfigurationType::Application);
         let _ = app.handle_type_changed(&ConfigurationType::SpringBoot);
-        assert!(!app.spring_boot_available_modules.contains_key(&id));
+        assert!(
+            !app.detected_candidates
+                .contains(id, CandidateKind::SpringModule)
+        );
     }
 
     #[test]
     fn detecting_is_not_started_twice() {
         let mut app = gradle_boot_app(&std::env::temp_dir().display().to_string());
-        app.is_detecting_spring_boot_modules = true;
+        app.is_detecting_candidates = true;
         app.status_message = String::from("unchanged");
 
         let _ = app.handle_detect_spring_boot_modules();
 
         assert_eq!(app.status_message, "unchanged");
+    }
+
+    fn kotlin_app(dir: &str, launch_mode: KotlinLaunchMode) -> RunConfigManager {
+        let mut app = manager_with_configs(&["kt"]);
+        app.configurations[0].type_data = ConfigTypeData::Kotlin {
+            jdk_path: None,
+            launch_mode,
+            vm_options: String::new(),
+            program_arguments: String::new(),
+        };
+        app.configurations[0].working_directory = dir.to_string();
+        app.selected_config_index = Some(0);
+        app
+    }
+
+    fn kotlin_jar_mode() -> KotlinLaunchMode {
+        KotlinLaunchMode::Jar {
+            jar_path: String::new(),
+        }
+    }
+
+    fn kotlin_main_of(app: &mut RunConfigManager) -> String {
+        app.configurations[0]
+            .type_data
+            .kotlin_main_class_mut()
+            .unwrap()
+            .main_class
+            .clone()
+    }
+
+    fn kotlin_jar_of(app: &mut RunConfigManager) -> String {
+        app.configurations[0]
+            .type_data
+            .kotlin_jar_path_mut()
+            .unwrap()
+            .clone()
+    }
+
+    #[test]
+    fn a_single_detected_main_class_fills_an_empty_field() {
+        let mut app = kotlin_app("/work", KotlinLaunchMode::default());
+        let id = app.configurations[0].id;
+        app.is_detecting_candidates = true;
+
+        let _ = app.handle_kotlin_candidates_scanned(
+            CandidateKind::KotlinMainClass,
+            id,
+            "/work",
+            Ok(scan_of(&["com.example.MainKt"])),
+        );
+
+        assert_eq!(kotlin_main_of(&mut app), "com.example.MainKt");
+        assert!(!app.is_detecting_candidates);
+        assert_eq!(
+            app.detected_candidates
+                .get(id, CandidateKind::KotlinMainClass),
+            ["com.example.MainKt"]
+        );
+    }
+
+    #[test]
+    fn detected_main_classes_never_overwrite_a_typed_value_and_several_only_fill_the_list() {
+        let mut app = kotlin_app("/work", KotlinLaunchMode::default());
+        let id = app.configurations[0].id;
+        let _ = app.handle_kotlin_main_class_changed(String::from("mine.Main"));
+
+        let _ = app.handle_kotlin_candidates_scanned(
+            CandidateKind::KotlinMainClass,
+            id,
+            "/work",
+            Ok(scan_of(&["a.MainKt"])),
+        );
+        assert_eq!(kotlin_main_of(&mut app), "mine.Main");
+
+        let _ = app.handle_kotlin_main_class_changed(String::new());
+        let _ = app.handle_kotlin_candidates_scanned(
+            CandidateKind::KotlinMainClass,
+            id,
+            "/work",
+            Ok(scan_of(&["a.MainKt", "b.MainKt"])),
+        );
+        assert_eq!(kotlin_main_of(&mut app), "");
+        assert!(app.status_message.contains('2'));
+    }
+
+    #[test]
+    fn a_single_detected_jar_fills_the_jar_path_in_jar_mode() {
+        let mut app = kotlin_app("/work", kotlin_jar_mode());
+        let id = app.configurations[0].id;
+
+        let _ = app.handle_kotlin_candidates_scanned(
+            CandidateKind::KotlinJar,
+            id,
+            "/work",
+            Ok(scan_of(&["build/libs/app.jar"])),
+        );
+
+        assert_eq!(kotlin_jar_of(&mut app), "build/libs/app.jar");
+    }
+
+    #[test]
+    fn a_scan_result_for_the_other_launch_mode_is_discarded() {
+        let mut app = kotlin_app("/work", KotlinLaunchMode::default());
+        let id = app.configurations[0].id;
+        app.is_detecting_candidates = true;
+        let _ = app.handle_kotlin_launch_mode_changed(KotlinLaunchModeType::Jar);
+
+        let _ = app.handle_kotlin_candidates_scanned(
+            CandidateKind::KotlinMainClass,
+            id,
+            "/work",
+            Ok(scan_of(&["a.MainKt"])),
+        );
+
+        assert!(!app.is_detecting_candidates);
+        assert!(app.status_message.contains("discarded"));
+        assert!(
+            !app.detected_candidates
+                .contains(id, CandidateKind::KotlinMainClass)
+        );
+    }
+
+    #[test]
+    fn a_kotlin_scan_result_for_another_directory_or_a_deleted_configuration_is_discarded() {
+        let mut app = kotlin_app("/work", KotlinLaunchMode::default());
+        let id = app.configurations[0].id;
+
+        let _ = app.handle_kotlin_candidates_scanned(
+            CandidateKind::KotlinMainClass,
+            id,
+            "/elsewhere",
+            Ok(scan_of(&["a.MainKt"])),
+        );
+        let _ = app.handle_kotlin_candidates_scanned(
+            CandidateKind::KotlinMainClass,
+            Uuid::new_v4(),
+            "/work",
+            Ok(scan_of(&["a.MainKt"])),
+        );
+
+        assert_eq!(kotlin_main_of(&mut app), "");
+        assert!(app.detected_candidates.is_empty());
+    }
+
+    #[test]
+    fn a_failed_kotlin_scan_reports_its_reason() {
+        let mut app = kotlin_app("/work", KotlinLaunchMode::default());
+        let id = app.configurations[0].id;
+        app.is_detecting_candidates = true;
+
+        let _ = app.handle_kotlin_candidates_scanned(
+            CandidateKind::KotlinMainClass,
+            id,
+            "/work",
+            Err(String::from("Scan failed: boom")),
+        );
+
+        assert!(!app.is_detecting_candidates);
+        assert_eq!(app.status_message, "Scan failed: boom");
+    }
+
+    #[test]
+    fn kotlin_detection_only_starts_for_the_matching_mode_and_never_twice() {
+        let mut app = kotlin_app("/work", KotlinLaunchMode::default());
+
+        let _ = app.handle_detect_kotlin_candidates(CandidateKind::KotlinJar);
+        assert!(!app.is_detecting_candidates, "JAR detection needs Jar mode");
+
+        let _ = app.handle_detect_kotlin_candidates(CandidateKind::KotlinMainClass);
+        assert!(app.is_detecting_candidates);
+
+        app.status_message = String::from("unchanged");
+        let _ = app.handle_detect_kotlin_candidates(CandidateKind::KotlinMainClass);
+        assert_eq!(app.status_message, "unchanged");
+    }
+
+    #[test]
+    fn kotlin_candidate_kinds_do_not_leak_into_each_other() {
+        let mut app = kotlin_app("/work", KotlinLaunchMode::default());
+        let id = app.configurations[0].id;
+
+        let _ = app.handle_kotlin_candidates_scanned(
+            CandidateKind::KotlinMainClass,
+            id,
+            "/work",
+            Ok(scan_of(&["a.MainKt", "b.MainKt"])),
+        );
+
+        assert_eq!(app.editor_select_state.kotlin_main_class.options().len(), 2);
+        assert!(app.editor_select_state.kotlin_jar.options().is_empty());
+        assert!(
+            app.editor_select_state
+                .spring_boot_module
+                .options()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn changing_the_directory_forgets_kotlin_candidates_too() {
+        let mut app = kotlin_app("/work", KotlinLaunchMode::default());
+        let id = app.configurations[0].id;
+        app.detected_candidates.set(
+            id,
+            CandidateKind::KotlinMainClass,
+            vec![String::from("a.MainKt")],
+        );
+        app.detected_candidates
+            .set(id, CandidateKind::KotlinJar, vec![String::from("x.jar")]);
+
+        let _ = app.handle_working_directory_changed("/other");
+
+        assert!(
+            !app.detected_candidates
+                .contains(id, CandidateKind::KotlinMainClass)
+        );
+        assert!(
+            !app.detected_candidates
+                .contains(id, CandidateKind::KotlinJar)
+        );
+    }
+
+    #[test]
+    fn the_background_kotlin_scan_validates_the_directory_and_scans_by_kind() {
+        let missing = scan_kotlin_candidates(
+            "/definitely/not/a/directory",
+            CandidateKind::KotlinMainClass,
+        );
+        assert!(missing.unwrap_err().contains("working directory"));
+        assert!(scan_kotlin_candidates("", CandidateKind::KotlinJar).is_err());
+
+        let root = std::env::temp_dir().join(format!("rcm-kt-detect-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("build/libs")).unwrap();
+        std::fs::write(root.join("Main.kt"), "package p\nfun main() {}\n").unwrap();
+        std::fs::write(root.join("build/libs/app.jar"), "").unwrap();
+        let dir = root.display().to_string();
+
+        let mains = scan_kotlin_candidates(&dir, CandidateKind::KotlinMainClass);
+        let jars = scan_kotlin_candidates(&dir, CandidateKind::KotlinJar);
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert_eq!(mains.unwrap().items, vec!["p.MainKt"]);
+        assert_eq!(jars.unwrap().items, vec!["build/libs/app.jar"]);
     }
 
     #[test]

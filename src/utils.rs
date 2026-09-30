@@ -667,23 +667,24 @@ pub enum SpringModuleFlavor {
     Maven,
 }
 
-/// 모듈 스캔 결과. `truncated`가 참이면 탐색 상한에 걸려 일부를 놓쳤을 수 있다.
+/// 후보 스캔 결과(Spring 모듈·Kotlin main class·JAR 공용). `truncated`가 참이면 탐색 상한에
+/// 걸려 일부를 놓쳤을 수 있다.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct SpringModuleScan {
-    pub modules: Vec<String>,
+pub struct CandidateScan {
+    pub items: Vec<String>,
     pub truncated: bool,
 }
 
 /// 모듈 디렉터리 탐색 깊이 상한 (`app/pspteller`류 중첩을 여유 있게 덮는다).
 const SPRING_SCAN_MAX_MODULE_DEPTH: usize = 6;
 /// 깊이 상한 밖에 모듈이 더 있는지 살필 때 추가로 내려가는 깊이.
-const SPRING_SCAN_MAX_PROBE_DEPTH: usize = 6;
+const SCAN_MAX_PROBE_DEPTH: usize = 6;
 /// `src/main/{kotlin,java}` 안 패키지 디렉터리 깊이 상한.
 const SPRING_SCAN_MAX_SOURCE_DEPTH: usize = 12;
 /// 한 번의 스캔에서 훑는 디렉터리 항목 수 상한 — 거대한 저장소에서 UI 작업이 길어지지 않게 한다.
-const SPRING_SCAN_MAX_ENTRIES: usize = 20_000;
+const SCAN_MAX_ENTRIES: usize = 20_000;
 /// 읽어볼 소스 파일 크기 상한. 생성 코드 같은 큰 파일 전체를 메모리에 올리지 않는다.
-const SPRING_SOURCE_MAX_BYTES: u64 = 256 * 1024;
+const SOURCE_MAX_BYTES: u64 = 256 * 1024;
 /// 실행 가능한 앱의 표지. Boot 플러그인 적용 여부는 main class가 없는 모듈에도 붙으므로 신호가
 /// 되지 못한다.
 const SPRING_BOOT_MARKER: &str = "@SpringBootApplication";
@@ -693,30 +694,35 @@ const SPRING_BOOT_MARKER: &str = "@SpringBootApplication";
 /// 디렉터리에 `src/main/{kotlin,java}`가 있으면 그 부모를 모듈 후보로 보고 소스만 살핀다.
 /// 루트 자체가 앱이면 빈 문자열이다. 디렉터리 이름이 모듈 값으로 쓸 수 없는 형태(공백 등)면
 /// 실행 단계에서 거절될 값을 만들지 않도록 결과에서 뺀다. 심볼릭 링크는 따라가지 않는다.
-pub fn scan_spring_boot_modules(root: &Path, flavor: SpringModuleFlavor) -> SpringModuleScan {
+pub fn scan_spring_boot_modules(root: &Path, flavor: SpringModuleFlavor) -> CandidateScan {
     let mut scan = SpringScan {
         flavor,
-        remaining: SPRING_SCAN_MAX_ENTRIES,
-        truncated: false,
+        budget: ScanBudget::new(),
         modules: Vec::new(),
     };
     scan.walk_modules(root, &mut Vec::new(), 0);
     scan.modules.sort();
     scan.modules.dedup();
-    SpringModuleScan {
-        modules: scan.modules,
-        truncated: scan.truncated,
+    CandidateScan {
+        items: scan.modules,
+        truncated: scan.budget.truncated,
     }
 }
 
-struct SpringScan {
-    flavor: SpringModuleFlavor,
+/// 후보 스캔들이 공유하는 방문 예산과 "놓쳤을 수 있음" 표지.
+struct ScanBudget {
     remaining: usize,
     truncated: bool,
-    modules: Vec<String>,
 }
 
-impl SpringScan {
+impl ScanBudget {
+    fn new() -> Self {
+        Self {
+            remaining: SCAN_MAX_ENTRIES,
+            truncated: false,
+        }
+    }
+
     /// 항목 하나를 방문할 예산을 쓴다. 바닥나면 `truncated`를 세우고 거절한다.
     fn spend(&mut self) -> bool {
         if self.remaining == 0 {
@@ -726,14 +732,26 @@ impl SpringScan {
         self.remaining -= 1;
         true
     }
+}
+
+struct SpringScan {
+    flavor: SpringModuleFlavor,
+    budget: ScanBudget,
+    modules: Vec<String>,
+}
+
+impl SpringScan {
+    fn spend(&mut self) -> bool {
+        self.budget.spend()
+    }
 
     fn walk_modules(&mut self, dir: &Path, relative: &mut Vec<String>, depth: usize) {
         if depth > SPRING_SCAN_MAX_MODULE_DEPTH {
             // 깊어서 건너뛴 곳 아래에 모듈처럼 보이는 디렉터리가 있을 때만 놓칠 수 있다고 알린다.
             // `docs/` 같은 비JVM 디렉터리가 깊다는 이유만으로 경고하면 모듈을 놓치지 않은
             // 프로젝트에도 뜬다.
-            if self.probe_for_module(dir, 0) {
-                self.truncated = true;
+            if probe_for_module(dir, 0, &mut self.budget) {
+                self.budget.truncated = true;
             }
             return;
         }
@@ -767,41 +785,6 @@ impl SpringScan {
         }
     }
 
-    /// `dir` 아래(자신 포함)에 모듈처럼 보이는 디렉터리가 있는지 예산 안에서 얕게 살핀다.
-    fn probe_for_module(&mut self, dir: &Path, extra_depth: usize) -> bool {
-        if looks_like_module(dir) {
-            return true;
-        }
-        if extra_depth >= SPRING_SCAN_MAX_PROBE_DEPTH {
-            return false;
-        }
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return false;
-        };
-        for entry in entries.flatten() {
-            if !self.spend() {
-                return false;
-            }
-            let Ok(file_type) = entry.file_type() else {
-                continue;
-            };
-            if file_type.is_symlink() || !file_type.is_dir() {
-                continue;
-            }
-            let name = entry.file_name();
-            let Some(name) = name.to_str() else {
-                continue;
-            };
-            if name.starts_with('.') || IGNORED_DIRS.contains(&name) {
-                continue;
-            }
-            if self.probe_for_module(&entry.path(), extra_depth + 1) {
-                return true;
-            }
-        }
-        false
-    }
-
     fn push_module(&mut self, relative: &[String]) {
         let value = match self.flavor {
             SpringModuleFlavor::Gradle if relative.is_empty() => String::new(),
@@ -827,7 +810,7 @@ impl SpringScan {
 
     fn search_sources(&mut self, dir: &Path, depth: usize) -> bool {
         if depth > SPRING_SCAN_MAX_SOURCE_DEPTH {
-            self.truncated = true;
+            self.budget.truncated = true;
             return false;
         }
         let Ok(entries) = std::fs::read_dir(dir) else {
@@ -854,6 +837,42 @@ impl SpringScan {
         }
         false
     }
+}
+
+/// `dir` 아래(자신 포함)에 모듈처럼 보이는 디렉터리가 있는지 예산 안에서 얕게 살핀다. 깊이 상한
+/// 밖에 모듈이 더 있었는지 가늠하는 데 쓴다.
+fn probe_for_module(dir: &Path, extra_depth: usize, budget: &mut ScanBudget) -> bool {
+    if looks_like_module(dir) {
+        return true;
+    }
+    if extra_depth >= SCAN_MAX_PROBE_DEPTH {
+        return false;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        if !budget.spend() {
+            return false;
+        }
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_symlink() || !file_type.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if name.starts_with('.') || IGNORED_DIRS.contains(&name) {
+            continue;
+        }
+        if probe_for_module(&entry.path(), extra_depth + 1, budget) {
+            return true;
+        }
+    }
+    false
 }
 
 /// 심볼릭 링크가 아닌 실제 디렉터리인지.
@@ -883,7 +902,7 @@ fn is_jvm_source(path: &Path) -> bool {
 
 fn contains_marker(path: &Path) -> bool {
     let small_enough = std::fs::metadata(path)
-        .map(|meta| meta.len() <= SPRING_SOURCE_MAX_BYTES)
+        .map(|meta| meta.len() <= SOURCE_MAX_BYTES)
         .unwrap_or(false);
     // 바이트로 읽는다: EUC-KR/CP949 주석이 든 소스도 `read_to_string`은 UTF-8 오류로 버려 앱을
     // 놓친다. 마커는 ASCII라 인코딩과 BOM에 상관없이 찾을 수 있다.
@@ -917,6 +936,385 @@ fn has_spring_boot_annotation(bytes: &[u8]) -> bool {
                 || trimmed.starts_with(b"/*");
             !continues_identifier && !in_comment
         })
+}
+
+/// 소스에서 main class를 찾을 때 내려가는 디렉터리 깊이 상한. 모듈 중첩(3~4단계)에 `src/main/kotlin`
+/// 과 긴 패키지 이름(10단계 안팎)이 더해져도 닿지 않도록 넉넉히 잡는다 — 멀티모듈 Kotlin
+/// 프로젝트에서 12는 패키지 디렉터리 도중에 끊겼다.
+const KOTLIN_SCAN_MAX_DEPTH: usize = 24;
+
+/// `src` 바로 아래의 디렉터리가 테스트 소스 세트인지. Gradle/멀티플랫폼은 `jvmTest`,
+/// `integrationTest`, `testFixtures`처럼 이름 끝이나 전체가 test인 세트를 쓴다.
+fn is_test_source_set(name: &str) -> bool {
+    matches!(name, "test" | "tests" | "androidTest" | "testFixtures")
+        || name.ends_with("Test")
+        || name.ends_with("Tests")
+}
+/// JAR 산출물 탐색에서 모듈 디렉터리를 내려가는 깊이 상한.
+const JAR_SCAN_MAX_DEPTH: usize = 6;
+/// 배포용이 아닌 부산물 JAR의 접미사.
+const AUXILIARY_JAR_SUFFIXES: &[&str] = &[
+    "-plain.jar",
+    "-sources.jar",
+    "-javadoc.jar",
+    "-tests.jar",
+    "-test-fixtures.jar",
+];
+
+/// `root` 아래 `.kt`/`.java` 소스에서 `main` 진입점을 가진 클래스의 완전한 이름을 찾는다.
+///
+/// `src/main` 레이아웃에 묶지 않는다 — `kotlinc` 단일 파일이나 임의 폴더 구조도 쓰기 때문이다.
+/// 테스트 소스(`src/test` 등)와 빌드 산출물·숨김 디렉터리는 건너뛰고 심볼릭 링크는 따라가지
+/// 않는다.
+pub fn scan_kotlin_main_classes(root: &Path) -> CandidateScan {
+    let mut budget = ScanBudget::new();
+    let mut found = Vec::new();
+    walk_main_class_sources(root, 0, &mut budget, &mut found);
+    found.sort();
+    found.dedup();
+    CandidateScan {
+        items: found,
+        truncated: budget.truncated,
+    }
+}
+
+fn walk_main_class_sources(
+    dir: &Path,
+    depth: usize,
+    budget: &mut ScanBudget,
+    found: &mut Vec<String>,
+) {
+    if depth > KOTLIN_SCAN_MAX_DEPTH {
+        budget.truncated = true;
+        return;
+    }
+    let inside_src = dir.file_name().is_some_and(|name| name == "src");
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if !budget.spend() {
+            return;
+        }
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_symlink() {
+            continue;
+        }
+        let path = entry.path();
+        if file_type.is_dir() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            let is_test_source = inside_src && is_test_source_set(name);
+            if name.starts_with('.') || IGNORED_DIRS.contains(&name) || is_test_source {
+                continue;
+            }
+            walk_main_class_sources(&path, depth + 1, budget, found);
+        } else if file_type.is_file() && is_jvm_source(&path) {
+            read_main_class(&path, found);
+        }
+    }
+}
+
+fn read_main_class(path: &Path, found: &mut Vec<String>) {
+    let (Some(stem), Some(extension)) = (
+        path.file_stem().and_then(|s| s.to_str()),
+        path.extension().and_then(|e| e.to_str()),
+    ) else {
+        return;
+    };
+    let small_enough = std::fs::metadata(path)
+        .map(|meta| meta.len() <= SOURCE_MAX_BYTES)
+        .unwrap_or(false);
+    if !small_enough {
+        return;
+    }
+    if let Some(class) = std::fs::read(path)
+        .ok()
+        .and_then(|bytes| parse_main_class(&bytes, stem, extension))
+    {
+        found.push(class);
+    }
+}
+
+/// 소스 하나에서 `main` 진입점을 가진 클래스의 완전한 이름을 뽑는다.
+///
+/// Kotlin은 들여쓰기 없는 최상위 `fun main(`만 본다(`private`은 진입점이 아니다). 클래스 이름은
+/// `@file:JvmName("X")`이 있으면 `X`, 없으면 파일 이름에서 만든 `<이름>Kt`다. Java는
+/// `public static void main(`을 찾고 클래스 이름은 **파일 이름**으로 가정한다 — 중첩 클래스나 파일
+/// 이름과 다른 클래스 안의 `main`은 잘못된 이름으로 나올 수 있어, 후보는 실행 전에 확인해야 한다.
+/// `object` 안 `@JvmStatic`이나 companion object의 main은 찾지 못하고, 줄 처음에서 시작하는
+/// 주석(`//`, `/* ... */`, `*`)의 언급은 무시하지만 문자열 리터럴 안의 언급은 가려내지 못한다.
+/// Java 선언은 줄 처음에서 시작해야 하므로 `class A { public static void main(...) {`처럼 클래스
+/// 선언과 같은 줄에 쓴 `main`이나 같은 줄의 어노테이션 뒤 선언은 찾지 못한다.
+fn parse_main_class(bytes: &[u8], file_stem: &str, extension: &str) -> Option<String> {
+    // 비ASCII 주석(CP949 등)이 있어도 ASCII인 선언 줄은 그대로 남는다.
+    let text = String::from_utf8_lossy(bytes);
+    let mut package = String::new();
+    let mut jvm_name: Option<String> = None;
+    let mut has_main = false;
+    let mut in_block_comment = false;
+
+    for (index, raw) in text.lines().enumerate() {
+        let line = if index == 0 {
+            raw.trim_start_matches('\u{feff}')
+        } else {
+            raw
+        };
+        let mut trimmed = line.trim();
+        let mut line = line;
+        // 줄 처음에서 열린 블록 주석은 닫는 표지까지 버리되, 같은 줄의 그 뒤 코드는 남긴다
+        // (`/* c */ fun main() {}`). 주석 뒤 코드는 사실상 줄 처음의 선언이므로 들여쓰기 없는
+        // 것으로 본다.
+        if in_block_comment || trimmed.starts_with("/*") {
+            match trimmed.find("*/") {
+                Some(end) => {
+                    in_block_comment = false;
+                    trimmed = trimmed[end + 2..].trim();
+                    line = trimmed;
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                }
+                None => {
+                    in_block_comment = true;
+                    continue;
+                }
+            }
+        }
+        if trimmed.starts_with("//") || trimmed.starts_with('*') {
+            continue;
+        }
+        if package.is_empty()
+            && let Some(rest) = trimmed
+                .strip_prefix("package")
+                .filter(|rest| rest.starts_with(char::is_whitespace))
+        {
+            // 주석을 먼저 떼고 나서 `;`를 정리해야 `package a.b; // c`가 `a.b`가 된다.
+            package = rest
+                .split("//")
+                .next()
+                .unwrap_or("")
+                .split("/*")
+                .next()
+                .unwrap_or("")
+                .trim()
+                .trim_end_matches(';')
+                .trim()
+                .to_string();
+        } else if let Some(rest) = trimmed.strip_prefix("@file:JvmName(") {
+            jvm_name = rest
+                .split('"')
+                .nth(1)
+                .filter(|name| !name.is_empty())
+                .map(str::to_string);
+        } else if !has_main {
+            has_main = match extension {
+                "kt" => is_kotlin_top_level_main(line),
+                "java" => is_java_main(trimmed),
+                _ => false,
+            };
+        }
+    }
+    if !has_main {
+        return None;
+    }
+
+    let class = match extension {
+        "kt" => jvm_name.unwrap_or_else(|| format!("{}Kt", kotlin_file_class_stem(file_stem))),
+        _ => file_stem.to_string(),
+    };
+    Some(if package.is_empty() {
+        class
+    } else {
+        format!("{package}.{class}")
+    })
+}
+
+/// Java 진입점 선언인지: `public`과 `static`을 갖고(순서·`final` 등은 무관) `void main(`으로
+/// 이어지는 줄. `void`와 `main` 사이, `main`과 `(` 사이 공백은 허용한다.
+fn is_java_main(trimmed: &str) -> bool {
+    let mut modifiers = Vec::new();
+    let mut tokens = trimmed.split_whitespace();
+    for token in tokens.by_ref() {
+        if token == "void" {
+            let is_entry = match tokens.next() {
+                Some("main") => tokens.next().is_some_and(|next| next.starts_with('(')),
+                Some(name) => name.starts_with("main("),
+                None => false,
+            };
+            return is_entry && modifiers.contains(&"public") && modifiers.contains(&"static");
+        }
+        if !matches!(
+            token,
+            "public" | "static" | "final" | "synchronized" | "strictfp"
+        ) {
+            return false;
+        }
+        modifiers.push(token);
+    }
+    false
+}
+
+/// 들여쓰기 없는 최상위 `fun main(`인지. `private`은 JVM 진입점이 되지 못한다.
+fn is_kotlin_top_level_main(line: &str) -> bool {
+    if line.starts_with(char::is_whitespace) {
+        return false;
+    }
+    let mut tokens = line.split_whitespace().peekable();
+    while tokens
+        .peek()
+        .is_some_and(|token| matches!(*token, "public" | "internal" | "suspend"))
+    {
+        tokens.next();
+    }
+    if tokens.next() != Some("fun") {
+        return false;
+    }
+    match tokens.next() {
+        // `fun main (args: ...)`처럼 이름과 여는 괄호 사이에 공백이 있는 경우
+        Some("main") => tokens.next().is_some_and(|token| token.starts_with('(')),
+        Some(name) => name.starts_with("main("),
+        None => false,
+    }
+}
+
+/// Kotlin이 최상위 선언을 담는 파일 클래스의 이름 규칙: 첫 글자를 대문자로 하고 식별자로 쓸 수
+/// 없는 문자는 `_`로 바꾼다 (`my-app.kt` -> `My_appKt`). 유니코드 글자·숫자는 그대로 두고
+/// (`메인.kt` -> `메인Kt`), 숫자로 시작하면 `_`를 앞에 붙인다.
+fn kotlin_file_class_stem(file_stem: &str) -> String {
+    let mut class = String::new();
+    for (index, c) in file_stem.chars().enumerate() {
+        let c = if c.is_alphanumeric() || c == '_' {
+            c
+        } else {
+            '_'
+        };
+        if index == 0 {
+            if c.is_ascii_digit() {
+                class.push('_');
+            }
+            // 컴파일러는 한 글자 대문자만 쓴다: `ß`처럼 여러 글자(`SS`)로 늘어나는 경우는 그대로 둔다.
+            let mut upper = c.to_uppercase();
+            match (upper.next(), upper.next()) {
+                (Some(single), None) => class.push(single),
+                _ => class.push(c),
+            }
+        } else {
+            class.push(c);
+        }
+    }
+    class
+}
+
+/// `root` 아래 빌드 산출물 폴더(`build/libs`, `target`)의 실행 가능한 JAR을 찾는다. 경로는 `root`
+/// 기준 상대 경로(`/` 구분, `./` 없음)라 작업 디렉터리에서 실행할 때 그대로 유효하다.
+///
+/// `build`와 `target`은 일반 탐색에서 건너뛰는 디렉터리라 이름으로 직접 골라 그 안만 본다.
+/// `-plain`·`-sources`·`-javadoc`·`-tests`와 `original-` 부산물은 제외한다.
+pub fn scan_jar_artifacts(root: &Path) -> CandidateScan {
+    let mut budget = ScanBudget::new();
+    let mut found = Vec::new();
+    walk_jar_artifacts(root, &mut Vec::new(), 0, &mut budget, &mut found);
+    found.sort();
+    found.dedup();
+    CandidateScan {
+        items: found,
+        truncated: budget.truncated,
+    }
+}
+
+fn walk_jar_artifacts(
+    dir: &Path,
+    relative: &mut Vec<String>,
+    depth: usize,
+    budget: &mut ScanBudget,
+    found: &mut Vec<String>,
+) {
+    if depth > JAR_SCAN_MAX_DEPTH {
+        // 산출물 폴더가 있을 법한 모듈 디렉터리를 놓쳤을 때만 알린다.
+        if probe_for_module(dir, 0, budget) {
+            budget.truncated = true;
+        }
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if !budget.spend() {
+            return;
+        }
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_symlink() || !file_type.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        match name {
+            "build" => collect_jars(
+                &entry.path().join("libs"),
+                relative,
+                "build/libs",
+                budget,
+                found,
+            ),
+            "target" => collect_jars(&entry.path(), relative, "target", budget, found),
+            // 소스 트리에는 산출물이 없고 패키지 디렉터리가 깊어 깊이 상한만 소모한다.
+            _ if name == "src" || name.starts_with('.') || IGNORED_DIRS.contains(&name) => {}
+            _ => {
+                relative.push(name.to_string());
+                walk_jar_artifacts(&entry.path(), relative, depth + 1, budget, found);
+                relative.pop();
+            }
+        }
+    }
+}
+
+fn collect_jars(
+    dir: &Path,
+    relative: &[String],
+    output_dir: &str,
+    budget: &mut ScanBudget,
+    found: &mut Vec<String>,
+) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if !budget.spend() {
+            return;
+        }
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_file() {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let lowered = name.to_ascii_lowercase();
+        let is_auxiliary = lowered.starts_with("original-")
+            || AUXILIARY_JAR_SUFFIXES
+                .iter()
+                .any(|suffix| lowered.ends_with(suffix));
+        if !lowered.ends_with(".jar") || is_auxiliary {
+            continue;
+        }
+        let mut parts = relative.to_vec();
+        parts.push(output_dir.to_string());
+        parts.push(name.to_string());
+        found.push(parts.join("/"));
+    }
 }
 
 #[cfg(test)]
@@ -1007,7 +1405,7 @@ mod tests {
             );
         }
 
-        fn scan(&self, flavor: SpringModuleFlavor) -> SpringModuleScan {
+        fn scan(&self, flavor: SpringModuleFlavor) -> CandidateScan {
             scan_spring_boot_modules(&self.0, flavor)
         }
     }
@@ -1023,8 +1421,8 @@ mod tests {
         let tree = SpringTree::new("root");
         tree.app("");
 
-        assert_eq!(tree.scan(SpringModuleFlavor::Gradle).modules, vec![""]);
-        assert_eq!(tree.scan(SpringModuleFlavor::Maven).modules, vec![""]);
+        assert_eq!(tree.scan(SpringModuleFlavor::Gradle).items, vec![""]);
+        assert_eq!(tree.scan(SpringModuleFlavor::Maven).items, vec![""]);
     }
 
     #[test]
@@ -1043,8 +1441,8 @@ mod tests {
         let gradle = tree.scan(SpringModuleFlavor::Gradle);
         let maven = tree.scan(SpringModuleFlavor::Maven);
 
-        assert_eq!(gradle.modules, vec![":app:pspteller", ":app:schemashifter"]);
-        assert_eq!(maven.modules, vec!["app/pspteller", "app/schemashifter"]);
+        assert_eq!(gradle.items, vec![":app:pspteller", ":app:schemashifter"]);
+        assert_eq!(maven.items, vec!["app/pspteller", "app/schemashifter"]);
         assert!(!gradle.truncated);
     }
 
@@ -1056,7 +1454,7 @@ mod tests {
             "@SpringBootApplication\npublic class Api {}\n",
         );
 
-        assert_eq!(tree.scan(SpringModuleFlavor::Gradle).modules, vec![":api"]);
+        assert_eq!(tree.scan(SpringModuleFlavor::Gradle).items, vec![":api"]);
     }
 
     #[test]
@@ -1075,7 +1473,7 @@ mod tests {
             "@SpringBootApplication\nclass X",
         );
 
-        assert!(tree.scan(SpringModuleFlavor::Gradle).modules.is_empty());
+        assert!(tree.scan(SpringModuleFlavor::Gradle).items.is_empty());
     }
 
     #[test]
@@ -1083,13 +1481,13 @@ mod tests {
         let tree = SpringTree::new("limits");
         let huge = format!(
             "@SpringBootApplication\n{}",
-            "x".repeat(usize::try_from(SPRING_SOURCE_MAX_BYTES).unwrap() + 1)
+            "x".repeat(usize::try_from(SOURCE_MAX_BYTES).unwrap() + 1)
         );
         tree.write("big/src/main/kotlin/Big.kt", &huge);
         // 공백이 든 디렉터리 이름은 실행 단계에서 거절될 값이라 결과에서 뺀다.
         tree.app("my app");
 
-        assert!(tree.scan(SpringModuleFlavor::Gradle).modules.is_empty());
+        assert!(tree.scan(SpringModuleFlavor::Gradle).items.is_empty());
     }
 
     #[test]
@@ -1099,7 +1497,7 @@ mod tests {
 
         let scan = tree.scan(SpringModuleFlavor::Gradle);
 
-        assert!(scan.modules.is_empty());
+        assert!(scan.items.is_empty());
         assert!(scan.truncated);
     }
 
@@ -1111,7 +1509,7 @@ mod tests {
         let tree = SpringTree::new("link");
         std::os::unix::fs::symlink(&outside.0, tree.0.join("linked")).expect("symlink");
 
-        assert!(tree.scan(SpringModuleFlavor::Gradle).modules.is_empty());
+        assert!(tree.scan(SpringModuleFlavor::Gradle).items.is_empty());
     }
 
     #[test]
@@ -1125,7 +1523,7 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, bytes).unwrap();
 
-        assert_eq!(tree.scan(SpringModuleFlavor::Gradle).modules, vec![":api"]);
+        assert_eq!(tree.scan(SpringModuleFlavor::Gradle).items, vec![":api"]);
     }
 
     #[test]
@@ -1145,7 +1543,7 @@ mod tests {
             "  @SpringBootApplication(scanBasePackages = [\"x\"])\nclass C\n",
         );
 
-        assert_eq!(tree.scan(SpringModuleFlavor::Gradle).modules, vec![":real"]);
+        assert_eq!(tree.scan(SpringModuleFlavor::Gradle).items, vec![":real"]);
     }
 
     #[cfg(unix)]
@@ -1160,7 +1558,7 @@ mod tests {
         std::fs::create_dir_all(tree.0.join("app")).unwrap();
         std::os::unix::fs::symlink(outside.0.join("src"), tree.0.join("app/src")).unwrap();
 
-        assert!(tree.scan(SpringModuleFlavor::Gradle).modules.is_empty());
+        assert!(tree.scan(SpringModuleFlavor::Gradle).items.is_empty());
     }
 
     #[test]
@@ -1171,14 +1569,16 @@ mod tests {
         }
         let mut scan = SpringScan {
             flavor: SpringModuleFlavor::Gradle,
-            remaining: 3,
-            truncated: false,
+            budget: ScanBudget {
+                remaining: 3,
+                truncated: false,
+            },
             modules: Vec::new(),
         };
 
         scan.walk_modules(&tree.0, &mut Vec::new(), 0);
 
-        assert!(scan.truncated);
+        assert!(scan.budget.truncated);
     }
 
     #[test]
@@ -1190,5 +1590,423 @@ mod tests {
         let module = SpringTree::new("deep-module");
         module.write("a/b/c/d/e/f/g/h/build.gradle.kts", "");
         assert!(module.scan(SpringModuleFlavor::Gradle).truncated);
+    }
+
+    // ---- Kotlin main class / JAR 스캔 ----
+
+    fn mains(tree: &SpringTree) -> Vec<String> {
+        scan_kotlin_main_classes(&tree.0).items
+    }
+
+    #[test]
+    fn main_class_of_a_top_level_kotlin_main_uses_the_file_class_name() {
+        let tree = SpringTree::new("kt-main");
+        tree.write(
+            "src/main/kotlin/com/example/Main.kt",
+            "package com.example\n\nfun main(args: Array<String>) {}\n",
+        );
+
+        assert_eq!(mains(&tree), vec!["com.example.MainKt"]);
+    }
+
+    #[test]
+    fn main_class_without_a_package_is_the_bare_file_class() {
+        let tree = SpringTree::new("kt-default");
+        tree.write("Main.kt", "fun main() {}\n");
+        tree.write("Spaced.kt", "suspend fun main (args: Array<String>) {}\n");
+
+        assert_eq!(mains(&tree), vec!["MainKt", "SpacedKt"]);
+    }
+
+    #[test]
+    fn main_class_honors_file_jvm_name_and_sanitizes_file_names() {
+        let tree = SpringTree::new("kt-jvmname");
+        tree.write(
+            "a/App.kt",
+            "@file:JvmName(\"Launcher\")\npackage com.x\nfun main() {}\n",
+        );
+        tree.write("b/my-app.kt", "package com.y\nfun main() {}\n");
+
+        assert_eq!(mains(&tree), vec!["com.x.Launcher", "com.y.My_appKt"]);
+    }
+
+    #[test]
+    fn main_class_skips_private_indented_and_lookalike_mains() {
+        let tree = SpringTree::new("kt-negative");
+        tree.write("A.kt", "private fun main() {}\n");
+        tree.write("B.kt", "class B {\n    fun main() {}\n}\n");
+        tree.write("C.kt", "fun mainly() {}\nfun main2() {}\n");
+        tree.write("D.kt", "// fun main() {}\n/*\nfun main() {}\n*/\n");
+
+        assert!(mains(&tree).is_empty());
+    }
+
+    #[test]
+    fn main_class_reads_java_entry_points_and_ignores_other_methods() {
+        let tree = SpringTree::new("java-main");
+        tree.write(
+            "src/main/java/com/example/App.java",
+            "package com.example;\npublic class App {\n    public static void main(String[] args) {}\n}\n",
+        );
+        tree.write(
+            "src/main/java/com/example/Util.java",
+            "package com.example;\nclass Util { static void main2() {} }\n",
+        );
+
+        // Java의 main은 클래스 안이라 들여쓰기가 있어도 진입점이다.
+        assert_eq!(mains(&tree), vec!["com.example.App"]);
+    }
+
+    #[test]
+    fn main_class_scan_skips_tests_build_output_and_hidden_directories() {
+        let tree = SpringTree::new("kt-skip");
+        tree.write("src/test/kotlin/T.kt", "fun main() {}\n");
+        tree.write("build/generated/G.kt", "fun main() {}\n");
+        tree.write(".hidden/H.kt", "fun main() {}\n");
+        // 패키지 이름이 `test`인 디렉터리는 `src` 바로 아래가 아니므로 건너뛰지 않는다.
+        tree.write(
+            "src/main/kotlin/com/test/Real.kt",
+            "package com.test\nfun main() {}\n",
+        );
+
+        assert_eq!(mains(&tree), vec!["com.test.RealKt"]);
+    }
+
+    #[test]
+    fn main_class_scan_reads_bom_and_non_utf8_sources() {
+        let tree = SpringTree::new("kt-encoding");
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice(b"package com.k\n// ");
+        bytes.extend_from_slice(&[0xC7, 0xD1, 0xB1, 0xDB]); // CP949 "한글"
+        bytes.extend_from_slice(b"\nfun main() {}\n");
+        let path = tree.0.join("Main.kt");
+        std::fs::write(path, bytes).unwrap();
+
+        assert_eq!(mains(&tree), vec!["com.k.MainKt"]);
+    }
+
+    #[test]
+    fn main_class_scan_skips_oversized_sources() {
+        let tree = SpringTree::new("kt-big");
+        let body = "x".repeat(usize::try_from(SOURCE_MAX_BYTES).unwrap() + 1);
+        tree.write("Big.kt", &format!("fun main() {{}}\n// {body}\n"));
+
+        assert!(mains(&tree).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn main_class_scan_does_not_follow_symlinks() {
+        let outside = SpringTree::new("kt-outside");
+        outside.write("Main.kt", "fun main() {}\n");
+        let tree = SpringTree::new("kt-link");
+        std::os::unix::fs::symlink(&outside.0, tree.0.join("linked")).unwrap();
+
+        assert!(mains(&tree).is_empty());
+    }
+
+    #[test]
+    fn kotlin_file_class_names_follow_the_compiler_rules() {
+        assert_eq!(kotlin_file_class_stem("main"), "Main");
+        assert_eq!(kotlin_file_class_stem("my-app"), "My_app");
+        assert_eq!(kotlin_file_class_stem("_x"), "_x");
+    }
+
+    fn jars(tree: &SpringTree) -> Vec<String> {
+        scan_jar_artifacts(&tree.0).items
+    }
+
+    #[test]
+    fn jar_scan_finds_gradle_and_maven_outputs_at_any_module_depth() {
+        let tree = SpringTree::new("jars");
+        tree.write("build/libs/app.jar", "");
+        tree.write("api/build/libs/api-1.0.jar", "");
+        tree.write("services/web/target/web.jar", "");
+
+        assert_eq!(
+            jars(&tree),
+            vec![
+                "api/build/libs/api-1.0.jar",
+                "build/libs/app.jar",
+                "services/web/target/web.jar",
+            ]
+        );
+    }
+
+    #[test]
+    fn jar_scan_skips_auxiliary_artifacts_and_other_files() {
+        let tree = SpringTree::new("jars-aux");
+        for name in [
+            "app-plain.jar",
+            "app-sources.jar",
+            "app-javadoc.jar",
+            "app-tests.jar",
+            "original-app.jar",
+            "notes.txt",
+            "app.war",
+        ] {
+            tree.write(&format!("build/libs/{name}"), "");
+        }
+        tree.write("build/libs/app.jar", "");
+
+        assert_eq!(jars(&tree), vec!["build/libs/app.jar"]);
+    }
+
+    #[test]
+    fn jar_scan_only_looks_in_output_directories_and_ignores_dependencies() {
+        let tree = SpringTree::new("jars-scope");
+        tree.write("libs/vendor.jar", "");
+        tree.write("node_modules/x/build/libs/x.jar", "");
+        tree.write(".gradle/build/libs/cache.jar", "");
+        tree.write("build/classes/Other.jar", "");
+
+        assert!(jars(&tree).is_empty());
+    }
+
+    #[test]
+    fn jar_scan_of_a_project_without_outputs_is_empty_and_not_truncated() {
+        let tree = SpringTree::new("jars-none");
+        tree.write("src/main/kotlin/Main.kt", "fun main() {}\n");
+
+        let scan = scan_jar_artifacts(&tree.0);
+
+        assert!(scan.items.is_empty());
+        assert!(!scan.truncated);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn jar_scan_does_not_follow_symlinks() {
+        let outside = SpringTree::new("jars-outside");
+        outside.write("build/libs/o.jar", "");
+        let tree = SpringTree::new("jars-link");
+        std::os::unix::fs::symlink(&outside.0, tree.0.join("linked")).unwrap();
+
+        assert!(jars(&tree).is_empty());
+    }
+
+    #[test]
+    fn main_class_scan_reaches_main_functions_under_long_package_paths() {
+        let tree = SpringTree::new("kt-deep");
+        let package = "a/b/c/d/e/f/g/h/i/j";
+        tree.write(
+            &format!("app/svc/src/main/kotlin/{package}/Main.kt"),
+            "package a.b.c.d.e.f.g.h.i.j\nfun main() {}\n",
+        );
+
+        let scan = scan_kotlin_main_classes(&tree.0);
+
+        assert_eq!(scan.items, vec!["a.b.c.d.e.f.g.h.i.j.MainKt"]);
+        assert!(!scan.truncated);
+    }
+
+    #[test]
+    fn jar_scan_does_not_warn_about_deep_source_packages() {
+        let tree = SpringTree::new("jars-deep-src");
+        tree.write(
+            "app/src/main/kotlin/a/b/c/d/e/f/g/h/i/Main.kt",
+            "fun main() {}\n",
+        );
+        tree.write("app/build/libs/app.jar", "");
+
+        let scan = scan_jar_artifacts(&tree.0);
+
+        assert_eq!(scan.items, vec!["app/build/libs/app.jar"]);
+        assert!(!scan.truncated);
+    }
+
+    #[test]
+    fn jar_scan_never_looks_inside_source_trees() {
+        let tree = SpringTree::new("jars-src-skip");
+        // `src` 안의 패키지 디렉터리 이름이 `build`/`libs`여도 산출물이 아니다.
+        tree.write("app/src/main/kotlin/build/libs/inner.jar", "");
+        tree.write("app/build/libs/app.jar", "");
+
+        assert_eq!(jars(&tree), vec!["app/build/libs/app.jar"]);
+    }
+
+    #[test]
+    fn jar_scan_filters_auxiliary_artifacts_regardless_of_case() {
+        let tree = SpringTree::new("jars-aux-case");
+        tree.write("build/libs/APP-SOURCES.JAR", "");
+        tree.write("build/libs/Original-App.jar", "");
+        tree.write("build/libs/app.jar", "");
+
+        assert_eq!(jars(&tree), vec!["build/libs/app.jar"]);
+    }
+
+    #[test]
+    fn jar_scan_warns_when_the_depth_cap_hides_a_module() {
+        let tree = SpringTree::new("jars-deep-module");
+        tree.write("a/b/c/d/e/f/g/h/build.gradle.kts", "");
+
+        assert!(scan_jar_artifacts(&tree.0).truncated);
+    }
+
+    #[test]
+    fn package_lines_with_semicolons_and_trailing_comments_are_parsed() {
+        let tree = SpringTree::new("pkg-comment");
+        tree.write(
+            "a/A.java",
+            "package com.a; // owner\npublic class A {\n    public static void main(String[] x) {}\n}\n",
+        );
+        tree.write(
+            "b/B.java",
+            "package com.b;// tight\npublic class B {\n    public static void main(String[] x) {}\n}\n",
+        );
+        tree.write(
+            "c/C.java",
+            "package com.c; /* c */\npublic class C {\n    public static void main(String[] x) {}\n}\n",
+        );
+        tree.write("d/D.kt", "package com.d // kotlin\nfun main() {}\n");
+
+        assert_eq!(
+            mains(&tree),
+            vec!["com.a.A", "com.b.B", "com.c.C", "com.d.DKt"]
+        );
+    }
+
+    #[test]
+    fn java_entry_points_are_recognised_across_modifier_orders_and_spacing() {
+        for declaration in [
+            "public static void main(String[] args) {}",
+            "public static void main (String[] args) {}",
+            "static public void main(String... args) {}",
+            "public final static void main(final String[] args) {}",
+            "public static  void  main( String[] args) {}",
+        ] {
+            assert!(is_java_main(declaration), "{declaration}");
+        }
+        for declaration in [
+            "public void main(String[] args) {}",
+            "static void main(String[] args) {}",
+            "public static void main2(String[] args) {}",
+            "public static int main(String[] args) {}",
+            "private static void main(String[] args) {}",
+            "public static void mainly() {}",
+        ] {
+            assert!(!is_java_main(declaration), "{declaration}");
+        }
+    }
+
+    #[test]
+    fn java_main_uses_the_file_name_as_the_class_name() {
+        // 문서화된 한계: 파일 이름과 다른 클래스의 main도 파일 이름 기준으로 보고된다.
+        let bytes = b"package p;\nclass Other {\n    public static void main(String[] a) {}\n}\n";
+
+        assert_eq!(
+            parse_main_class(bytes, "File", "java"),
+            Some(String::from("p.File"))
+        );
+    }
+
+    #[test]
+    fn block_comments_without_leading_stars_are_ignored() {
+        let source = b"/*\nLicense header\npackage fake.pkg\nfun main() {}\n*/\npackage real.pkg\nfun main() {}\n";
+
+        assert_eq!(
+            parse_main_class(source, "App", "kt"),
+            Some(String::from("real.pkg.AppKt"))
+        );
+    }
+
+    #[test]
+    fn code_after_a_closing_block_comment_marker_is_still_read() {
+        for source in [
+            "/* header */ fun main() {}\n",
+            "/**\n * doc\n */ fun main() {}\n",
+            "/* a */\nfun main() {}\n",
+        ] {
+            assert_eq!(
+                parse_main_class(source.as_bytes(), "App", "kt"),
+                Some(String::from("AppKt")),
+                "{source:?}"
+            );
+        }
+        // 전부 주석이면 진입점이 아니다.
+        assert_eq!(
+            parse_main_class(b"/* fun main() {} */\nclass A\n", "A", "kt"),
+            None
+        );
+        // 닫히지 않은 주석은 파일 끝까지 주석이다(잘못된 입력이라 감수).
+        assert_eq!(
+            parse_main_class(b"/* never closed\nfun main() {}\n", "A", "kt"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_java_main_on_the_class_declaration_line_is_a_documented_limit() {
+        let source = b"public class A { public static void main(String[] a) {\n}}\n";
+
+        assert_eq!(parse_main_class(source, "A", "java"), None);
+    }
+
+    #[test]
+    fn a_package_declaration_separated_by_a_tab_is_read() {
+        assert_eq!(
+            parse_main_class(b"package\tcom.tab\nfun main() {}\n", "M", "kt"),
+            Some(String::from("com.tab.MKt"))
+        );
+    }
+
+    #[test]
+    fn kotlin_top_level_modifiers_are_accepted_in_any_supported_order() {
+        for line in [
+            "fun main() {}",
+            "public fun main() {}",
+            "internal fun main(args: Array<String>) {}",
+            "suspend fun main() {}",
+            "public suspend fun main() {}",
+            "fun main (args: Array<String>) {}",
+        ] {
+            assert!(is_kotlin_top_level_main(line), "{line}");
+        }
+        for line in [
+            "private fun main() {}",
+            "    fun main() {}",
+            "fun main2() {}",
+            "fun mainly() {}",
+            "val main = 1",
+        ] {
+            assert!(!is_kotlin_top_level_main(line), "{line}");
+        }
+    }
+
+    #[test]
+    fn kotlin_file_class_names_keep_unicode_and_guard_leading_digits() {
+        assert_eq!(kotlin_file_class_stem("메인"), "메인");
+        assert_eq!(kotlin_file_class_stem("1app"), "_1app");
+        assert_eq!(kotlin_file_class_stem("app.v2"), "App_v2");
+        // `ß`의 대문자는 두 글자(`SS`)지만 컴파일러는 한 글자 대문자만 쓰므로 그대로 둔다.
+        assert_eq!(kotlin_file_class_stem("ßa"), "ßa");
+    }
+
+    #[test]
+    fn test_source_sets_are_skipped_but_main_packages_named_test_are_not() {
+        let tree = SpringTree::new("test-sets");
+        for set in [
+            "test",
+            "commonTest",
+            "jvmTest",
+            "integrationTest",
+            "testFixtures",
+        ] {
+            tree.write(&format!("src/{set}/kotlin/T.kt"), "fun main() {}\n");
+        }
+        tree.write("src/main/kotlin/M.kt", "fun main() {}\n");
+        // 이름이 `test`로 끝나지 않는 세트는 테스트가 아니다.
+        tree.write("src/latest/kotlin/L.kt", "fun main() {}\n");
+        tree.write("src/contest/kotlin/C.kt", "fun main() {}\n");
+
+        assert_eq!(mains(&tree), vec!["CKt", "LKt", "MKt"]);
+    }
+
+    #[test]
+    fn jar_extension_matching_ignores_case() {
+        let tree = SpringTree::new("jar-case");
+        tree.write("build/libs/APP.JAR", "");
+
+        assert_eq!(jars(&tree), vec!["build/libs/APP.JAR"]);
     }
 }

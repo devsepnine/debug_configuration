@@ -782,8 +782,9 @@ impl RunConfigManager {
             // 다시 채운다.
             self.node_available_scripts.remove(&config_id);
             self.node_available_package_jsons.remove(&config_id);
-            // 모듈 표기는 빌드 도구·작업 디렉터리에 묶여 있어 MCP 변경 뒤에는 유효하지 않을 수 있다.
-            self.spring_boot_available_modules.remove(&config_id);
+            // 감지한 후보(모듈·main class·JAR)는 빌드 도구·작업 디렉터리·타입에 묶여 있어 MCP 변경 뒤에는
+            // 유효하지 않을 수 있다.
+            self.detected_candidates.forget(config_id);
         }
         // 편집기 패널의 select 상태는 선택된 구성에서 파생되므로 다시 맞춘다.
         self.sync_editor_select_state_for_selected_config();
@@ -3700,8 +3701,11 @@ mod tests {
             .insert(config_id, vec![String::from(STALE_SCRIPT)]);
         app.node_available_package_jsons
             .insert(config_id, vec![String::from("/tmp/project/package.json")]);
-        app.spring_boot_available_modules
-            .insert(config_id, vec![String::from(":stale")]);
+        app.detected_candidates.set(
+            config_id,
+            crate::app::detected_candidates::CandidateKind::SpringModule,
+            vec![String::from(":stale")],
+        );
         let op = McpOp::UpdateConfiguration(Box::new(UpdateConfigurationArgs {
             working_directory: Some(String::from("/tmp/somewhere-else")),
             ..patch("build")
@@ -3712,7 +3716,10 @@ mod tests {
         // Application 타입은 재스캔하지 않으므로 두 캐시가 비어야 한다.
         assert!(!app.node_available_scripts.contains_key(&config_id));
         assert!(!app.node_available_package_jsons.contains_key(&config_id));
-        assert!(!app.spring_boot_available_modules.contains_key(&config_id));
+        assert!(!app.detected_candidates.contains(
+            config_id,
+            crate::app::detected_candidates::CandidateKind::SpringModule
+        ));
     }
 
     fn node_type_data(project_directory: &str) -> ConfigTypeData {
