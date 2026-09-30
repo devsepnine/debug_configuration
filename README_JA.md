@@ -43,6 +43,9 @@ Rust と iced GUI フレームワークで開発されたクロスプラット�
 
 ### Kotlin サポート
 - `java` 経由で Kotlin/JVM アプリを実行 — Main class または JAR 起動モード
+- **Main Class** 横の更新ボタンで `.kt`/`.java` ソースから main 関数を検出します (Kotlin のトップレベル `fun main`、Java の `public static void main`。テストソース、ビルド出力、隠しディレクトリはスキップ)。Kotlin のファイルクラスはコンパイラの規則に従い (`Main.kt` -> `MainKt`、または `@file:JvmName` の名前)、Java のクラス名はファイル名と同じと仮定し、object 内の `@JvmStatic` main や `.kts` スクリプトは検出できません
+- **JAR Path** 横の更新ボタンで `build/libs` と `target` の JAR を一覧表示します (`-plain`、`-sources`、`-javadoc`、`-tests`、`original-` は除外)
+- 結果が 1 つなら空欄を自動入力し、複数ならドロップダウンで表示します (直接入力も可能)。Classpath と依存関係は検出しません
 - VM options (例: `-Xmx2g`) とプログラム引数の設定
 - JDK の自動検出 (JAVA_HOME, SDKMAN, macOS/Linux/Windows の標準的な場所) と手動指定
 

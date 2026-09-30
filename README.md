@@ -44,6 +44,9 @@ Grab the latest pre-built binary for your platform from the [Releases page](http
 
 ### Kotlin Support
 - Run Kotlin/JVM apps through `java` — Main class or JAR launch mode
+- Click the refresh button next to **Main Class** to scan `.kt`/`.java` sources for main functions (top-level Kotlin `fun main`, Java `public static void main`; test sources, build output and hidden directories are skipped). Kotlin file classes follow the compiler rule (`Main.kt` -> `MainKt`, or the `@file:JvmName` name); Java class names are assumed to match the file name; `@JvmStatic` mains inside objects and `.kts` scripts are not detected
+- Click the refresh button next to **JAR Path** to list JARs in `build/libs` and `target`, excluding `-plain`, `-sources`, `-javadoc`, `-tests` and `original-` artifacts
+- A single result fills an empty field automatically; several results appear as a dropdown you can still type over. Classpath and dependencies are never detected
 - Set VM options (e.g., `-Xmx2g`) and program arguments
 - Auto-detect JDKs (JAVA_HOME, SDKMAN, standard macOS/Linux/Windows locations) with manual override
 

@@ -43,6 +43,9 @@ Rust와 iced GUI 프레임워크로 개발되었으며, 여러 프로그램 실�
 
 ### Kotlin 지원
 - `java`로 Kotlin/JVM 앱 실행 — Main class 또는 JAR 실행 모드
+- **Main Class** 옆 새로고침 버튼으로 `.kt`/`.java` 소스에서 main 함수를 찾습니다(Kotlin 최상위 `fun main`, Java `public static void main`; 테스트 소스, 빌드 산출물, 숨김 디렉터리는 건너뜀). Kotlin 파일 클래스는 컴파일러 규칙을 따르며(`Main.kt` -> `MainKt`, 또는 `@file:JvmName` 이름), Java 클래스 이름은 파일 이름과 같다고 가정하며, object 안 `@JvmStatic` main과 `.kts` 스크립트는 감지하지 못합니다
+- **JAR Path** 옆 새로고침 버튼으로 `build/libs`와 `target`의 JAR을 나열합니다(`-plain`, `-sources`, `-javadoc`, `-tests`, `original-` 산출물 제외)
+- 결과가 하나면 빈 칸을 자동으로 채우고, 여러 개면 드롭다운으로 보여주며 직접 타이핑도 가능합니다. Classpath와 의존성은 감지하지 않습니다
 - VM options(예: `-Xmx2g`)와 프로그램 인자 설정
 - JDK 자동 감지 (JAVA_HOME, SDKMAN, macOS/Linux/Windows 표준 위치) + 수동 지정
 

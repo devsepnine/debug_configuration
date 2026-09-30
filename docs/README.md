@@ -87,6 +87,9 @@ debug_configuration/
 
 4. **Kotlin**
    - `java`로 Kotlin/JVM 앱 실행 (MainClass/Jar 모드)
+   - Main Class 감지(새로고침 버튼): `.kt`/`.java`에서 최상위 `fun main(`/`public static void main(`을 찾아 완전한 클래스 이름으로 제시(`Main.kt`→`MainKt`, `@file:JvmName` 반영; 테스트 소스·빌드 산출물·숨김 디렉터리 제외; Java 클래스 이름은 파일 이름으로 가정, object 안 `@JvmStatic`·`.kts` 미지원)
+   - JAR 감지: `build/libs`·`target`의 JAR 목록(`-plain`/`-sources`/`-javadoc`/`-tests`/`original-` 제외), 작업 디렉터리 기준 상대 경로
+   - 후보가 하나이고 값이 비어 있으면 자동 채움, 여러 개면 드롭다운(직접 입력 가능). Classpath는 감지하지 않음
    - 필드: jdk_path, launch_mode, vm_options, program_arguments
 
 5. **Spring Boot**
@@ -192,6 +195,8 @@ winresource = "0.1"
   - MCP `type_data`에 SpringBoot 추가(필드 길이 상한, profiles·module 문자셋 검증)
   - 멀티모듈 실행 모듈 지정(`module`, Gradle `:app`/Maven `-pl`)과 `@SpringBootApplication` 모듈 감지(Detect)
   - 개발 중 `gradle_module` 키로 저장된 파일도 별칭으로 읽음
+- **Kotlin Main class / JAR 자동 감지**
+  - Main Class·JAR Path 옆 새로고침 버튼으로 후보를 찾아 드롭다운 또는 자동 채움(Spring Boot 모듈 감지와 같은 방식)
 
 #### 변경됨
 - 구성 파일 포맷 버전 1 → 2 (`CURRENT_CONFIG_VERSION`). 이전 버전 앱은 "newer version" 안내를 표시하며 저장 파일을 열지 않음
