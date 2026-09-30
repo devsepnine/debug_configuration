@@ -4,7 +4,8 @@ mod session;
 
 pub use configuration::{
     ConfigTypeData, ConfigurationType, ExecuteMode, ExecuteModeType, KotlinLaunchMode,
-    KotlinLaunchModeType, NodeCommand, PackageManager, RunConfiguration,
+    KotlinLaunchModeType, NodeCommand, PackageManager, RunConfiguration, SpringBootBuildTool,
+    is_valid_spring_module, is_valid_spring_profiles,
 };
 pub use pane::{LayoutId, Pane, WorkspaceTab};
 pub use session::{

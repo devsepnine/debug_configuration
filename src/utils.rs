@@ -98,6 +98,7 @@ pub const ICON_TYPE_APPLICATION: &[u8] = include_bytes!("../assets/app--type-app
 pub const ICON_TYPE_SHELL: &[u8] = include_bytes!("../assets/app--type-shell.svg");
 pub const ICON_TYPE_NODE: &[u8] = include_bytes!("../assets/app--type-node.svg");
 pub const ICON_TYPE_KOTLIN: &[u8] = include_bytes!("../assets/app--type-kotlin.svg");
+pub const ICON_TYPE_SPRING_BOOT: &[u8] = include_bytes!("../assets/app--type-springboot.svg");
 pub const ICON_TYPE_COMPOUND: &[u8] = include_bytes!("../assets/app--type-compound.svg");
 
 // Pane View
@@ -192,6 +193,31 @@ pub fn detect_package_manager(working_dir: &Path) -> String {
     "npm".to_string()
 }
 
+/// 재귀 탐색에서 제외할 디렉토리 (의존성·빌드 산출물·VCS·캐시). `package.json`과 Spring Boot
+/// 모듈 스캔이 공유한다 — `build`/`target`이 빠지면 산출물 안의 사본을 모듈로 잘못 잡는다.
+const IGNORED_DIRS: &[&str] = &[
+    "node_modules",
+    ".git",
+    ".svn",
+    ".hg",
+    "dist",
+    "build",
+    "out",
+    ".next",
+    ".nuxt",
+    "coverage",
+    ".nyc_output",
+    "target",
+    "vendor",
+    ".cache",
+    ".temp",
+    ".tmp",
+    "__pycache__",
+    ".pytest_cache",
+    ".venv",
+    "venv",
+];
+
 /// `project_directory` 하위의 모든 `package.json` 파일 탐색 (재귀)
 ///
 /// # Arguments
@@ -205,30 +231,6 @@ pub fn find_all_package_jsons(project_dir: &Path) -> Vec<PathBuf> {
 
 /// package.json 파일 재귀 탐색 (깊이 제한 포함)
 fn find_package_jsons_recursive(dir: &Path, depth: usize, max_depth: usize) -> Vec<PathBuf> {
-    // 제외할 디렉토리 목록
-    const IGNORED_DIRS: &[&str] = &[
-        "node_modules",
-        ".git",
-        ".svn",
-        ".hg",
-        "dist",
-        "build",
-        "out",
-        ".next",
-        ".nuxt",
-        "coverage",
-        ".nyc_output",
-        "target",
-        "vendor",
-        ".cache",
-        ".temp",
-        ".tmp",
-        "__pycache__",
-        ".pytest_cache",
-        ".venv",
-        "venv",
-    ];
-
     let mut results = Vec::new();
 
     // 깊이 제한 초과 시 중단
@@ -657,6 +659,266 @@ pub fn to_relative_path(absolute_path: &Path, project_dir: &Path) -> String {
     raw.replace('\\', "/")
 }
 
+/// Spring Boot 모듈 경로 표기. Gradle은 프로젝트 경로(`:app:api`), Maven은 `-pl`에 줄 상대 경로
+/// (`app/api`)다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpringModuleFlavor {
+    Gradle,
+    Maven,
+}
+
+/// 모듈 스캔 결과. `truncated`가 참이면 탐색 상한에 걸려 일부를 놓쳤을 수 있다.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SpringModuleScan {
+    pub modules: Vec<String>,
+    pub truncated: bool,
+}
+
+/// 모듈 디렉터리 탐색 깊이 상한 (`app/pspteller`류 중첩을 여유 있게 덮는다).
+const SPRING_SCAN_MAX_MODULE_DEPTH: usize = 6;
+/// 깊이 상한 밖에 모듈이 더 있는지 살필 때 추가로 내려가는 깊이.
+const SPRING_SCAN_MAX_PROBE_DEPTH: usize = 6;
+/// `src/main/{kotlin,java}` 안 패키지 디렉터리 깊이 상한.
+const SPRING_SCAN_MAX_SOURCE_DEPTH: usize = 12;
+/// 한 번의 스캔에서 훑는 디렉터리 항목 수 상한 — 거대한 저장소에서 UI 작업이 길어지지 않게 한다.
+const SPRING_SCAN_MAX_ENTRIES: usize = 20_000;
+/// 읽어볼 소스 파일 크기 상한. 생성 코드 같은 큰 파일 전체를 메모리에 올리지 않는다.
+const SPRING_SOURCE_MAX_BYTES: u64 = 256 * 1024;
+/// 실행 가능한 앱의 표지. Boot 플러그인 적용 여부는 main class가 없는 모듈에도 붙으므로 신호가
+/// 되지 못한다.
+const SPRING_BOOT_MARKER: &str = "@SpringBootApplication";
+
+/// `root` 아래에서 `@SpringBootApplication`이 있는 모듈을 찾는다.
+///
+/// 디렉터리에 `src/main/{kotlin,java}`가 있으면 그 부모를 모듈 후보로 보고 소스만 살핀다.
+/// 루트 자체가 앱이면 빈 문자열이다. 디렉터리 이름이 모듈 값으로 쓸 수 없는 형태(공백 등)면
+/// 실행 단계에서 거절될 값을 만들지 않도록 결과에서 뺀다. 심볼릭 링크는 따라가지 않는다.
+pub fn scan_spring_boot_modules(root: &Path, flavor: SpringModuleFlavor) -> SpringModuleScan {
+    let mut scan = SpringScan {
+        flavor,
+        remaining: SPRING_SCAN_MAX_ENTRIES,
+        truncated: false,
+        modules: Vec::new(),
+    };
+    scan.walk_modules(root, &mut Vec::new(), 0);
+    scan.modules.sort();
+    scan.modules.dedup();
+    SpringModuleScan {
+        modules: scan.modules,
+        truncated: scan.truncated,
+    }
+}
+
+struct SpringScan {
+    flavor: SpringModuleFlavor,
+    remaining: usize,
+    truncated: bool,
+    modules: Vec<String>,
+}
+
+impl SpringScan {
+    /// 항목 하나를 방문할 예산을 쓴다. 바닥나면 `truncated`를 세우고 거절한다.
+    fn spend(&mut self) -> bool {
+        if self.remaining == 0 {
+            self.truncated = true;
+            return false;
+        }
+        self.remaining -= 1;
+        true
+    }
+
+    fn walk_modules(&mut self, dir: &Path, relative: &mut Vec<String>, depth: usize) {
+        if depth > SPRING_SCAN_MAX_MODULE_DEPTH {
+            // 깊어서 건너뛴 곳 아래에 모듈처럼 보이는 디렉터리가 있을 때만 놓칠 수 있다고 알린다.
+            // `docs/` 같은 비JVM 디렉터리가 깊다는 이유만으로 경고하면 모듈을 놓치지 않은
+            // 프로젝트에도 뜬다.
+            if self.probe_for_module(dir, 0) {
+                self.truncated = true;
+            }
+            return;
+        }
+        if self.has_spring_boot_application(&dir.join("src").join("main")) {
+            self.push_module(relative);
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            if !self.spend() {
+                return;
+            }
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_symlink() || !file_type.is_dir() {
+                continue;
+            }
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            // `src`는 위에서 이미 소스로 살폈다. 그 안을 모듈 후보로 다시 재귀하지 않는다.
+            if name.starts_with('.') || name == "src" || IGNORED_DIRS.contains(&name) {
+                continue;
+            }
+            relative.push(name.to_string());
+            self.walk_modules(&entry.path(), relative, depth + 1);
+            relative.pop();
+        }
+    }
+
+    /// `dir` 아래(자신 포함)에 모듈처럼 보이는 디렉터리가 있는지 예산 안에서 얕게 살핀다.
+    fn probe_for_module(&mut self, dir: &Path, extra_depth: usize) -> bool {
+        if looks_like_module(dir) {
+            return true;
+        }
+        if extra_depth >= SPRING_SCAN_MAX_PROBE_DEPTH {
+            return false;
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return false;
+        };
+        for entry in entries.flatten() {
+            if !self.spend() {
+                return false;
+            }
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_symlink() || !file_type.is_dir() {
+                continue;
+            }
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if name.starts_with('.') || IGNORED_DIRS.contains(&name) {
+                continue;
+            }
+            if self.probe_for_module(&entry.path(), extra_depth + 1) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn push_module(&mut self, relative: &[String]) {
+        let value = match self.flavor {
+            SpringModuleFlavor::Gradle if relative.is_empty() => String::new(),
+            SpringModuleFlavor::Gradle => format!(":{}", relative.join(":")),
+            SpringModuleFlavor::Maven => relative.join("/"),
+        };
+        if crate::models::is_valid_spring_module(&value) {
+            self.modules.push(value);
+        }
+    }
+
+    fn has_spring_boot_application(&mut self, src_main: &Path) -> bool {
+        // `src`·`main`·언어 디렉터리 자체가 링크일 수 있다. 자식 항목만 검사하면 링크된 `src`가
+        // 트리 밖을 가리킬 때 그대로 따라간다.
+        if !src_main.parent().is_some_and(is_real_dir) || !is_real_dir(src_main) {
+            return false;
+        }
+        ["kotlin", "java"].iter().any(|language| {
+            let dir = src_main.join(language);
+            is_real_dir(&dir) && self.search_sources(&dir, 0)
+        })
+    }
+
+    fn search_sources(&mut self, dir: &Path, depth: usize) -> bool {
+        if depth > SPRING_SCAN_MAX_SOURCE_DEPTH {
+            self.truncated = true;
+            return false;
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return false;
+        };
+        for entry in entries.flatten() {
+            if !self.spend() {
+                return false;
+            }
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_symlink() {
+                continue;
+            }
+            let path = entry.path();
+            if file_type.is_dir() {
+                if self.search_sources(&path, depth + 1) {
+                    return true;
+                }
+            } else if file_type.is_file() && is_jvm_source(&path) && contains_marker(&path) {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// 심볼릭 링크가 아닌 실제 디렉터리인지.
+fn is_real_dir(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_dir())
+}
+
+/// 모듈 루트로 보이는 디렉터리인지 (`src/main` 또는 빌드 파일). 깊이 상한으로 건너뛴 디렉터리에
+/// 모듈이 있었을 가능성을 가늠하는 데 쓴다.
+fn looks_like_module(dir: &Path) -> bool {
+    dir.join("src").join("main").is_dir()
+        || [
+            "build.gradle",
+            "build.gradle.kts",
+            "settings.gradle",
+            "settings.gradle.kts",
+            "pom.xml",
+        ]
+        .iter()
+        .any(|name| dir.join(name).is_file())
+}
+
+fn is_jvm_source(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|ext| ext == "kt" || ext == "java")
+}
+
+fn contains_marker(path: &Path) -> bool {
+    let small_enough = std::fs::metadata(path)
+        .map(|meta| meta.len() <= SPRING_SOURCE_MAX_BYTES)
+        .unwrap_or(false);
+    // 바이트로 읽는다: EUC-KR/CP949 주석이 든 소스도 `read_to_string`은 UTF-8 오류로 버려 앱을
+    // 놓친다. 마커는 ASCII라 인코딩과 BOM에 상관없이 찾을 수 있다.
+    small_enough && std::fs::read(path).is_ok_and(|bytes| has_spring_boot_annotation(&bytes))
+}
+
+/// 소스 바이트에 실제 `@SpringBootApplication` 사용이 있는지. 뒤에 식별자 문자가 이어지는
+/// 이름(`@SpringBootApplicationX`)과 주석 줄(`//`, `*`, `/*`)의 언급은 제외한다. 문자열 안의
+/// 언급까지는 가려내지 못하지만, 자동 채움은 후보가 정확히 하나일 때만 일어난다.
+fn has_spring_boot_annotation(bytes: &[u8]) -> bool {
+    let marker = SPRING_BOOT_MARKER.as_bytes();
+    bytes
+        .windows(marker.len())
+        .enumerate()
+        .filter(|(_, window)| *window == marker)
+        .any(|(at, _)| {
+            let after = bytes.get(at + marker.len());
+            let continues_identifier =
+                after.is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_');
+            let line_start = bytes[..at]
+                .iter()
+                .rposition(|b| *b == b'\n')
+                .map_or(0, |newline| newline + 1);
+            let before_marker = &bytes[line_start..at];
+            let trimmed = before_marker
+                .iter()
+                .position(|b| !b.is_ascii_whitespace())
+                .map_or(&[][..], |first| &before_marker[first..]);
+            let in_comment = trimmed.starts_with(b"//")
+                || trimmed.starts_with(b"*")
+                || trimmed.starts_with(b"/*");
+            !continues_identifier && !in_comment
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -716,5 +978,217 @@ mod tests {
         let project = Path::new("/proj");
         let abs = Path::new("/other/app/package.json");
         assert_eq!(to_relative_path(abs, project), "/other/app/package.json");
+    }
+    /// 임시 디렉터리에 격리된 프로젝트 트리. 사용자 홈이나 실제 프로젝트를 건드리지 않는다.
+    struct SpringTree(PathBuf);
+
+    impl SpringTree {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("rcm-scan-{tag}-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).expect("temp dir");
+            Self(dir)
+        }
+
+        fn write(&self, rel: &str, content: &str) {
+            let path = self.0.join(rel);
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("dirs");
+            std::fs::write(path, content).expect("file");
+        }
+
+        fn app(&self, module_dir: &str) {
+            let prefix = if module_dir.is_empty() {
+                String::new()
+            } else {
+                format!("{module_dir}/")
+            };
+            self.write(
+                &format!("{prefix}src/main/kotlin/com/example/App.kt"),
+                "@SpringBootApplication\nclass App\n",
+            );
+        }
+
+        fn scan(&self, flavor: SpringModuleFlavor) -> SpringModuleScan {
+            scan_spring_boot_modules(&self.0, flavor)
+        }
+    }
+
+    impl Drop for SpringTree {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn spring_scan_reports_a_root_app_as_the_empty_module() {
+        let tree = SpringTree::new("root");
+        tree.app("");
+
+        assert_eq!(tree.scan(SpringModuleFlavor::Gradle).modules, vec![""]);
+        assert_eq!(tree.scan(SpringModuleFlavor::Maven).modules, vec![""]);
+    }
+
+    #[test]
+    fn spring_scan_finds_only_modules_with_a_boot_application() {
+        let tree = SpringTree::new("multi");
+        tree.app("app/pspteller");
+        tree.app("app/schemashifter");
+        // Boot 플러그인만 있고 main class가 없는 모듈은 후보가 아니다.
+        tree.write(
+            "adapter/build.gradle.kts",
+            "plugins { id(\"org.springframework.boot\") }",
+        );
+        tree.write("adapter/src/main/kotlin/Lib.kt", "class Lib");
+        tree.write("core/src/main/kotlin/Core.kt", "class Core");
+
+        let gradle = tree.scan(SpringModuleFlavor::Gradle);
+        let maven = tree.scan(SpringModuleFlavor::Maven);
+
+        assert_eq!(gradle.modules, vec![":app:pspteller", ":app:schemashifter"]);
+        assert_eq!(maven.modules, vec!["app/pspteller", "app/schemashifter"]);
+        assert!(!gradle.truncated);
+    }
+
+    #[test]
+    fn spring_scan_reads_java_sources_too() {
+        let tree = SpringTree::new("java");
+        tree.write(
+            "api/src/main/java/com/example/Api.java",
+            "@SpringBootApplication\npublic class Api {}\n",
+        );
+
+        assert_eq!(tree.scan(SpringModuleFlavor::Gradle).modules, vec![":api"]);
+    }
+
+    #[test]
+    fn spring_scan_ignores_test_sources_and_build_output() {
+        let tree = SpringTree::new("ignored");
+        tree.write(
+            "app/src/test/kotlin/TestApp.kt",
+            "@SpringBootApplication\nclass TestApp",
+        );
+        tree.write(
+            "app/build/generated/src/main/kotlin/Gen.kt",
+            "@SpringBootApplication\nclass Gen",
+        );
+        tree.write(
+            "node_modules/x/src/main/kotlin/X.kt",
+            "@SpringBootApplication\nclass X",
+        );
+
+        assert!(tree.scan(SpringModuleFlavor::Gradle).modules.is_empty());
+    }
+
+    #[test]
+    fn spring_scan_skips_oversized_sources_and_unusable_module_names() {
+        let tree = SpringTree::new("limits");
+        let huge = format!(
+            "@SpringBootApplication\n{}",
+            "x".repeat(usize::try_from(SPRING_SOURCE_MAX_BYTES).unwrap() + 1)
+        );
+        tree.write("big/src/main/kotlin/Big.kt", &huge);
+        // 공백이 든 디렉터리 이름은 실행 단계에서 거절될 값이라 결과에서 뺀다.
+        tree.app("my app");
+
+        assert!(tree.scan(SpringModuleFlavor::Gradle).modules.is_empty());
+    }
+
+    #[test]
+    fn spring_scan_reports_truncation_when_the_depth_cap_hides_modules() {
+        let tree = SpringTree::new("deep");
+        tree.app("a/b/c/d/e/f/g/h");
+
+        let scan = tree.scan(SpringModuleFlavor::Gradle);
+
+        assert!(scan.modules.is_empty());
+        assert!(scan.truncated);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spring_scan_does_not_follow_symlinks() {
+        let outside = SpringTree::new("outside");
+        outside.app("");
+        let tree = SpringTree::new("link");
+        std::os::unix::fs::symlink(&outside.0, tree.0.join("linked")).expect("symlink");
+
+        assert!(tree.scan(SpringModuleFlavor::Gradle).modules.is_empty());
+    }
+
+    #[test]
+    fn spring_scan_finds_an_app_in_a_non_utf8_source_with_a_bom() {
+        let tree = SpringTree::new("encoding");
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice(b"// ");
+        bytes.extend_from_slice(&[0xC7, 0xD1, 0xB1, 0xDB]); // CP949 "한글"
+        bytes.extend_from_slice(b"\n@SpringBootApplication\nclass App\n");
+        let path = tree.0.join("api/src/main/kotlin/App.kt");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, bytes).unwrap();
+
+        assert_eq!(tree.scan(SpringModuleFlavor::Gradle).modules, vec![":api"]);
+    }
+
+    #[test]
+    fn spring_scan_ignores_mentions_in_comments_and_longer_names() {
+        let tree = SpringTree::new("mentions");
+        tree.write(
+            "docs-only/src/main/kotlin/A.kt",
+            "// @SpringBootApplication is documented elsewhere\n * @SpringBootApplication\n\
+             /* @SpringBootApplication */\nclass A\n",
+        );
+        tree.write(
+            "custom/src/main/kotlin/B.kt",
+            "@SpringBootApplicationExtra\nclass B\n",
+        );
+        tree.write(
+            "real/src/main/kotlin/C.kt",
+            "  @SpringBootApplication(scanBasePackages = [\"x\"])\nclass C\n",
+        );
+
+        assert_eq!(tree.scan(SpringModuleFlavor::Gradle).modules, vec![":real"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spring_scan_does_not_follow_a_symlinked_src_directory() {
+        let outside = SpringTree::new("outside-src");
+        outside.write(
+            "src/main/kotlin/App.kt",
+            "@SpringBootApplication\nclass App\n",
+        );
+        let tree = SpringTree::new("link-src");
+        std::fs::create_dir_all(tree.0.join("app")).unwrap();
+        std::os::unix::fs::symlink(outside.0.join("src"), tree.0.join("app/src")).unwrap();
+
+        assert!(tree.scan(SpringModuleFlavor::Gradle).modules.is_empty());
+    }
+
+    #[test]
+    fn spring_scan_reports_truncation_when_the_entry_budget_runs_out() {
+        let tree = SpringTree::new("budget");
+        for index in 0..10 {
+            tree.write(&format!("m{index}/README.md"), "x");
+        }
+        let mut scan = SpringScan {
+            flavor: SpringModuleFlavor::Gradle,
+            remaining: 3,
+            truncated: false,
+            modules: Vec::new(),
+        };
+
+        scan.walk_modules(&tree.0, &mut Vec::new(), 0);
+
+        assert!(scan.truncated);
+    }
+
+    #[test]
+    fn spring_scan_only_warns_about_depth_when_the_skipped_directory_looks_like_a_module() {
+        let plain = SpringTree::new("deep-docs");
+        plain.write("a/b/c/d/e/f/g/h/notes.md", "x");
+        assert!(!plain.scan(SpringModuleFlavor::Gradle).truncated);
+
+        let module = SpringTree::new("deep-module");
+        module.write("a/b/c/d/e/f/g/h/build.gradle.kts", "");
+        assert!(module.scan(SpringModuleFlavor::Gradle).truncated);
     }
 }

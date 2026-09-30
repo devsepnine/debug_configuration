@@ -2,15 +2,18 @@ use crate::messages::{ConfigurationDropPosition, Message, StdinBarKey, ViewMode}
 use crate::models::{
     ConfigTypeData, ConfigurationType, ExecuteMode, ExecuteModeType, KotlinLaunchMode,
     KotlinLaunchModeType, LayoutId, PackageManager, RunConfiguration, RunFailure, RunSession,
-    SearchState, SessionStatusKind, WorkspaceTab,
+    SearchState, SessionStatusKind, SpringBootBuildTool, WorkspaceTab,
 };
 use crate::services::{
     AppSettings, McpPermission, McpRequestLog, UpdateOutcome, check_latest_release, export_text,
     force_kill_process_tree, load_or_migrate_store, load_settings, mask_token, mcp_server,
-    register_running_pid, run_configuration_stream, save_settings, save_to_store,
-    terminate_session_process, unregister_running_pid,
+    register_running_pid, resolve_spring_build_tool, run_configuration_stream, save_settings,
+    save_to_store, terminate_session_process, unregister_running_pid,
 };
-use crate::utils::{DIALOG_CANCELLED, ICON_DELETE, ICON_PLAY, ICON_REFRESH, ICON_STOP};
+use crate::utils::{
+    DIALOG_CANCELLED, ICON_DELETE, ICON_PLAY, ICON_REFRESH, ICON_STOP, SpringModuleFlavor,
+    SpringModuleScan,
+};
 use crate::views::shared::icon_tooltip;
 use crate::views::{
     ConfirmDeleteModalView, ConfirmUpdateModalView, EditorLoadingState, EditorSelectState,
@@ -88,6 +91,8 @@ struct FileDialogState {
     is_loading_interpreter: bool,
     is_loading_kotlin_jar: bool,
     is_loading_kotlin_jdk: bool,
+    is_loading_spring_boot_jar: bool,
+    is_loading_spring_boot_jdk: bool,
 }
 
 #[derive(Default)]
@@ -355,6 +360,52 @@ fn node_paths(config: &RunConfiguration) -> Option<(Uuid, String, String)> {
     }
 }
 
+/// 작업 디렉터리에서 Spring Boot 실행 모듈 후보를 스캔한다.
+///
+/// `Auto` 해석(wrapper·빌드 파일 조회)과 디렉터리 확인도 여기서 한다: 네트워크 마운트에서 UI
+/// 스레드를 붙잡지 않도록 update 핸들러는 파일시스템을 건드리지 않는다.
+fn resolve_and_scan_spring_boot_modules(
+    root: &str,
+    tool: SpringBootBuildTool,
+) -> Result<SpringModuleScan, String> {
+    if !std::path::Path::new(root.trim()).is_dir() {
+        return Err(String::from(
+            "Set a valid working directory before detecting modules",
+        ));
+    }
+    let resolved = resolve_spring_build_tool(tool, root)?;
+    let flavor = spring_module_flavor(resolved)
+        .ok_or_else(|| String::from("Modules are not used with the JAR build tool"))?;
+    Ok(crate::utils::scan_spring_boot_modules(
+        std::path::Path::new(root),
+        flavor,
+    ))
+}
+
+/// `scan_node_metadata`와 같은 이유로 `spawn_blocking`에서 실행하고 결과를 바로 적용
+/// 메시지로 돌려준다. 스캔이 실패해도 "후보 없음"으로 뭉개지 않고 사유를 싣는다.
+async fn scan_spring_boot_modules_task(
+    config_id: Uuid,
+    root: String,
+    tool: SpringBootBuildTool,
+) -> Message {
+    let scanned_root = root.clone();
+    let result =
+        tokio::task::spawn_blocking(move || resolve_and_scan_spring_boot_modules(&root, tool))
+            .await
+            .unwrap_or_else(|err| Err(format!("Module scan failed: {err}")));
+    Message::SpringBootModulesScanned(config_id, scanned_root, tool, result)
+}
+
+/// 모듈 표기 방식. Jar는 모듈을 쓰지 않으므로 없다.
+fn spring_module_flavor(tool: SpringBootBuildTool) -> Option<SpringModuleFlavor> {
+    match tool {
+        SpringBootBuildTool::Gradle => Some(SpringModuleFlavor::Gradle),
+        SpringBootBuildTool::Maven => Some(SpringModuleFlavor::Maven),
+        SpringBootBuildTool::Auto | SpringBootBuildTool::Jar => None,
+    }
+}
+
 /// Node 메타데이터(package.json 목록 + scripts)를 파일시스템에서 스캔한다.
 /// 재귀 디렉터리 워크가 무거울 수 있어 `spawn_blocking`으로 전용 블로킹 스레드에서
 /// 실행하므로, iced/tokio 워커도 UI 스레드도 막지 않는다.
@@ -453,6 +504,11 @@ pub struct RunConfigManager {
     editor_select_state: EditorSelectState,
     /// Node 프로젝트에서 발견된 `package.json` 목록 (`config_id` -> 상대 경로 리스트)
     node_available_package_jsons: HashMap<Uuid, Vec<String>>,
+    /// 구성별로 감지한 Spring Boot 실행 모듈 후보. 표기가 빌드 도구별이라 도구나 작업
+    /// 디렉터리가 바뀌면 비운다.
+    spring_boot_available_modules: HashMap<Uuid, Vec<String>>,
+    /// 모듈 감지 스캔이 진행 중인지 (버튼 중복 클릭 방지)
+    is_detecting_spring_boot_modules: bool,
     /// 시스템에서 감지된 Node.js Runtime 목록 (label, path)
     available_node_runtimes: Vec<(String, String)>,
     /// 시스템에서 감지된 JDK 목록 (label, path)
@@ -573,6 +629,8 @@ impl RunConfigManager {
             node_ui: NodeUiState::default(),
             editor_select_state: EditorSelectState::new(),
             node_available_package_jsons: HashMap::new(),
+            spring_boot_available_modules: HashMap::new(),
+            is_detecting_spring_boot_modules: false,
             available_node_runtimes: vec![("Default (system)".to_string(), "node".to_string())],
             available_jdks: vec![("Default (system)".to_string(), "java".to_string())],
             sessions: vec![],
@@ -790,6 +848,19 @@ impl RunConfigManager {
             | Message::BrowseKotlinJdk
             | Message::KotlinJdkPathSelected(_)
             | Message::JdksDetected(_)
+            | Message::SpringBootBuildToolChanged(_)
+            | Message::SpringBootModuleChanged(_)
+            | Message::DetectSpringBootModules
+            | Message::SpringBootModulesScanned(..)
+            | Message::SpringBootJarPathChanged(_)
+            | Message::BrowseSpringBootJarPath
+            | Message::SpringBootJarPathSelected(_)
+            | Message::SpringBootProfilesChanged(_)
+            | Message::SpringBootVmOptionsChanged(_)
+            | Message::SpringBootProgramArgumentsChanged(_)
+            | Message::SpringBootJdkChanged(_)
+            | Message::BrowseSpringBootJdk
+            | Message::SpringBootJdkPathSelected(_)
             | Message::WorkingDirectoryChanged(_)
             | Message::BrowseWorkingDirectory
             | Message::WorkingDirectorySelected(_)
@@ -974,6 +1045,37 @@ impl RunConfigManager {
             Message::BrowseKotlinJdk => self.handle_browse_kotlin_jdk(),
             Message::KotlinJdkPathSelected(result) => self.handle_kotlin_jdk_path_selected(result),
             Message::JdksDetected(jdks) => self.handle_jdks_detected(jdks),
+            Message::SpringBootBuildToolChanged(tool) => {
+                self.handle_spring_boot_build_tool_changed(tool)
+            }
+            Message::SpringBootJarPathChanged(value) => {
+                self.handle_spring_boot_jar_path_changed(value)
+            }
+            Message::BrowseSpringBootJarPath => self.handle_browse_spring_boot_jar_path(),
+            Message::SpringBootJarPathSelected(result) => {
+                self.handle_spring_boot_jar_path_selected(result)
+            }
+            Message::SpringBootModuleChanged(value) => {
+                self.handle_spring_boot_module_changed(value)
+            }
+            Message::DetectSpringBootModules => self.handle_detect_spring_boot_modules(),
+            Message::SpringBootModulesScanned(config_id, root, tool, result) => {
+                self.handle_spring_boot_modules_scanned(config_id, &root, tool, result)
+            }
+            Message::SpringBootProfilesChanged(value) => {
+                self.handle_spring_boot_profiles_changed(value)
+            }
+            Message::SpringBootVmOptionsChanged(value) => {
+                self.handle_spring_boot_vm_options_changed(value)
+            }
+            Message::SpringBootProgramArgumentsChanged(value) => {
+                self.handle_spring_boot_program_arguments_changed(value)
+            }
+            Message::SpringBootJdkChanged(label) => self.handle_spring_boot_jdk_changed(label),
+            Message::BrowseSpringBootJdk => self.handle_browse_spring_boot_jdk(),
+            Message::SpringBootJdkPathSelected(result) => {
+                self.handle_spring_boot_jdk_path_selected(result)
+            }
             Message::WorkingDirectoryChanged(dir) => self.handle_working_directory_changed(&dir),
             Message::BrowseWorkingDirectory => self.handle_browse_working_directory(),
             Message::WorkingDirectorySelected(result) => {
@@ -1475,6 +1577,7 @@ impl RunConfigManager {
             // 구성별 Node 캐시도 함께 제거 (UUID는 재사용되지 않으므로 누수 방지).
             self.node_available_scripts.remove(&config_id);
             self.node_available_package_jsons.remove(&config_id);
+            self.spring_boot_available_modules.remove(&config_id);
             // 삭제된 구성을 참조하던 Compound 멤버에서도 제거 (댕글링 참조 방지).
             for other in &mut self.configurations {
                 if let Some(members) = other.type_data.compound_members_mut() {
@@ -1535,6 +1638,9 @@ impl RunConfigManager {
             }
             if let Some(pkgs) = self.node_available_package_jsons.get(&source_id).cloned() {
                 self.node_available_package_jsons.insert(new_id, pkgs);
+            }
+            if let Some(modules) = self.spring_boot_available_modules.get(&source_id).cloned() {
+                self.spring_boot_available_modules.insert(new_id, modules);
             }
 
             let new_idx = idx + 1;
@@ -1827,8 +1933,20 @@ impl RunConfigManager {
                 },
             );
 
+            // 새 SpringBoot 데이터는 Auto·빈 모듈로 시작하므로 이전 후보(표기가 다를 수 있음)를 버린다.
+            self.spring_boot_available_modules.remove(&config_id);
+
             if let Some(config) = self.configurations.get_mut(index) {
                 config.type_data = match config_type {
+                    ConfigurationType::SpringBoot => ConfigTypeData::SpringBoot {
+                        build_tool: SpringBootBuildTool::default(),
+                        module: String::new(),
+                        jar_path: String::new(),
+                        profiles: String::new(),
+                        jdk_path: None,
+                        vm_options: String::new(),
+                        program_arguments: String::new(),
+                    },
                     ConfigurationType::Application => ConfigTypeData::Application {
                         command: String::new(),
                         arguments: String::new(),
@@ -2072,6 +2190,8 @@ impl RunConfigManager {
                 if is_node {
                     self.load_node_scripts(config_id, &path);
                 }
+                // 이전 디렉터리에서 찾은 모듈 후보는 새 디렉터리에서 의미가 없다.
+                self.forget_spring_boot_modules_of_selected_config();
 
                 self.status_message = format!("Working directory set: {path}");
             }
@@ -2317,6 +2437,270 @@ impl RunConfigManager {
         Task::none()
     }
 
+    fn handle_spring_boot_build_tool_changed(
+        &mut self,
+        tool: SpringBootBuildTool,
+    ) -> Task<Message> {
+        // jar_path는 Jar가 아닐 때도 지우지 않는다 — 되돌렸을 때 입력이 유실되지 않게 하고 실행 시점에 무시된다.
+        if let Some(spring_boot) = self
+            .selected_type_data_mut()
+            .and_then(ConfigTypeData::spring_boot_mut)
+        {
+            *spring_boot.build_tool = tool;
+        }
+        // 모듈 후보의 표기(Gradle `:a:b` / Maven `a/b`)는 도구에 묶여 있어 도구가 바뀌면 낡는다.
+        self.forget_spring_boot_modules_of_selected_config();
+
+        Task::none()
+    }
+
+    fn handle_spring_boot_jar_path_changed(&mut self, value: String) -> Task<Message> {
+        if let Some(spring_boot) = self
+            .selected_type_data_mut()
+            .and_then(ConfigTypeData::spring_boot_mut)
+        {
+            *spring_boot.jar_path = value;
+        }
+
+        Task::none()
+    }
+
+    fn handle_browse_spring_boot_jar_path(&mut self) -> Task<Message> {
+        self.file_dialog.is_loading_spring_boot_jar = true;
+        pick_path_task(
+            "Select JAR File",
+            Some(("JAR Files", &["jar"])),
+            false,
+            Message::SpringBootJarPathSelected,
+        )
+    }
+
+    fn handle_spring_boot_jar_path_selected(
+        &mut self,
+        result: Result<String, String>,
+    ) -> Task<Message> {
+        self.file_dialog.is_loading_spring_boot_jar = false;
+
+        match result {
+            Ok(path) => {
+                if let Some(spring_boot) = self
+                    .selected_type_data_mut()
+                    .and_then(ConfigTypeData::spring_boot_mut)
+                {
+                    spring_boot.jar_path.clone_from(&path);
+                }
+                self.status_message = format!("JAR file selected: {path}");
+            }
+            Err(error) => {
+                self.status_message = cancellable_status(&error, "JAR file selection");
+            }
+        }
+
+        Task::none()
+    }
+
+    fn handle_spring_boot_module_changed(&mut self, value: String) -> Task<Message> {
+        if let Some(spring_boot) = self
+            .selected_type_data_mut()
+            .and_then(ConfigTypeData::spring_boot_mut)
+        {
+            *spring_boot.module = value;
+        }
+
+        Task::none()
+    }
+
+    fn forget_spring_boot_modules_of_selected_config(&mut self) {
+        if let Some(config) = self
+            .selected_config_index
+            .and_then(|index| self.configurations.get(index))
+        {
+            self.spring_boot_available_modules.remove(&config.id);
+            self.sync_editor_select_state_for_selected_config();
+        }
+    }
+
+    fn handle_detect_spring_boot_modules(&mut self) -> Task<Message> {
+        if self.is_detecting_spring_boot_modules {
+            return Task::none();
+        }
+        let Some(config) = self
+            .selected_config_index
+            .and_then(|index| self.configurations.get(index))
+        else {
+            return Task::none();
+        };
+        let ConfigTypeData::SpringBoot { build_tool, .. } = &config.type_data else {
+            return Task::none();
+        };
+        if *build_tool == SpringBootBuildTool::Jar {
+            self.status_message = String::from("Modules are not used with the JAR build tool");
+            return Task::none();
+        }
+        let (config_id, root, tool) = (config.id, config.working_directory.clone(), *build_tool);
+
+        self.is_detecting_spring_boot_modules = true;
+        self.status_message = String::from("Scanning for @SpringBootApplication modules...");
+        Task::perform(
+            scan_spring_boot_modules_task(config_id, root, tool),
+            std::convert::identity,
+        )
+    }
+
+    fn handle_spring_boot_modules_scanned(
+        &mut self,
+        config_id: Uuid,
+        root: &str,
+        requested_tool: SpringBootBuildTool,
+        result: Result<SpringModuleScan, String>,
+    ) -> Task<Message> {
+        self.is_detecting_spring_boot_modules = false;
+        // 스캔 중에 구성이 지워지거나 다른 타입·도구·작업 디렉터리로 바뀌었으면 결과의 표기가
+        // 더는 맞지 않는다. 선택된 구성이 아니라 id로 찾아 엉뚱한 구성에 쓰지 않는다.
+        let Some(index) = self.configurations.iter().position(|c| {
+            c.id == config_id
+                && c.working_directory == root
+                && matches!(
+                    &c.type_data,
+                    ConfigTypeData::SpringBoot { build_tool, .. } if *build_tool == requested_tool
+                )
+        }) else {
+            // 상태 표시줄이 "Scanning..."에 멈춰 있지 않도록 버렸음을 알린다.
+            self.status_message =
+                String::from("Module scan discarded because the configuration changed");
+            return Task::none();
+        };
+
+        let scan = match result {
+            Ok(scan) => scan,
+            Err(reason) => {
+                self.status_message = reason;
+                return Task::none();
+            }
+        };
+        let SpringModuleScan { modules, truncated } = scan;
+        let mut message = match modules.as_slice() {
+            [] => format!("No @SpringBootApplication module found under {root}"),
+            [only] if only.is_empty() => String::from(
+                "The working directory itself is the application; Module can stay empty",
+            ),
+            [only] => format!("Found bootable module {only}"),
+            many => format!(
+                "Found {} bootable modules - pick one from the Module list",
+                many.len()
+            ),
+        };
+        if truncated {
+            message.push_str(" (scan limit reached; some modules may be missing)");
+        }
+
+        // 후보가 하나뿐이고 사용자가 아직 값을 넣지 않았을 때만 채운다 — 입력한 값을 덮지 않는다.
+        if let [only] = modules.as_slice()
+            && !only.is_empty()
+            && let Some(spring_boot) = self.configurations[index].type_data.spring_boot_mut()
+            && spring_boot.module.trim().is_empty()
+        {
+            *spring_boot.module = only.clone();
+            message = format!("Module set to {only}");
+        }
+
+        self.status_message = message;
+        self.spring_boot_available_modules
+            .insert(config_id, modules);
+        self.sync_editor_select_state_for_selected_config();
+        Task::none()
+    }
+
+    fn handle_spring_boot_profiles_changed(&mut self, value: String) -> Task<Message> {
+        if let Some(spring_boot) = self
+            .selected_type_data_mut()
+            .and_then(ConfigTypeData::spring_boot_mut)
+        {
+            *spring_boot.profiles = value;
+        }
+
+        Task::none()
+    }
+
+    fn handle_spring_boot_vm_options_changed(&mut self, value: String) -> Task<Message> {
+        if let Some(spring_boot) = self
+            .selected_type_data_mut()
+            .and_then(ConfigTypeData::spring_boot_mut)
+        {
+            *spring_boot.vm_options = value;
+        }
+
+        Task::none()
+    }
+
+    fn handle_spring_boot_program_arguments_changed(&mut self, value: String) -> Task<Message> {
+        if let Some(spring_boot) = self
+            .selected_type_data_mut()
+            .and_then(ConfigTypeData::spring_boot_mut)
+        {
+            *spring_boot.program_arguments = value;
+        }
+
+        Task::none()
+    }
+
+    fn handle_spring_boot_jdk_changed(&mut self, label: String) -> Task<Message> {
+        let actual_path = self
+            .available_jdks
+            .iter()
+            .find(|(jdk_label, _)| jdk_label == &label)
+            .map(|(_, path)| path.clone())
+            .unwrap_or(label);
+
+        if let Some(spring_boot) = self
+            .selected_type_data_mut()
+            .and_then(ConfigTypeData::spring_boot_mut)
+        {
+            *spring_boot.jdk_path = if actual_path == "java" {
+                None
+            } else {
+                Some(actual_path)
+            };
+        }
+
+        Task::none()
+    }
+
+    fn handle_browse_spring_boot_jdk(&mut self) -> Task<Message> {
+        self.file_dialog.is_loading_spring_boot_jdk = true;
+        // JDK는 home 디렉터리를 고른다 (executor가 bin/java를 해석).
+        pick_path_task(
+            "Select JDK Home",
+            None,
+            true,
+            Message::SpringBootJdkPathSelected,
+        )
+    }
+
+    fn handle_spring_boot_jdk_path_selected(
+        &mut self,
+        result: Result<String, String>,
+    ) -> Task<Message> {
+        self.file_dialog.is_loading_spring_boot_jdk = false;
+
+        match result {
+            Ok(path) => {
+                if let Some(spring_boot) = self
+                    .selected_type_data_mut()
+                    .and_then(ConfigTypeData::spring_boot_mut)
+                {
+                    *spring_boot.jdk_path = Some(path.clone());
+                }
+                self.status_message = format!("JDK selected: {path}");
+            }
+            Err(error) => {
+                self.status_message = cancellable_status(&error, "JDK selection");
+            }
+        }
+
+        Task::none()
+    }
+
     fn handle_kotlin_launch_mode_changed(
         &mut self,
         mode_type: KotlinLaunchModeType,
@@ -2514,6 +2898,8 @@ impl RunConfigManager {
         {
             config.working_directory = dir.to_string();
         }
+        // 다른 디렉터리의 후보 목록은 의미가 없다.
+        self.forget_spring_boot_modules_of_selected_config();
 
         if is_node {
             self.load_node_scripts(config_id, dir);
@@ -2535,6 +2921,7 @@ impl RunConfigManager {
                 self.env_bulk_inputs.clear();
                 self.node_available_scripts.clear();
                 self.node_available_package_jsons.clear();
+                self.spring_boot_available_modules.clear();
                 self.env_modal = None;
                 // 내보내기 모달의 선택 집합은 교체 전 구성의 id라 stale — 닫아서
                 // "선택했다고 믿은 것과 다른 것을 내보내는" 사고를 막는다.
@@ -4308,11 +4695,11 @@ impl RunConfigManager {
     }
 
     fn sync_editor_select_state_for_selected_config(&mut self) {
-        let (scripts, package_jsons) = self
+        let (scripts, package_jsons, spring_boot_modules) = self
             .selected_config_index
             .and_then(|idx| self.configurations.get(idx))
             .map_or_else(
-                || (Vec::new(), Vec::new()),
+                || (Vec::new(), Vec::new(), Vec::new()),
                 |config| {
                     (
                         self.node_available_scripts
@@ -4323,12 +4710,18 @@ impl RunConfigManager {
                             .get(&config.id)
                             .cloned()
                             .unwrap_or_default(),
+                        self.spring_boot_available_modules
+                            .get(&config.id)
+                            .cloned()
+                            .unwrap_or_default(),
                     )
                 },
             );
 
         self.editor_select_state.set_node_scripts(scripts);
         self.editor_select_state.set_package_jsons(package_jsons);
+        self.editor_select_state
+            .set_spring_boot_modules(spring_boot_modules);
     }
 
     fn view_status_bar(
@@ -4993,12 +5386,20 @@ impl RunConfigManager {
                                     self.selected_config_index,
                                     env_bulk_text,
                                     EditorLoadingState {
+                                        spring_boot_detecting: self
+                                            .is_detecting_spring_boot_modules,
                                         file_dialog: FileDialogLoadingState {
                                             folder: self.file_dialog.is_loading_folder,
                                             script_file: self.file_dialog.is_loading_script_file,
                                             interpreter: self.file_dialog.is_loading_interpreter,
                                             kotlin_jar: self.file_dialog.is_loading_kotlin_jar,
                                             kotlin_jdk: self.file_dialog.is_loading_kotlin_jdk,
+                                            spring_boot_jar: self
+                                                .file_dialog
+                                                .is_loading_spring_boot_jar,
+                                            spring_boot_jdk: self
+                                                .file_dialog
+                                                .is_loading_spring_boot_jdk,
                                         },
                                         node: NodeLoadingState {
                                             scripts: self.node_ui.is_loading_node_scripts,
@@ -5613,6 +6014,506 @@ mod tests {
 
     fn names(app: &RunConfigManager) -> Vec<String> {
         app.configurations.iter().map(|c| c.name.clone()).collect()
+    }
+
+    fn spring_boot_app() -> RunConfigManager {
+        let mut app = manager_with_configs(&["boot"]);
+        app.configurations[0].type_data = ConfigTypeData::SpringBoot {
+            build_tool: SpringBootBuildTool::default(),
+            module: String::new(),
+            jar_path: String::new(),
+            profiles: String::new(),
+            jdk_path: None,
+            vm_options: String::new(),
+            program_arguments: String::new(),
+        };
+        app.selected_config_index = Some(0);
+        app
+    }
+
+    #[test]
+    fn switching_to_spring_boot_starts_from_auto_with_empty_fields() {
+        let mut app = manager_with_configs(&["x"]);
+        app.selected_config_index = Some(0);
+
+        let _ = app.handle_type_changed(&ConfigurationType::SpringBoot);
+
+        assert!(matches!(
+            &app.configurations[0].type_data,
+            ConfigTypeData::SpringBoot {
+                build_tool: SpringBootBuildTool::Auto,
+                module,
+                jar_path,
+                profiles,
+                jdk_path: None,
+                vm_options,
+                program_arguments,
+            } if module.is_empty()
+                && jar_path.is_empty()
+                && profiles.is_empty()
+                && vm_options.is_empty()
+                && program_arguments.is_empty()
+        ));
+    }
+
+    #[test]
+    fn spring_boot_text_handlers_write_their_own_field() {
+        let mut app = spring_boot_app();
+
+        let _ = app.handle_spring_boot_build_tool_changed(SpringBootBuildTool::Maven);
+        let _ = app.handle_spring_boot_jar_path_changed(String::from("build/app.jar"));
+        let _ = app.handle_spring_boot_module_changed(String::from(":app"));
+        let _ = app.handle_spring_boot_profiles_changed(String::from("dev,local"));
+        let _ = app.handle_spring_boot_vm_options_changed(String::from("-Xmx1g"));
+        let _ = app.handle_spring_boot_program_arguments_changed(String::from("--debug"));
+
+        let spring_boot = app.configurations[0].type_data.spring_boot_mut().unwrap();
+        assert_eq!(*spring_boot.build_tool, SpringBootBuildTool::Maven);
+        assert_eq!(spring_boot.module, ":app");
+        assert_eq!(spring_boot.jar_path, "build/app.jar");
+        assert_eq!(spring_boot.profiles, "dev,local");
+        assert_eq!(spring_boot.vm_options, "-Xmx1g");
+        assert_eq!(spring_boot.program_arguments, "--debug");
+    }
+
+    #[test]
+    fn changing_the_build_tool_keeps_the_jar_path() {
+        let mut app = spring_boot_app();
+        let _ = app.handle_spring_boot_build_tool_changed(SpringBootBuildTool::Jar);
+        let _ = app.handle_spring_boot_jar_path_changed(String::from("app.jar"));
+
+        let _ = app.handle_spring_boot_build_tool_changed(SpringBootBuildTool::Gradle);
+
+        let spring_boot = app.configurations[0].type_data.spring_boot_mut().unwrap();
+        assert_eq!(spring_boot.jar_path, "app.jar");
+    }
+
+    #[test]
+    fn changing_the_build_tool_keeps_the_module() {
+        let mut app = spring_boot_app();
+        let _ = app.handle_spring_boot_module_changed(String::from(":app"));
+
+        let _ = app.handle_spring_boot_build_tool_changed(SpringBootBuildTool::Maven);
+        let _ = app.handle_spring_boot_build_tool_changed(SpringBootBuildTool::Gradle);
+
+        let spring_boot = app.configurations[0].type_data.spring_boot_mut().unwrap();
+        assert_eq!(spring_boot.module, ":app");
+    }
+
+    fn gradle_boot_app(dir: &str) -> RunConfigManager {
+        let mut app = spring_boot_app();
+        app.configurations[0].working_directory = dir.to_string();
+        *app.configurations[0]
+            .type_data
+            .spring_boot_mut()
+            .unwrap()
+            .build_tool = SpringBootBuildTool::Gradle;
+        app
+    }
+
+    fn scan_of(modules: &[&str]) -> SpringModuleScan {
+        SpringModuleScan {
+            modules: modules.iter().map(|m| (*m).to_string()).collect(),
+            truncated: false,
+        }
+    }
+
+    fn module_of(app: &mut RunConfigManager) -> String {
+        app.configurations[0]
+            .type_data
+            .spring_boot_mut()
+            .unwrap()
+            .module
+            .clone()
+    }
+
+    #[test]
+    fn a_single_detected_module_fills_an_empty_module() {
+        let mut app = gradle_boot_app("/work");
+        let id = app.configurations[0].id;
+        app.is_detecting_spring_boot_modules = true;
+
+        let _ = app.handle_spring_boot_modules_scanned(
+            id,
+            "/work",
+            SpringBootBuildTool::Gradle,
+            Ok(scan_of(&[":app"])),
+        );
+
+        assert_eq!(module_of(&mut app), ":app");
+        assert_eq!(app.spring_boot_available_modules[&id], vec![":app"]);
+        assert!(!app.is_detecting_spring_boot_modules);
+        assert!(app.status_message.contains(":app"));
+    }
+
+    #[test]
+    fn a_single_detected_module_does_not_overwrite_a_typed_value() {
+        let mut app = gradle_boot_app("/work");
+        let id = app.configurations[0].id;
+        let _ = app.handle_spring_boot_module_changed(String::from(":mine"));
+
+        let _ = app.handle_spring_boot_modules_scanned(
+            id,
+            "/work",
+            SpringBootBuildTool::Gradle,
+            Ok(scan_of(&[":app"])),
+        );
+
+        assert_eq!(module_of(&mut app), ":mine");
+        assert_eq!(app.spring_boot_available_modules[&id], vec![":app"]);
+    }
+
+    #[test]
+    fn several_detected_modules_only_fill_the_list() {
+        let mut app = gradle_boot_app("/work");
+        let id = app.configurations[0].id;
+
+        let _ = app.handle_spring_boot_modules_scanned(
+            id,
+            "/work",
+            SpringBootBuildTool::Gradle,
+            Ok(scan_of(&[":app:a", ":app:b"])),
+        );
+
+        assert_eq!(module_of(&mut app), "");
+        assert_eq!(app.spring_boot_available_modules[&id].len(), 2);
+        assert!(app.status_message.contains('2'));
+    }
+
+    #[test]
+    fn a_root_application_leaves_the_module_empty() {
+        let mut app = gradle_boot_app("/work");
+        let id = app.configurations[0].id;
+
+        let _ = app.handle_spring_boot_modules_scanned(
+            id,
+            "/work",
+            SpringBootBuildTool::Gradle,
+            Ok(scan_of(&[""])),
+        );
+
+        assert_eq!(module_of(&mut app), "");
+        assert!(app.status_message.contains("working directory itself"));
+    }
+
+    #[test]
+    fn a_truncated_scan_says_so() {
+        let mut app = gradle_boot_app("/work");
+        let id = app.configurations[0].id;
+
+        let _ = app.handle_spring_boot_modules_scanned(
+            id,
+            "/work",
+            SpringBootBuildTool::Gradle,
+            Ok(SpringModuleScan {
+                modules: Vec::new(),
+                truncated: true,
+            }),
+        );
+
+        assert!(app.status_message.contains("scan limit"));
+    }
+
+    #[test]
+    fn a_scan_result_for_another_directory_is_discarded() {
+        let mut app = gradle_boot_app("/work");
+        let id = app.configurations[0].id;
+
+        let _ = app.handle_spring_boot_modules_scanned(
+            id,
+            "/elsewhere",
+            SpringBootBuildTool::Gradle,
+            Ok(scan_of(&[":app"])),
+        );
+
+        assert_eq!(module_of(&mut app), "");
+        assert!(!app.spring_boot_available_modules.contains_key(&id));
+    }
+
+    #[test]
+    fn a_scan_result_in_the_wrong_notation_for_the_current_tool_is_discarded() {
+        let mut app = gradle_boot_app("/work");
+        let id = app.configurations[0].id;
+
+        // 스캔 중에 Maven으로 바뀐 경우를 가정한, Gradle로 요청한 결과.
+        app.status_message = String::from("Scanning for @SpringBootApplication modules...");
+        *app.configurations[0]
+            .type_data
+            .spring_boot_mut()
+            .unwrap()
+            .build_tool = SpringBootBuildTool::Maven;
+        let _ = app.handle_spring_boot_modules_scanned(
+            id,
+            "/work",
+            SpringBootBuildTool::Gradle,
+            Ok(scan_of(&[":app"])),
+        );
+
+        assert_eq!(module_of(&mut app), "");
+        assert!(!app.spring_boot_available_modules.contains_key(&id));
+        assert!(
+            app.status_message.contains("discarded"),
+            "{}",
+            app.status_message
+        );
+    }
+
+    #[test]
+    fn a_stale_scan_result_replaces_the_scanning_status() {
+        let mut app = gradle_boot_app("/work");
+        let id = app.configurations[0].id;
+        app.is_detecting_spring_boot_modules = true;
+        app.status_message = String::from("Scanning for @SpringBootApplication modules...");
+
+        let _ = app.handle_spring_boot_modules_scanned(
+            id,
+            "/elsewhere",
+            SpringBootBuildTool::Gradle,
+            Ok(scan_of(&[":app"])),
+        );
+
+        assert!(!app.is_detecting_spring_boot_modules);
+        assert!(
+            !app.status_message.contains("Scanning"),
+            "{}",
+            app.status_message
+        );
+    }
+
+    #[test]
+    fn an_auto_request_is_only_applied_while_the_tool_is_still_auto() {
+        let mut app = spring_boot_app();
+        app.configurations[0].working_directory = String::from("/work");
+        let id = app.configurations[0].id;
+
+        let _ = app.handle_spring_boot_modules_scanned(
+            id,
+            "/work",
+            SpringBootBuildTool::Auto,
+            Ok(scan_of(&[":app"])),
+        );
+        assert_eq!(module_of(&mut app), ":app");
+
+        let _ = app.handle_spring_boot_module_changed(String::new());
+        *app.configurations[0]
+            .type_data
+            .spring_boot_mut()
+            .unwrap()
+            .build_tool = SpringBootBuildTool::Gradle;
+        let _ = app.handle_spring_boot_modules_scanned(
+            id,
+            "/work",
+            SpringBootBuildTool::Auto,
+            Ok(scan_of(&[":app"])),
+        );
+        assert_eq!(module_of(&mut app), "");
+    }
+
+    #[test]
+    fn a_failed_scan_reports_its_reason_instead_of_no_modules() {
+        let mut app = gradle_boot_app("/work");
+        let id = app.configurations[0].id;
+        app.is_detecting_spring_boot_modules = true;
+
+        let _ = app.handle_spring_boot_modules_scanned(
+            id,
+            "/work",
+            SpringBootBuildTool::Gradle,
+            Err(String::from("Module scan failed: boom")),
+        );
+
+        assert!(!app.is_detecting_spring_boot_modules);
+        assert_eq!(app.status_message, "Module scan failed: boom");
+        assert!(!app.spring_boot_available_modules.contains_key(&id));
+    }
+
+    #[test]
+    fn a_scan_result_for_a_deleted_configuration_is_ignored() {
+        let mut app = gradle_boot_app("/work");
+
+        let _ = app.handle_spring_boot_modules_scanned(
+            Uuid::new_v4(),
+            "/work",
+            SpringBootBuildTool::Gradle,
+            Ok(scan_of(&[":app"])),
+        );
+
+        assert_eq!(module_of(&mut app), "");
+        assert!(app.spring_boot_available_modules.is_empty());
+    }
+
+    #[test]
+    fn a_scan_result_never_lands_on_a_different_selected_configuration() {
+        let mut app = gradle_boot_app("/work");
+        let scanned_id = app.configurations[0].id;
+        app.configurations.push(RunConfiguration {
+            name: String::from("other"),
+            ..RunConfiguration::default()
+        });
+        app.selected_config_index = Some(1);
+
+        let _ = app.handle_spring_boot_modules_scanned(
+            scanned_id,
+            "/work",
+            SpringBootBuildTool::Gradle,
+            Ok(scan_of(&[":app"])),
+        );
+
+        assert_eq!(module_of(&mut app), ":app");
+        assert!(matches!(
+            app.configurations[1].type_data,
+            ConfigTypeData::Application { .. }
+        ));
+    }
+
+    #[test]
+    fn changing_the_build_tool_or_directory_forgets_detected_modules() {
+        let mut app = gradle_boot_app("/work");
+        let id = app.configurations[0].id;
+        app.spring_boot_available_modules
+            .insert(id, vec![String::from(":app")]);
+
+        let _ = app.handle_spring_boot_build_tool_changed(SpringBootBuildTool::Maven);
+        assert!(!app.spring_boot_available_modules.contains_key(&id));
+
+        app.spring_boot_available_modules
+            .insert(id, vec![String::from("app")]);
+        let _ = app.handle_working_directory_changed("/other");
+        assert!(!app.spring_boot_available_modules.contains_key(&id));
+    }
+
+    #[test]
+    fn detecting_starts_a_scan_without_touching_the_filesystem() {
+        // 존재하지 않는 경로여도 핸들러는 I/O를 하지 않고 스캔을 시작한다 — 검증은 백그라운드에서 한다.
+        let mut app = gradle_boot_app("/definitely/not/a/directory");
+
+        let _ = app.handle_detect_spring_boot_modules();
+
+        assert!(app.is_detecting_spring_boot_modules);
+    }
+
+    #[test]
+    fn the_background_scan_rejects_bad_directories_and_jar() {
+        let missing = resolve_and_scan_spring_boot_modules(
+            "/definitely/not/a/directory",
+            SpringBootBuildTool::Gradle,
+        );
+        assert!(missing.unwrap_err().contains("working directory"));
+
+        let temp = std::env::temp_dir().display().to_string();
+        let jar = resolve_and_scan_spring_boot_modules(&temp, SpringBootBuildTool::Jar);
+        assert!(jar.unwrap_err().contains("JAR"));
+    }
+
+    #[test]
+    fn the_background_scan_resolves_auto_before_scanning() {
+        let root = std::env::temp_dir().join(format!("rcm-detect-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("app/src/main/kotlin")).unwrap();
+        std::fs::write(root.join("pom.xml"), "").unwrap();
+        std::fs::write(
+            root.join("app/src/main/kotlin/App.kt"),
+            "@SpringBootApplication\nclass App\n",
+        )
+        .unwrap();
+
+        let auto = resolve_and_scan_spring_boot_modules(
+            &root.display().to_string(),
+            SpringBootBuildTool::Auto,
+        );
+        let _ = std::fs::remove_dir_all(&root);
+
+        // pom.xml이 있으니 Maven 표기(`app`)로 나와야 한다.
+        assert_eq!(auto.unwrap().modules, vec!["app"]);
+    }
+
+    #[test]
+    fn detecting_a_jar_configuration_is_refused_before_scanning() {
+        let mut jar = spring_boot_app();
+        jar.configurations[0].working_directory = std::env::temp_dir().display().to_string();
+        *jar.configurations[0]
+            .type_data
+            .spring_boot_mut()
+            .unwrap()
+            .build_tool = SpringBootBuildTool::Jar;
+        let _ = jar.handle_detect_spring_boot_modules();
+        assert!(!jar.is_detecting_spring_boot_modules);
+        assert!(jar.status_message.contains("JAR"));
+    }
+
+    #[test]
+    fn browsing_to_another_directory_or_switching_type_forgets_detected_modules() {
+        let mut app = gradle_boot_app("/work");
+        let id = app.configurations[0].id;
+        app.spring_boot_available_modules
+            .insert(id, vec![String::from(":app")]);
+        let _ = app.handle_working_directory_selected(Ok(String::from("/other")));
+        assert!(!app.spring_boot_available_modules.contains_key(&id));
+
+        app.spring_boot_available_modules
+            .insert(id, vec![String::from(":app")]);
+        let _ = app.handle_type_changed(&ConfigurationType::Application);
+        let _ = app.handle_type_changed(&ConfigurationType::SpringBoot);
+        assert!(!app.spring_boot_available_modules.contains_key(&id));
+    }
+
+    #[test]
+    fn detecting_is_not_started_twice() {
+        let mut app = gradle_boot_app(&std::env::temp_dir().display().to_string());
+        app.is_detecting_spring_boot_modules = true;
+        app.status_message = String::from("unchanged");
+
+        let _ = app.handle_detect_spring_boot_modules();
+
+        assert_eq!(app.status_message, "unchanged");
+    }
+
+    #[test]
+    fn spring_boot_jdk_changed_maps_java_to_none_and_resolves_labels() {
+        let mut app = spring_boot_app();
+        app.available_jdks = vec![(String::from("JDK 21"), String::from("/jdks/21"))];
+
+        let _ = app.handle_spring_boot_jdk_changed(String::from("JDK 21"));
+        assert_eq!(
+            *app.configurations[0]
+                .type_data
+                .spring_boot_mut()
+                .unwrap()
+                .jdk_path,
+            Some(String::from("/jdks/21"))
+        );
+
+        let _ = app.handle_spring_boot_jdk_changed(String::from("java"));
+        assert_eq!(
+            *app.configurations[0]
+                .type_data
+                .spring_boot_mut()
+                .unwrap()
+                .jdk_path,
+            None
+        );
+    }
+
+    #[test]
+    fn spring_boot_selection_results_update_fields_and_clear_loading() {
+        let mut app = spring_boot_app();
+        app.file_dialog.is_loading_spring_boot_jar = true;
+        app.file_dialog.is_loading_spring_boot_jdk = true;
+
+        let _ = app.handle_spring_boot_jar_path_selected(Ok(String::from("/w/app.jar")));
+        let _ = app.handle_spring_boot_jdk_path_selected(Ok(String::from("/jdks/21")));
+
+        assert!(!app.file_dialog.is_loading_spring_boot_jar);
+        assert!(!app.file_dialog.is_loading_spring_boot_jdk);
+        let spring_boot = app.configurations[0].type_data.spring_boot_mut().unwrap();
+        assert_eq!(spring_boot.jar_path, "/w/app.jar");
+        assert_eq!(*spring_boot.jdk_path, Some(String::from("/jdks/21")));
+
+        // 취소는 기존 값을 건드리지 않고 로딩 플래그만 내린다.
+        app.file_dialog.is_loading_spring_boot_jar = true;
+        let _ = app.handle_spring_boot_jar_path_selected(Err(String::from("cancelled")));
+        assert!(!app.file_dialog.is_loading_spring_boot_jar);
+        let spring_boot = app.configurations[0].type_data.spring_boot_mut().unwrap();
+        assert_eq!(spring_boot.jar_path, "/w/app.jar");
     }
 
     #[test]

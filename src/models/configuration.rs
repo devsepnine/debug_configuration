@@ -13,6 +13,8 @@ pub enum ConfigurationType {
     Node,
     /// Kotlin 앱 실행 (JVM `java` 경유)
     Kotlin,
+    /// Spring Boot 앱 실행 (Gradle `bootRun` / Maven `spring-boot:run` / `java -jar`)
+    SpringBoot,
     /// 여러 구성을 묶어 한 번에 실행 (복합 구성)
     Compound,
 }
@@ -335,6 +337,64 @@ impl Default for ExecuteMode {
     }
 }
 
+/// Spring Boot 실행 도구 선택.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum SpringBootBuildTool {
+    /// 작업 디렉터리의 wrapper/빌드 파일로 감지한다. 감지에 실패해도 Jar로 가지 않는다.
+    #[default]
+    Auto,
+    Gradle,
+    Maven,
+    Jar,
+}
+
+impl SpringBootBuildTool {
+    pub const ALL: [Self; 4] = [Self::Auto, Self::Gradle, Self::Maven, Self::Jar];
+}
+
+impl std::fmt::Display for SpringBootBuildTool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let label = match self {
+            Self::Auto => "Auto",
+            Self::Gradle => "Gradle",
+            Self::Maven => "Maven",
+            Self::Jar => "JAR",
+        };
+
+        write!(f, "{label}")
+    }
+}
+
+/// `profiles` 입력이 허용된 문자만으로 이루어졌는지. 빈 값은 "프로파일 없음"으로 유효하다.
+///
+/// 값이 셸 명령에 그대로 끼워지므로 executor(실행 시점)와 MCP(저장 시점)가 같은 규칙을
+/// 써야 한다 — 두 곳이 어긋나면 저장은 되는데 실행이 실패하거나 그 반대가 된다.
+/// 호출자는 앞뒤 공백을 `trim`한 값을 넘긴다.
+pub fn is_valid_spring_profiles(profiles: &str) -> bool {
+    profiles
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | ',' | '-'))
+}
+
+/// Spring Boot 실행 모듈 입력이 허용된 형태인지. 빈 값은 "지정 안 함"으로 유효하다.
+///
+/// Gradle은 프로젝트 경로(`:app:api`, `app/api`), Maven은 `-pl` 값(`app/api`, `:artifactId`)이며
+/// 값이 셸 명령의 태스크 이름·옵션 값에 그대로 끼워지므로 executor와 MCP가 같은 규칙을 써야 한다.
+/// `..`와 `//`, 앞자리 `/`는 작업 디렉터리 밖을 가리키거나 경로를 모호하게 만들고, 앞자리 `-`는
+/// 옵션으로 읽힐 수 있어 거절한다. 호출자는 앞뒤 공백을 `trim`한 값을 넘긴다.
+pub fn is_valid_spring_module(module: &str) -> bool {
+    // `:/`·`/:`는 Gradle 변환(`/`→`:`) 뒤 `::`가 되고, 단독 `.` 구간은 현재 디렉터리를 뜻해
+    // 태스크 경로가 성립하지 않는다.
+    !["::", "//", ":/", "/:", ".."]
+        .iter()
+        .any(|forbidden| module.contains(forbidden))
+        && !module.starts_with(['/', '-'])
+        && !module.split([':', '/']).any(|segment| segment == ".")
+        && module
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-' | ':' | '/'))
+}
+
 /// Kotlin 실행 모드 타입 (UI 선택용)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KotlinLaunchModeType {
@@ -459,6 +519,30 @@ pub enum ConfigTypeData {
         /// 프로그램 인자
         program_arguments: String,
     },
+    /// Spring Boot 타입 데이터 — 작업 디렉터리는 공통 `working_directory`를 쓴다.
+    SpringBoot {
+        /// 실행 도구 (Auto / Gradle / Maven / JAR)
+        #[serde(default)]
+        build_tool: SpringBootBuildTool,
+        /// 실행할 모듈. Gradle은 프로젝트 경로(`:app`, `:services:api`), Maven은 `-pl` 값
+        /// (`app/api`, `:artifactId`). 비우면 작업 디렉터리의 프로젝트를 그대로 실행한다.
+        /// 멀티모듈 루트에서 한정자 없는 `bootRun`은 모든 서브프로젝트에서 실행되어 main class가
+        /// 없는 모듈이 실패하므로 실행할 모듈을 지정하는 수단이다. Jar에서는 쓰이지 않으며 값은
+        /// 유지한다. 개발 중 `gradle_module` 키로 저장된 파일도 읽도록 별칭을 둔다 — 이 열거형은
+        /// `deny_unknown_fields`라 옛 키가 남은 파일은 전체가 읽히지 않는다.
+        #[serde(default, alias = "gradle_module")]
+        module: String,
+        /// JAR 경로. `build_tool`이 Jar일 때만 쓰이며, 다른 도구로 바꿔도 값은 유지한다.
+        jar_path: String,
+        /// 활성 프로파일 (쉼표 목록, `spring.profiles.active`)
+        profiles: String,
+        /// JDK 경로 (None이면 시스템 기본값). 디렉터리(JDK home) 또는 `java` 실행 파일 경로
+        jdk_path: Option<String>,
+        /// VM options (`-Xmx2g` 등 JVM 인자)
+        vm_options: String,
+        /// 프로그램 인자
+        program_arguments: String,
+    },
     /// 복합 구성 데이터 — 함께 실행할 다른 구성들의 id 목록.
     /// 실행 시 각 멤버가 자신의 세션/페인으로 동시에 펼쳐진다.
     Compound {
@@ -504,6 +588,17 @@ pub struct KotlinFieldsMut<'a> {
     pub program_arguments: &'a mut String,
 }
 
+/// `ConfigTypeData::SpringBoot` 변형의 가변 필드 묶음.
+pub struct SpringBootFieldsMut<'a> {
+    pub build_tool: &'a mut SpringBootBuildTool,
+    pub module: &'a mut String,
+    pub jar_path: &'a mut String,
+    pub profiles: &'a mut String,
+    pub jdk_path: &'a mut Option<String>,
+    pub vm_options: &'a mut String,
+    pub program_arguments: &'a mut String,
+}
+
 /// `KotlinLaunchMode::MainClass` 변형의 가변 필드 묶음.
 pub struct KotlinMainClassFieldsMut<'a> {
     pub main_class: &'a mut String,
@@ -518,6 +613,7 @@ impl ConfigTypeData {
             ConfigTypeData::ShellScript { .. } => ConfigurationType::ShellScript,
             ConfigTypeData::Node { .. } => ConfigurationType::Node,
             ConfigTypeData::Kotlin { .. } => ConfigurationType::Kotlin,
+            ConfigTypeData::SpringBoot { .. } => ConfigurationType::SpringBoot,
             ConfigTypeData::Compound { .. } => ConfigurationType::Compound,
         }
     }
@@ -611,6 +707,32 @@ impl ConfigTypeData {
         }
     }
 
+    /// SpringBoot 변형이면 가변 필드 묶음 반환.
+    pub fn spring_boot_mut(&mut self) -> Option<SpringBootFieldsMut<'_>> {
+        if let ConfigTypeData::SpringBoot {
+            build_tool,
+            module,
+            jar_path,
+            profiles,
+            jdk_path,
+            vm_options,
+            program_arguments,
+        } = self
+        {
+            Some(SpringBootFieldsMut {
+                build_tool,
+                module,
+                jar_path,
+                profiles,
+                jdk_path,
+                vm_options,
+                program_arguments,
+            })
+        } else {
+            None
+        }
+    }
+
     /// Kotlin + `MainClass` 변형이면 가변 필드 묶음 반환.
     pub fn kotlin_main_class_mut(&mut self) -> Option<KotlinMainClassFieldsMut<'_>> {
         if let ConfigTypeData::Kotlin {
@@ -673,11 +795,12 @@ impl ConfigTypeData {
 }
 
 impl ConfigurationType {
-    pub const ALL: [ConfigurationType; 5] = [
+    pub const ALL: [ConfigurationType; 6] = [
         ConfigurationType::Application,
         ConfigurationType::ShellScript,
         ConfigurationType::Node,
         ConfigurationType::Kotlin,
+        ConfigurationType::SpringBoot,
         ConfigurationType::Compound,
     ];
 }
@@ -692,6 +815,7 @@ impl std::fmt::Display for ConfigurationType {
                 ConfigurationType::ShellScript => "Shell Script",
                 ConfigurationType::Node => "Node",
                 ConfigurationType::Kotlin => "Kotlin",
+                ConfigurationType::SpringBoot => "Spring Boot",
                 ConfigurationType::Compound => "Compound",
             }
         )
@@ -783,5 +907,111 @@ mod tests {
     #[test]
     fn configuration_type_all_includes_kotlin() {
         assert!(ConfigurationType::ALL.contains(&ConfigurationType::Kotlin));
+    }
+
+    #[test]
+    fn configuration_type_all_includes_spring_boot() {
+        assert!(ConfigurationType::ALL.contains(&ConfigurationType::SpringBoot));
+    }
+
+    #[test]
+    fn spring_boot_config_type_data_round_trips() {
+        let original = ConfigTypeData::SpringBoot {
+            build_tool: SpringBootBuildTool::Maven,
+            module: String::from(":app"),
+            jar_path: String::from("build/libs/app.jar"),
+            profiles: String::from("dev,local"),
+            jdk_path: Some(String::from("/opt/jdk")),
+            vm_options: String::from("-Xmx2g"),
+            program_arguments: String::from("--debug"),
+        };
+
+        let json = serde_json::to_string(&original).expect("serialize");
+        let restored: ConfigTypeData = serde_json::from_str(&json).expect("deserialize");
+
+        assert_eq!(original, restored);
+        assert_eq!(restored.config_type(), ConfigurationType::SpringBoot);
+    }
+
+    #[test]
+    fn spring_boot_build_tool_defaults_to_auto_when_absent() {
+        let json = r#"{"type":"SpringBoot","jar_path":"","profiles":"","jdk_path":null,
+            "vm_options":"","program_arguments":""}"#;
+
+        let restored: ConfigTypeData = serde_json::from_str(json).expect("deserialize");
+
+        let ConfigTypeData::SpringBoot { build_tool, .. } = restored else {
+            panic!("expected the SpringBoot variant");
+        };
+        assert_eq!(build_tool, SpringBootBuildTool::Auto);
+    }
+
+    #[test]
+    fn spring_profiles_accept_names_lists_and_empty_only() {
+        assert!(is_valid_spring_profiles(""));
+        assert!(is_valid_spring_profiles("dev"));
+        assert!(is_valid_spring_profiles("dev,local-2_x.y"));
+        assert!(!is_valid_spring_profiles("dev local"));
+        assert!(!is_valid_spring_profiles("dev;rm"));
+        assert!(!is_valid_spring_profiles("d'ev"));
+        assert!(!is_valid_spring_profiles("dev\n"));
+        assert!(!is_valid_spring_profiles("가"));
+    }
+
+    #[test]
+    fn module_accepts_gradle_paths_maven_paths_and_empty_only() {
+        assert!(is_valid_spring_module(""));
+        assert!(is_valid_spring_module(":app"));
+        assert!(is_valid_spring_module(":services:api-v2"));
+        assert!(is_valid_spring_module("app"));
+        assert!(is_valid_spring_module("app/pspteller"));
+        assert!(!is_valid_spring_module(":app::api"));
+        assert!(!is_valid_spring_module("app//api"));
+        assert!(!is_valid_spring_module("app:/api"));
+        assert!(!is_valid_spring_module("app/:api"));
+        assert!(!is_valid_spring_module("."));
+        assert!(!is_valid_spring_module(":app:.:api"));
+        assert!(is_valid_spring_module("app/"));
+        assert!(is_valid_spring_module("app.v2/api"));
+        assert!(!is_valid_spring_module("../app"));
+        assert!(!is_valid_spring_module("/abs/app"));
+        assert!(!is_valid_spring_module("-x"));
+        assert!(!is_valid_spring_module(":app bootRun"));
+        assert!(!is_valid_spring_module(":app;rm"));
+        assert!(!is_valid_spring_module("'app'"));
+    }
+
+    #[test]
+    fn spring_boot_reads_the_legacy_gradle_module_key() {
+        let json = r#"{"type":"SpringBoot","gradle_module":":app","jar_path":"","profiles":"",
+            "jdk_path":null,"vm_options":"","program_arguments":""}"#;
+
+        let restored: ConfigTypeData = serde_json::from_str(json).expect("deserialize");
+
+        let ConfigTypeData::SpringBoot { module, .. } = restored else {
+            panic!("expected the SpringBoot variant");
+        };
+        assert_eq!(module, ":app");
+    }
+
+    #[test]
+    fn spring_boot_module_defaults_to_empty_when_absent() {
+        let json = r#"{"type":"SpringBoot","jar_path":"","profiles":"","jdk_path":null,
+            "vm_options":"","program_arguments":""}"#;
+
+        let restored: ConfigTypeData = serde_json::from_str(json).expect("deserialize");
+
+        let ConfigTypeData::SpringBoot { module, .. } = restored else {
+            panic!("expected the SpringBoot variant");
+        };
+        assert!(module.is_empty());
+    }
+
+    #[test]
+    fn spring_boot_rejects_unknown_fields() {
+        let json = r#"{"type":"SpringBoot","jar_path":"","profiles":"","jdk_path":null,
+            "vm_options":"","program_arguments":"","profile":"dev"}"#;
+
+        assert!(serde_json::from_str::<ConfigTypeData>(json).is_err());
     }
 }

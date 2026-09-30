@@ -782,6 +782,8 @@ impl RunConfigManager {
             // 다시 채운다.
             self.node_available_scripts.remove(&config_id);
             self.node_available_package_jsons.remove(&config_id);
+            // 모듈 표기는 빌드 도구·작업 디렉터리에 묶여 있어 MCP 변경 뒤에는 유효하지 않을 수 있다.
+            self.spring_boot_available_modules.remove(&config_id);
         }
         // 편집기 패널의 select 상태는 선택된 구성에서 파생되므로 다시 맞춘다.
         self.sync_editor_select_state_for_selected_config();
@@ -3698,6 +3700,8 @@ mod tests {
             .insert(config_id, vec![String::from(STALE_SCRIPT)]);
         app.node_available_package_jsons
             .insert(config_id, vec![String::from("/tmp/project/package.json")]);
+        app.spring_boot_available_modules
+            .insert(config_id, vec![String::from(":stale")]);
         let op = McpOp::UpdateConfiguration(Box::new(UpdateConfigurationArgs {
             working_directory: Some(String::from("/tmp/somewhere-else")),
             ..patch("build")
@@ -3708,6 +3712,7 @@ mod tests {
         // Application 타입은 재스캔하지 않으므로 두 캐시가 비어야 한다.
         assert!(!app.node_available_scripts.contains_key(&config_id));
         assert!(!app.node_available_package_jsons.contains_key(&config_id));
+        assert!(!app.spring_boot_available_modules.contains_key(&config_id));
     }
 
     fn node_type_data(project_directory: &str) -> ConfigTypeData {
@@ -3803,6 +3808,31 @@ mod tests {
     }
 
     #[test]
+    fn a_spring_boot_configuration_needs_a_working_directory() {
+        // Spring Boot는 빌드 도구 wrapper 탐색과 상대 jar 경로의 기준이 모두 작업 디렉터리다.
+        // 빈 값이면 스폰 시점에 실패하므로 쓰기 경계에서 막는다(`check_working_directory`의 `_` 폴백).
+        let mut app = app_at_edit_tier();
+        let op = McpOp::CreateConfiguration(Box::new(CreateConfigurationArgs {
+            working_directory: String::from("  "),
+            type_data: ConfigTypeData::SpringBoot {
+                build_tool: crate::models::SpringBootBuildTool::default(),
+                module: String::new(),
+                jar_path: String::new(),
+                profiles: String::new(),
+                jdk_path: None,
+                vm_options: String::new(),
+                program_arguments: String::new(),
+            },
+            ..create_args("boot")
+        }));
+
+        let reason = failure_of(respond_to(&mut app, op));
+
+        assert!(reason.contains("working_directory"), "{reason}");
+        assert!(!app.configurations.iter().any(|it| it.name == "boot"));
+    }
+
+    #[test]
     fn a_type_switch_cannot_leave_an_empty_working_directory() {
         // compound는 디렉터리를 비운 채로 존재할 수 있다(어느 실행에도 닿지 않는다). 그것을
         // Application으로 바꾸는 패치는 디렉터리를 실을 의무가 없어 파서만으로는 빈 cwd가
@@ -3825,6 +3855,37 @@ mod tests {
 
         assert!(reason.contains("working_directory"), "{reason}");
         // 거절은 반쯤 적용된 패치를 남기지 않는다.
+        assert!(matches!(
+            app.configurations[0].type_data,
+            ConfigTypeData::Compound { .. }
+        ));
+    }
+
+    #[test]
+    fn switching_to_spring_boot_cannot_leave_an_empty_working_directory() {
+        // SpringBoot는 Node·Compound와 달리 작업 디렉터리를 쓰므로 빈 값은 실행에서야 드러난다.
+        let mut app = app_at_edit_tier();
+        app.configurations[0].working_directory = String::new();
+        app.configurations[0].type_data = ConfigTypeData::Compound {
+            members: Vec::new(),
+            workspace: None,
+        };
+        let op = McpOp::UpdateConfiguration(Box::new(UpdateConfigurationArgs {
+            type_data: Some(ConfigTypeData::SpringBoot {
+                build_tool: crate::models::SpringBootBuildTool::Gradle,
+                module: String::new(),
+                jar_path: String::new(),
+                profiles: String::new(),
+                jdk_path: None,
+                vm_options: String::new(),
+                program_arguments: String::new(),
+            }),
+            ..patch("build")
+        }));
+
+        let reason = failure_of(respond_to(&mut app, op));
+
+        assert!(reason.contains("working_directory"), "{reason}");
         assert!(matches!(
             app.configurations[0].type_data,
             ConfigTypeData::Compound { .. }

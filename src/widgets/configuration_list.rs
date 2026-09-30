@@ -2,7 +2,7 @@ use crate::messages::{ConfigurationDropPosition, Message};
 use crate::models::{ConfigurationType, RunConfiguration};
 use crate::utils::{
     ICON_COPY, ICON_DELETE, ICON_PLAY, ICON_TYPE_APPLICATION, ICON_TYPE_COMPOUND, ICON_TYPE_KOTLIN,
-    ICON_TYPE_NODE, ICON_TYPE_SHELL, truncate_text,
+    ICON_TYPE_NODE, ICON_TYPE_SHELL, ICON_TYPE_SPRING_BOOT, truncate_text,
 };
 use iced::{
     Alignment::{self},
@@ -304,7 +304,8 @@ fn view_configuration_summary(
 }
 
 /// 구성 타입을 나타내는 아이콘 뱃지. 배경 없이 아이콘 자체에 타입별 색을 입혀
-/// (APP=primary, SH=success, Node=danger, Kotlin=#7F52FF, Multi=secondary) 한눈에 구분되게 한다.
+/// (APP=primary, SH=success, Node=danger, Kotlin=#7F52FF, Spring Boot=#6DB33F,
+/// Multi=secondary) 한눈에 구분되게 한다.
 fn type_icon(
     config_type: ConfigurationType,
     is_selected: bool,
@@ -318,6 +319,7 @@ fn type_icon(
         ConfigurationType::ShellScript => ICON_TYPE_SHELL,
         ConfigurationType::Node => ICON_TYPE_NODE,
         ConfigurationType::Kotlin => ICON_TYPE_KOTLIN,
+        ConfigurationType::SpringBoot => ICON_TYPE_SPRING_BOOT,
         ConfigurationType::Compound => ICON_TYPE_COMPOUND,
     };
 
@@ -333,6 +335,8 @@ fn type_icon(
                     ConfigurationType::Node => palette.danger.base.color,
                     // Kotlin 브랜드 퍼플 (#7F52FF) — 팔레트 4슬롯이 모두 사용 중이라 고정색 사용
                     ConfigurationType::Kotlin => Color::from_rgb8(0x7F, 0x52, 0xFF),
+                    // Spring Boot 브랜드 그린 (#6DB33F) — 팔레트 슬롯이 모두 사용 중이라 Kotlin처럼 고정색 사용
+                    ConfigurationType::SpringBoot => Color::from_rgb8(0x6D, 0xB3, 0x3F),
                     ConfigurationType::Compound => palette.secondary.base.color,
                 };
 

@@ -14,7 +14,8 @@
 
 use super::protocol::{INVALID_PARAMS, JsonRpcError, METHOD_NOT_FOUND};
 use crate::models::{
-    ConfigTypeData, ConfigurationType, ExecuteMode, KotlinLaunchMode, compile_search_regex,
+    ConfigTypeData, ConfigurationType, ExecuteMode, KotlinLaunchMode, SpringBootBuildTool,
+    compile_search_regex, is_valid_spring_module, is_valid_spring_profiles,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -170,7 +171,7 @@ static TOOLS: &[ToolSpec] = &[
         name: "get_configuration",
         title: "Get a run configuration",
         description: "Full detail of one configuration, including the type-specific fields \
-                      (command, script, node/kotlin settings, compound members).",
+                      (command, script, node/kotlin/spring boot settings, compound members).",
         tier: McpPermission::ReadOnly,
         schema: || {
             json!({
@@ -563,7 +564,7 @@ fn request_id_schema(description: &str) -> Value {
     })
 }
 
-/// 타입별 데이터 스키마. 필드를 타입마다 나열하지 않는 것은 의도적이다 — 다섯 타입의 중첩
+/// 타입별 데이터 스키마. 필드를 타입마다 나열하지 않는 것은 의도적이다 — 여섯 타입의 중첩
 /// 열거형을 손으로 옮긴 스키마는 모델이 늘어날 때 조용히 뒤처지고, 그 순간 유효한 구성이
 /// 거절된다. 대신 `type` 목록만 모델(`ConfigurationType::ALL`)에서 끌어오고, 나머지는
 /// `get_configuration`이 돌려준 형태를 그대로 쓰라고 설명에 싣는다.
@@ -600,7 +601,8 @@ fn type_data_schema() -> Value {
              types into it, so a stored value can be longer than the limit and copying that \
              type_data back is refused even when you changed nothing in it — leave type_data out \
              when you are not changing it, and a value that is already too long has to be \
-             shortened in the app. The limits bind what you send, not what you receive: responses \
+             shortened in the app. A SpringBoot configuration's profiles allow letters, digits \
+             and _ . , - only. The limits bind what you send, not what you receive: responses \
              carry stored values as they are, so a configuration holding an over-limit value \
              returns it on every successful call including ones that do not touch it. \
              list_configurations is the channel that carries no values at all."
@@ -1101,6 +1103,36 @@ fn require_bounded_type_data(type_data: &ConfigTypeData) -> Result<(), JsonRpcEr
                 MAX_CONFIG_TEXT_CHARS,
             )
         }
+        ConfigTypeData::SpringBoot {
+            build_tool,
+            module,
+            jar_path,
+            profiles,
+            jdk_path,
+            vm_options,
+            program_arguments,
+        } => {
+            require_length("module", module, MAX_NAME_CHARS)?;
+            require_module_charset(module)?;
+            require_length("jar_path", jar_path, MAX_PATH_CHARS)?;
+            require_length("profiles", profiles, MAX_NAME_CHARS)?;
+            require_profiles_charset(profiles)?;
+            require_optional_length("jdk_path", jdk_path.as_deref(), MAX_PATH_CHARS)?;
+            require_length("vm_options", vm_options, MAX_CONFIG_TEXT_CHARS)?;
+            require_length(
+                "program_arguments",
+                program_arguments,
+                MAX_CONFIG_TEXT_CHARS,
+            )?;
+            // Jar는 Kotlin처럼 텍스트를 셸에 그대로 넘기지만, Gradle/Maven은 wrapper 옵션 값 하나에
+            // 끼워 넣어 개행·제어문자를 executor가 실행 시점에 거절한다(Auto도 그쪽으로 풀릴 수
+            // 있다). 저장은 되는데 실행만 실패하지 않도록 같은 규칙을 경계에서 미리 적용한다.
+            if *build_tool != SpringBootBuildTool::Jar {
+                require_no_control_chars("vm_options", vm_options)?;
+                require_no_control_chars("program_arguments", program_arguments)?;
+            }
+            Ok(())
+        }
         ConfigTypeData::Compound { members, workspace } => {
             if members.len() > MAX_COMPOUND_MEMBERS {
                 return Err(invalid_params(format!(
@@ -1110,6 +1142,44 @@ fn require_bounded_type_data(type_data: &ConfigTypeData) -> Result<(), JsonRpcEr
             require_optional_length("workspace", workspace.as_deref(), MAX_NAME_CHARS)
         }
     }
+}
+
+/// profiles는 실행 시 셸 명령의 옵션 값에 그대로 끼워지므로 executor와 같은 화이트리스트
+/// (`is_valid_spring_profiles`)를 저장 경계에서도 건다. GUI가 앞뒤 공백이 붙은 값을 저장할 수
+/// 있어 `trim`한 값을 검사한다(조회 응답을 그대로 되돌려 보내는 갱신이 거절되지 않도록).
+fn require_profiles_charset(profiles: &str) -> Result<(), JsonRpcError> {
+    if is_valid_spring_profiles(profiles.trim()) {
+        Ok(())
+    } else {
+        Err(invalid_params(
+            "profiles may only contain letters, digits, '_', '.', ',' and '-'".to_string(),
+        ))
+    }
+}
+
+/// module은 실행 시 Gradle 태스크 이름(`:app:bootRun`)이나 Maven `-pl` 값에 그대로 끼워지므로
+/// executor와 같은 규칙(`is_valid_spring_module`)을 저장 경계에서도 건다. profiles와 같은 이유로 `trim`한 값을
+/// 검사한다.
+fn require_module_charset(module: &str) -> Result<(), JsonRpcError> {
+    if is_valid_spring_module(module.trim()) {
+        Ok(())
+    } else {
+        Err(invalid_params(
+            "module may only contain letters, digits, '_', '.', '-', ':' and '/' \
+             (no '::', '//', '..', or a leading '/' or '-')"
+                .to_string(),
+        ))
+    }
+}
+
+/// 탭을 제외한 제어문자(개행 포함)를 거절한다.
+fn require_no_control_chars(key: &str, value: &str) -> Result<(), JsonRpcError> {
+    if value.chars().any(|c| c.is_control() && c != '\t') {
+        return Err(invalid_params(format!(
+            "{key} must not contain control characters or line breaks unless build_tool is Jar"
+        )));
+    }
+    Ok(())
 }
 
 /// 비어 있음이 유효한 상태인 필드의 길이 상한. `require_bounded`와 갈리는 이유는 `None`과 빈
@@ -1982,6 +2052,18 @@ mod tests {
                     },
                 }),
             ),
+            (
+                "jarPath",
+                json!({
+                    "type": "SpringBoot",
+                    "build_tool": "Jar",
+                    "jar_path": "",
+                    "profiles": "",
+                    "vm_options": "",
+                    "program_arguments": "",
+                    "jarPath": "/tmp/burnin.jar",
+                }),
+            ),
         ];
 
         for (typo, type_data) in cases {
@@ -2498,6 +2580,66 @@ mod tests {
                 }),
             ),
             (
+                "spring_boot jar_path",
+                json!({
+                    "type": "SpringBoot",
+                    "build_tool": "Gradle",
+                    "jar_path": path,
+                    "profiles": "",
+                    "jdk_path": null,
+                    "vm_options": "",
+                    "program_arguments": "",
+                }),
+            ),
+            (
+                "spring_boot profiles",
+                json!({
+                    "type": "SpringBoot",
+                    "build_tool": "Gradle",
+                    "jar_path": "",
+                    "profiles": "a".repeat(MAX_NAME_CHARS + 1),
+                    "jdk_path": null,
+                    "vm_options": "",
+                    "program_arguments": "",
+                }),
+            ),
+            (
+                "spring_boot jdk_path",
+                json!({
+                    "type": "SpringBoot",
+                    "build_tool": "Gradle",
+                    "jar_path": "",
+                    "profiles": "",
+                    "jdk_path": path,
+                    "vm_options": "",
+                    "program_arguments": "",
+                }),
+            ),
+            (
+                "spring_boot vm_options",
+                json!({
+                    "type": "SpringBoot",
+                    "build_tool": "Gradle",
+                    "jar_path": "",
+                    "profiles": "",
+                    "jdk_path": null,
+                    "vm_options": text,
+                    "program_arguments": "",
+                }),
+            ),
+            (
+                "spring_boot program_arguments",
+                json!({
+                    "type": "SpringBoot",
+                    "build_tool": "Gradle",
+                    "jar_path": "",
+                    "profiles": "",
+                    "jdk_path": null,
+                    "vm_options": "",
+                    "program_arguments": text,
+                }),
+            ),
+            (
                 "workspace",
                 json!({ "type": "Compound", "workspace": name }),
             ),
@@ -2517,6 +2659,187 @@ mod tests {
                 "update {label}"
             );
         }
+    }
+
+    #[test]
+    fn spring_boot_profiles_outside_the_whitelist_are_rejected() {
+        for bad in ["dev prod", "dev;rm", "a'b", "dev\nprod", "$(x)", "프로필"] {
+            let mut args = create_args();
+            args["type_data"] = json!({
+                "type": "SpringBoot",
+                "build_tool": "Maven",
+                "jar_path": "",
+                "profiles": bad,
+                "vm_options": "",
+                "program_arguments": "",
+            });
+            let err = parse_call("create_configuration", &args)
+                .expect_err("화이트리스트 밖 profiles는 거절");
+            assert_eq!(err.code, INVALID_PARAMS, "{bad:?}");
+            assert!(err.message.contains("profiles"), "{bad:?}: {}", err.message);
+        }
+    }
+
+    #[test]
+    fn spring_boot_module_outside_the_charset_is_rejected() {
+        for bad in [
+            ":app;rm",
+            ":app bootRun",
+            ":a::b",
+            "'app'",
+            "$(x)",
+            "앱",
+            "../app",
+            "/abs/app",
+            "app//api",
+            "-x",
+        ] {
+            let mut args = create_args();
+            args["type_data"] = json!({
+                "type": "SpringBoot",
+                "build_tool": "Gradle",
+                "module": bad,
+                "jar_path": "",
+                "profiles": "",
+                "vm_options": "",
+                "program_arguments": "",
+            });
+            let err =
+                parse_call("create_configuration", &args).expect_err("문자셋 밖 module은 거절");
+            assert_eq!(err.code, INVALID_PARAMS, "{bad:?}");
+            assert!(err.message.contains("module"), "{bad:?}: {}", err.message);
+        }
+    }
+
+    #[test]
+    fn spring_boot_module_project_paths_and_empty_are_accepted() {
+        for ok in [
+            "",
+            ":app",
+            " :services:api ",
+            "app",
+            ":my-app_2.x",
+            "app/pspteller",
+        ] {
+            let mut args = create_args();
+            args["type_data"] = json!({
+                "type": "SpringBoot",
+                "build_tool": "Gradle",
+                "module": ok,
+                "jar_path": "",
+                "profiles": "",
+                "vm_options": "",
+                "program_arguments": "",
+            });
+            assert!(parse_call("create_configuration", &args).is_ok(), "{ok:?}");
+        }
+    }
+
+    #[test]
+    fn spring_boot_still_accepts_the_legacy_gradle_module_key() {
+        let mut args = create_args();
+        args["type_data"] = json!({
+            "type": "SpringBoot",
+            "build_tool": "Gradle",
+            "gradle_module": ":app",
+            "jar_path": "",
+            "profiles": "",
+            "vm_options": "",
+            "program_arguments": "",
+        });
+
+        assert!(parse_call("create_configuration", &args).is_ok());
+    }
+
+    #[test]
+    fn spring_boot_module_over_the_limit_fails_on_length() {
+        let mut args = create_args();
+        args["type_data"] = json!({
+            "type": "SpringBoot",
+            "build_tool": "Gradle",
+            "module": "a".repeat(MAX_NAME_CHARS + 1),
+            "jar_path": "",
+            "profiles": "",
+            "vm_options": "",
+            "program_arguments": "",
+        });
+
+        let err = parse_call("create_configuration", &args).expect_err("길이 초과는 거절");
+
+        assert_eq!(err.code, INVALID_PARAMS);
+        assert!(err.message.contains("module"), "{}", err.message);
+        assert!(err.message.contains("at most"), "{}", err.message);
+    }
+
+    #[test]
+    fn spring_boot_profiles_within_the_whitelist_and_empty_are_accepted() {
+        for ok in ["", "dev", "dev ", " dev,local-1 ", "a_b.c"] {
+            let mut args = create_args();
+            args["type_data"] = json!({
+                "type": "SpringBoot",
+                "build_tool": "Auto",
+                "jar_path": "",
+                "profiles": ok,
+                "vm_options": "",
+                "program_arguments": "",
+            });
+            assert!(parse_call("create_configuration", &args).is_ok(), "{ok:?}");
+        }
+    }
+
+    #[test]
+    fn spring_boot_profiles_over_the_limit_fail_on_length() {
+        let mut args = create_args();
+        args["type_data"] = json!({
+            "type": "SpringBoot",
+            "build_tool": "Gradle",
+            "jar_path": "",
+            "profiles": "a".repeat(MAX_NAME_CHARS + 1),
+            "vm_options": "",
+            "program_arguments": "",
+        });
+        let err = parse_call("create_configuration", &args).expect_err("길이 초과");
+        assert!(err.message.contains("at most"), "{}", err.message);
+    }
+
+    #[test]
+    fn spring_boot_control_characters_are_rejected_unless_the_build_tool_is_jar() {
+        for field in ["vm_options", "program_arguments"] {
+            for (tool, accepted) in [
+                ("Auto", false),
+                ("Gradle", false),
+                ("Maven", false),
+                ("Jar", true),
+            ] {
+                let mut type_data = json!({
+                    "type": "SpringBoot",
+                    "build_tool": tool,
+                    "jar_path": "",
+                    "profiles": "",
+                    "vm_options": "",
+                    "program_arguments": "",
+                });
+                type_data[field] = json!("-Xmx1g\n-Dx=1");
+                let mut args = create_args();
+                args["type_data"] = type_data;
+                let result = parse_call("create_configuration", &args);
+                assert_eq!(result.is_ok(), accepted, "{field} {tool}");
+            }
+        }
+    }
+
+    #[test]
+    fn spring_boot_tabs_are_allowed_in_free_text() {
+        let mut args = create_args();
+        args["type_data"] = json!({
+            "type": "SpringBoot",
+            "build_tool": "Gradle",
+            "jar_path": "",
+            "profiles": "",
+            "vm_options": "-Xmx1g\t-Xms1g",
+            "program_arguments": "",
+        });
+        assert!(parse_call("create_configuration", &args).is_ok());
     }
 
     #[test]

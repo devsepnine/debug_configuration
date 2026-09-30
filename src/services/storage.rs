@@ -144,15 +144,20 @@ pub fn save_settings(settings: &AppSettings) {
 /// 현재 구성 파일 스키마 버전. 디스크 포맷이 호환 불가하게 바뀔 때마다 +1 하고
 /// `migrate_config_file`에 변환 단계를 추가한다.
 ///
-/// `ConfigTypeData`와 그 안의 `ExecuteMode`·`KotlinLaunchMode`에 필드를 **더하는** 변경도
-/// 여기서 +1 해야 한다. 세 열거형은
+/// `ConfigTypeData`와 그 안의 `ExecuteMode`·`KotlinLaunchMode`에 필드나 변형(variant)을
+/// **더하는** 변경도 여기서 +1 해야 한다. 세 열거형은
 /// `deny_unknown_fields`이므로(사유는 `ConfigTypeData`의 doc) 새 필드가 든 파일을 옛 앱이
 /// 읽지 못하는데,
 /// 버전을 올리지 않으면 그 실패가 `migrate_config_file`의 "이 앱이 지원하는 버전보다 새 파일"
 /// 게이트를 통과해 원인 없는 `Deserialization error`로 나타난다 — 사용자에게는 구성이 전부
 /// 사라진 것으로 보이고, 화면에는 무엇을 해야 하는지가 없다. 최상위 필드는 이 제약을 받지
 /// 않는다(`parse_config_file` 참조).
-const CURRENT_CONFIG_VERSION: u32 = 1;
+///
+/// 2: `ConfigTypeData::SpringBoot` 추가. 저장은 항상 현재 버전으로 쓰므로 Spring Boot 구성을
+/// 만들지 않아도 이후 저장된 파일은 옛 앱에서 "newer version" 안내로 열린다.
+/// `SpringBoot`의 `module`은 v0.8.0 출시 전에 같은 버전 2 안에서 더했다 — 버전 2 파일을
+/// 쓴 배포본이 없어 올릴 필요가 없었다. 출시 이후에 필드를 더하면 이 예외는 적용되지 않는다.
+const CURRENT_CONFIG_VERSION: u32 = 2;
 
 /// 디스크에 저장되는 구성 파일 형식 (버전 envelope).
 ///
@@ -446,6 +451,46 @@ mod tests {
             err.contains("newer"),
             "expected a version error, got: {err}"
         );
+    }
+
+    #[test]
+    fn rejects_the_version_right_above_current() {
+        let next = format!(
+            r#"{{"version":{},"configurations":[]}}"#,
+            CURRENT_CONFIG_VERSION + 1
+        );
+        let err = parse_config_file(&next).unwrap_err();
+        assert!(
+            err.contains("newer"),
+            "expected a version error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn loads_version_2_file_with_a_spring_boot_configuration() {
+        let v2 = r#"{"version":2,"configurations":[
+          {"id":"00000000-0000-0000-0000-000000000002","name":"Boot",
+           "working_directory":"/tmp/app","environment_variables":{},
+           "type_data":{"type":"SpringBoot","build_tool":"Gradle","jar_path":"",
+             "profiles":"dev","jdk_path":null,"vm_options":"","program_arguments":""}}
+        ]}"#;
+        let parsed = parse_config_file(v2).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(
+            parsed[0].config_type(),
+            crate::models::ConfigurationType::SpringBoot
+        );
+    }
+
+    #[test]
+    fn version_1_file_still_loads() {
+        let v1 = r#"{"version":1,"configurations":[
+          {"id":"00000000-0000-0000-0000-000000000003","name":"Old",
+           "working_directory":".","environment_variables":{},
+           "type_data":{"type":"Application","command":"echo","arguments":""}}
+        ]}"#;
+        let parsed = parse_config_file(v1).unwrap();
+        assert_eq!(parsed[0].name, "Old");
     }
 
     #[test]

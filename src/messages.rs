@@ -1,8 +1,9 @@
 use crate::models::{
     ConfigurationType, ExecuteModeType, KotlinLaunchModeType, NodeCommand, PackageManager,
-    RunConfiguration, RunFailure, StdinWriteError,
+    RunConfiguration, RunFailure, SpringBootBuildTool, StdinWriteError,
 };
 use crate::services::{McpEvent, McpPermission, McpRequest};
+use crate::utils::SpringModuleScan;
 use crate::widgets::pane_grid;
 use iced::window;
 use std::path::PathBuf;
@@ -149,6 +150,38 @@ pub enum Message {
     BrowseKotlinJdk,
     /// JDK 수동 선택 완료
     KotlinJdkPathSelected(Result<String, String>),
+    // Spring Boot 구성 편집 메시지
+    /// 실행 도구 선택 (Auto / Gradle / Maven / JAR)
+    SpringBootBuildToolChanged(SpringBootBuildTool),
+    /// 실행 모듈 변경 (직접 입력·드롭다운 선택 공용)
+    SpringBootModuleChanged(String),
+    /// `@SpringBootApplication` 모듈 감지 시작
+    DetectSpringBootModules,
+    /// 모듈 감지 완료 (구성 id, 스캔한 작업 디렉터리, 요청 시점의 빌드 도구, 결과 또는 실패 사유)
+    SpringBootModulesScanned(
+        Uuid,
+        String,
+        SpringBootBuildTool,
+        Result<SpringModuleScan, String>,
+    ),
+    /// JAR 파일 경로 변경
+    SpringBootJarPathChanged(String),
+    /// JAR 파일 선택 다이얼로그 열기
+    BrowseSpringBootJarPath,
+    /// JAR 파일 선택 완료
+    SpringBootJarPathSelected(Result<String, String>),
+    /// 활성 프로파일 변경
+    SpringBootProfilesChanged(String),
+    /// VM options 변경
+    SpringBootVmOptionsChanged(String),
+    /// 프로그램 인자 변경
+    SpringBootProgramArgumentsChanged(String),
+    /// JDK 선택 변경 (레이블 → 경로 해석)
+    SpringBootJdkChanged(String),
+    /// JDK 수동 선택 다이얼로그 열기
+    BrowseSpringBootJdk,
+    /// JDK 수동 선택 완료
+    SpringBootJdkPathSelected(Result<String, String>),
     /// JDK 감지 완료
     JdksDetected(Vec<(String, String)>),
 

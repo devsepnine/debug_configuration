@@ -1,7 +1,7 @@
 use crate::messages::Message;
 use crate::models::{
     ConfigTypeData, ExecuteMode, KotlinLaunchMode, NodeCommand, OutputEvent, PackageManager,
-    RunConfiguration, RunFailure,
+    RunConfiguration, RunFailure, SpringBootBuildTool,
 };
 use iced::stream;
 use std::collections::{HashMap, HashSet};
@@ -549,7 +549,17 @@ pub fn run_configuration_stream(
             // 종료 보장 가드: 정상 경로의 끝에서 disarm한다.
             let mut completion = CompletionGuard::new(output.clone(), session_id);
 
-            let (command_str, extra_env) = build_command(&config);
+            // 명령을 만들 수 없으면(빌드 도구 미발견, 잘못된 profiles 등) 배너 없이 사유만 보고한다.
+            let (command_str, extra_env) = match build_command(&config) {
+                Ok(built) => built,
+                Err(reason) => {
+                    send_run_result(&mut output, session_id, Err(RunFailure::Failed(reason))).await;
+                    completion.disarm();
+                    return;
+                }
+            };
+            // 병합은 여기서 정확히 한 번만 한다(멱등이 아니다) — 배너와 두 스폰 경로가 같은 값을 본다.
+            let extra_env = effective_extra_env(&config.environment_variables, &extra_env);
             send_command_info(
                 &mut output,
                 session_id,
@@ -648,13 +658,17 @@ pub fn prewarm_shell_detection() {
 ///
 /// 환경변수는 셸 명령 문자열에 보간하지 않고 `Command::env`로 전달한다. 이렇게 하면
 /// 따옴표 이스케이프 누락이나 셸 메타문자 재해석으로 인한 명령 주입을 원천 차단할 수 있다.
-fn build_command(config: &RunConfiguration) -> (String, Vec<(String, String)>) {
+///
+/// Err는 명령 자체를 만들 수 없을 때(Spring Boot: Auto 감지 실패·없는 작업 디렉터리, 잘못된
+/// profiles, 빈 JAR 경로, wrapper 옵션 값에 들어가는 줄바꿈/제어문자)이며, 호출부는 배너 없이
+/// 실패로 보고한다.
+fn build_command(config: &RunConfiguration) -> Result<(String, Vec<(String, String)>), String> {
     match &config.type_data {
         ConfigTypeData::Application { command, arguments } => {
-            (build_application_command(command, arguments), Vec::new())
+            Ok((build_application_command(command, arguments), Vec::new()))
         }
         ConfigTypeData::ShellScript { execute_mode } => {
-            (build_shell_script_command(execute_mode), Vec::new())
+            Ok((build_shell_script_command(execute_mode), Vec::new()))
         }
         ConfigTypeData::Node {
             project_directory: _,
@@ -679,7 +693,7 @@ fn build_command(config: &RunConfiguration) -> (String, Vec<(String, String)>) {
             } else {
                 vec![(String::from("NODE_OPTIONS"), node_options.clone())]
             };
-            (command_str, extra_env)
+            Ok((command_str, extra_env))
         }
         ConfigTypeData::Kotlin {
             jdk_path,
@@ -694,11 +708,32 @@ fn build_command(config: &RunConfiguration) -> (String, Vec<(String, String)>) {
                 program_arguments,
             });
             // VM options는 명령줄에 직접 노출하므로 별도 환경변수 불필요.
-            (command_str, Vec::new())
+            Ok((command_str, Vec::new()))
         }
+        ConfigTypeData::SpringBoot {
+            build_tool,
+            module,
+            jar_path,
+            profiles,
+            jdk_path,
+            vm_options,
+            program_arguments,
+        } => build_spring_boot_command(
+            Shell::native(),
+            &SpringBootCommandParts {
+                build_tool: *build_tool,
+                module,
+                jar_path,
+                profiles,
+                jdk_path: jdk_path.as_ref(),
+                vm_options,
+                program_arguments,
+                working_directory: &config.working_directory,
+            },
+        ),
         // Compound 구성은 셸 명령이 없다 — app.rs가 멤버별로 펼쳐 실행하므로
         // 이 스트림 경로에는 도달하지 않는다 (방어적으로 빈 명령 반환).
-        ConfigTypeData::Compound { .. } => (String::new(), Vec::new()),
+        ConfigTypeData::Compound { .. } => Ok((String::new(), Vec::new())),
     }
 }
 
@@ -726,7 +761,8 @@ fn windows_powershell_exe() -> &'static str {
 
 /// Windows PowerShell 5.x는 `&&`를 지원하지 않으므로 `;`(순차 실행)로 대체한다.
 /// 단락 평가(앞 명령 실패 시 중단)는 보존되지 않는 최선의 폴백이며, pwsh 7이 감지되면
-/// 이 변환은 호출되지 않는다.
+/// 이 변환은 호출되지 않는다. 한계: 명령 문자열 전체에 대한 단순 치환이라 따옴표 안의 ` && `
+/// (예: Gradle `--args`)도 바뀔 수 있다 — 모든 타입에 해당하는 기존 동작이라 그대로 둔다.
 #[cfg(windows)]
 fn rewrite_chaining_for_legacy_powershell(command_str: &str) -> String {
     command_str.replace(" && ", "; ")
@@ -775,8 +811,7 @@ fn create_process_command(
 
     cmd.current_dir(&config.working_directory);
     // 환경변수는 셸 문자열이 아닌 프로세스 환경으로 직접 주입 (이스케이프/주입 방지).
-    cmd.envs(config.environment_variables.iter());
-    cmd.envs(extra_env.iter().map(|(k, v)| (k, v)));
+    cmd.envs(resolved_process_env(config, extra_env));
     // stdin: Windows는 pipe(입력바 지원), unix pipe 경로는 폴백 전용이라 null(출력 전용).
     #[cfg(windows)]
     cmd.stdin(Stdio::piped());
@@ -823,10 +858,7 @@ fn create_pty_command(
     cmd.args(["-l", "-c", command_str]);
     cmd.cwd(&config.working_directory);
     cmd.env("TERM", "xterm-256color");
-    for (key, value) in &config.environment_variables {
-        cmd.env(key, value);
-    }
-    for (key, value) in extra_env {
+    for (key, value) in resolved_process_env(config, extra_env) {
         cmd.env(key, value);
     }
     cmd
@@ -856,10 +888,7 @@ fn create_pty_command(
         &format!("[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; {adapted}"),
     ]);
     cmd.cwd(&config.working_directory);
-    for (key, value) in &config.environment_variables {
-        cmd.env(key, value);
-    }
-    for (key, value) in extra_env {
+    for (key, value) in resolved_process_env(config, extra_env) {
         cmd.env(key, value);
     }
     cmd
@@ -2393,12 +2422,10 @@ struct KotlinCommandParts<'a> {
     program_arguments: &'a str,
 }
 
-/// Kotlin 구성의 셸 명령 문자열 생성 (`java` 경유).
-///
-/// MainClass: `java [vm_options] -cp "<classpath>" <main_class> [program_arguments]`
-/// Jar:       `java [vm_options] -jar <jar_path> [program_arguments]`
-fn build_kotlin_command(parts: KotlinCommandParts<'_>) -> String {
-    let java = resolve_java_executable(parts.jdk_path);
+/// `java [vm_options]` 접두부 — Kotlin과 Spring Boot(JAR)가 공유한다.
+/// VM options(-Xmx 등)는 main class / -jar 앞에 위치해야 한다.
+fn java_command_prefix(jdk_path: Option<&String>, vm_options: &str) -> Vec<String> {
+    let java = resolve_java_executable(jdk_path);
 
     // Windows PowerShell에서는 공백이 포함된 경로를 & "경로" 형태로 실행해야 함
     #[cfg(target_os = "windows")]
@@ -2412,11 +2439,18 @@ fn build_kotlin_command(parts: KotlinCommandParts<'_>) -> String {
     let java_cmd = java;
 
     let mut cmd_parts = vec![java_cmd];
-
-    // VM options(-Xmx 등)는 main class / -jar 앞에 위치
-    if !parts.vm_options.trim().is_empty() {
-        cmd_parts.push(parts.vm_options.trim().to_string());
+    if !vm_options.trim().is_empty() {
+        cmd_parts.push(vm_options.trim().to_string());
     }
+    cmd_parts
+}
+
+/// Kotlin 구성의 셸 명령 문자열 생성 (`java` 경유).
+///
+/// MainClass: `java [vm_options] -cp "<classpath>" <main_class> [program_arguments]`
+/// Jar:       `java [vm_options] -jar <jar_path> [program_arguments]`
+fn build_kotlin_command(parts: KotlinCommandParts<'_>) -> String {
+    let mut cmd_parts = java_command_prefix(parts.jdk_path, parts.vm_options);
 
     match parts.launch_mode {
         KotlinLaunchMode::MainClass {
@@ -2481,6 +2515,453 @@ fn resolve_java_executable(jdk_path: Option<&String>) -> String {
     }
 
     quote_if_needed(trimmed)
+}
+
+// ---- Spring Boot ----------------------------------------------------------------
+
+/// 인용 방언. 실행 플랫폼과 무관하게 순수 함수로 테스트할 수 있도록 인자로 받는다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Shell {
+    Sh,
+    PowerShell,
+}
+
+impl Shell {
+    fn native() -> Self {
+        if cfg!(windows) {
+            Self::PowerShell
+        } else {
+            Self::Sh
+        }
+    }
+}
+
+/// 인자 하나를 셸 리터럴로 인용한다. 내부 `'`는 방언별로 이스케이프한다.
+/// PowerShell은 곡선 따옴표도 작은따옴표로 취급하므로 함께 겹쳐 쓴다.
+/// `-Dkey=value` 형태는 PowerShell 5.1에서 `.`으로 쪼개지므로 인자 **전체**를 넘겨 인용한다.
+fn quote_arg(shell: Shell, arg: &str) -> String {
+    match shell {
+        Shell::Sh => format!("'{}'", arg.replace('\'', "'\\''")),
+        Shell::PowerShell => {
+            let mut quoted = String::with_capacity(arg.len() + 2);
+            quoted.push('\'');
+            for c in arg.chars() {
+                quoted.push(c);
+                if matches!(c, '\'' | '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}') {
+                    quoted.push(c);
+                }
+            }
+            quoted.push('\'');
+            quoted
+        }
+    }
+}
+
+/// wrapper 옵션 값에 끼워 넣는 사용자 입력의 줄바꿈·제어문자를 거절한다(탭은 공백이라 허용).
+/// 인용으로는 옵션 경계가 깨지는 것을 막지 못하는 경로(`--args`, `-Dspring-boot.run.*`)용이다.
+fn reject_control_chars(field: &str, value: &str) -> Result<(), String> {
+    if value.chars().any(|c| c.is_control() && c != '\t') {
+        return Err(format!(
+            "{field} must not contain newlines or control characters"
+        ));
+    }
+    Ok(())
+}
+
+/// profiles는 셸 인용 없이 `--spring.profiles.active=` 등에 그대로 붙으므로 화이트리스트로 제한한다.
+fn validate_profiles(profiles: &str) -> Result<(), String> {
+    if crate::models::is_valid_spring_profiles(profiles) {
+        Ok(())
+    } else {
+        Err(format!(
+            "Invalid profiles '{profiles}': only letters, digits, '_', '.', ',' and '-' are allowed"
+        ))
+    }
+}
+
+/// wrapper를 상위 몇 단계까지 찾을지 (멀티모듈 서브디렉터리에서 실행하는 경우 대응).
+const SPRING_WRAPPER_ANCESTOR_DEPTH: usize = 3;
+
+struct SpringBootCommandParts<'a> {
+    build_tool: SpringBootBuildTool,
+    module: &'a str,
+    jar_path: &'a str,
+    profiles: &'a str,
+    jdk_path: Option<&'a String>,
+    vm_options: &'a str,
+    program_arguments: &'a str,
+    working_directory: &'a str,
+}
+
+/// 모듈 입력을 `trim`해 검증한다. 값이 태스크 이름·`-pl` 옵션 값에 그대로 끼워지므로 MCP와
+/// 같은 규칙(`is_valid_spring_module`)을 실행 직전에 다시 건다.
+fn checked_spring_module(module: &str) -> Result<&str, String> {
+    let module = module.trim();
+    if crate::models::is_valid_spring_module(module) {
+        Ok(module)
+    } else {
+        Err(format!(
+            "Module '{module}' may only contain letters, digits, '_', '.', '-', ':' and '/' \
+             (no '::', '//', '..', or a leading '/' or '-')"
+        ))
+    }
+}
+
+/// Gradle `bootRun` 태스크 경로. 모듈을 비우면 작업 디렉터리 프로젝트의 `bootRun`이고,
+/// 지정하면 `:app:bootRun`처럼 그 프로젝트만 대상으로 한다 — 멀티모듈 루트의 한정자 없는
+/// `bootRun`은 main class가 없는 모듈까지 실행하려다 실패한다. 앞뒤 `:`를 정규화하고
+/// 디렉터리 형태(`app/api`)로 준 값은 프로젝트 경로(`:app:api`)로 바꾼다.
+fn gradle_boot_run_task(module: &str) -> Result<String, String> {
+    let module = checked_spring_module(module)?.replace('/', ":");
+    let module = module.trim_matches(':');
+    Ok(if module.is_empty() {
+        String::from("bootRun")
+    } else {
+        format!(":{module}:bootRun")
+    })
+}
+
+fn spring_wrapper_names(shell: Shell, stem: &str) -> Vec<String> {
+    match shell {
+        Shell::Sh => vec![stem.to_string()],
+        // 확장자 없는 파일은 셸 스크립트라 PowerShell에서 실행할 수 없다. 후보에 넣으면
+        // 실행 불가능한 파일이 상위 디렉터리의 실제 `.bat`/`.cmd`를 가릴 수 있다.
+        Shell::PowerShell => vec![format!("{stem}.bat"), format!("{stem}.cmd")],
+    }
+}
+
+/// 존재하는 디렉터리의 절대 경로. 빈 값이나 없는 경로는 None — 빈 문자열에 `join`하면
+/// 프로세스 cwd를 탐색하게 되므로 wrapper 탐색이 엉뚱한 곳을 보지 않게 여기서 막는다.
+fn absolute_dir(dir: &str) -> Option<std::path::PathBuf> {
+    if dir.trim().is_empty() {
+        return None;
+    }
+    std::path::absolute(dir).ok().filter(|d| d.is_dir())
+}
+
+/// 작업 디렉터리와 상위 `SPRING_WRAPPER_ANCESTOR_DEPTH`단계에서 wrapper 파일을 찾는다(절대 경로).
+/// Windows 후보는 `.bat`/`.cmd`만 본다(사유는 `spring_wrapper_names`).
+fn find_spring_wrapper(shell: Shell, working_dir: &str, stem: &str) -> Option<std::path::PathBuf> {
+    let start = absolute_dir(working_dir)?;
+    let names = spring_wrapper_names(shell, stem);
+    start
+        .ancestors()
+        .take(SPRING_WRAPPER_ANCESTOR_DEPTH + 1)
+        .find_map(|dir| {
+            names
+                .iter()
+                .map(|name| dir.join(name))
+                .find(|candidate| candidate.is_file())
+        })
+}
+
+/// wrapper 호출 문자열. 실행 비트가 없을 수 있는 unix에서는 `sh <wrapper>`로 폴백한다.
+/// Windows는 `& '<path>'` 호출 연산자를 앞에 붙인다.
+fn wrapper_invocation(shell: Shell, wrapper: &Path, executable: bool) -> String {
+    let quoted = quote_arg(shell, &wrapper.to_string_lossy());
+    match shell {
+        Shell::PowerShell => format!("& {quoted}"),
+        Shell::Sh if executable => quoted,
+        Shell::Sh => format!("sh {quoted}"),
+    }
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
+    }
+    #[cfg(not(unix))]
+    {
+        path.is_file()
+    }
+}
+
+/// wrapper가 있으면 그것을, 없으면 시스템 `gradle`/`mvn`을 호출하는 명령 접두부.
+fn spring_build_tool_invocation(
+    shell: Shell,
+    working_dir: &str,
+    wrapper_stem: &str,
+    system_command: &str,
+) -> String {
+    match find_spring_wrapper(shell, working_dir, wrapper_stem) {
+        Some(wrapper) => wrapper_invocation(shell, &wrapper, is_executable_file(&wrapper)),
+        None => system_command.to_string(),
+    }
+}
+
+/// 모듈 감지처럼 실행 전에 도구가 필요한 곳을 위해 `Auto`를 실제 도구로 푼다. 명시한 도구는
+/// 그대로 돌려주고, `Auto`는 실행 때와 같은 규칙으로 감지한다.
+pub fn resolve_spring_build_tool(
+    tool: SpringBootBuildTool,
+    working_directory: &str,
+) -> Result<SpringBootBuildTool, String> {
+    match tool {
+        SpringBootBuildTool::Auto => detect_spring_build_tool(working_directory),
+        explicit => Ok(explicit),
+    }
+}
+
+/// `Auto` 감지: 작업 디렉터리의 wrapper > 빌드 파일, 그다음 상위 디렉터리의 wrapper.
+/// 못 찾으면 조용히 폴백하지 않고 Err — 특히 JAR로는 절대 가지 않는다.
+fn detect_spring_build_tool(dir: &str) -> Result<SpringBootBuildTool, String> {
+    let Some(start) = absolute_dir(dir) else {
+        return Err(format!(
+            "Working directory does not exist or is not a directory: {dir}"
+        ));
+    };
+    let has = |base: &Path, names: &[&str]| names.iter().any(|n| base.join(n).is_file());
+    const GRADLEW: [&str; 2] = ["gradlew", "gradlew.bat"];
+    const MVNW: [&str; 2] = ["mvnw", "mvnw.cmd"];
+    const GRADLE_FILES: [&str; 4] = [
+        "build.gradle",
+        "build.gradle.kts",
+        "settings.gradle",
+        "settings.gradle.kts",
+    ];
+
+    if has(&start, &GRADLEW) {
+        return Ok(SpringBootBuildTool::Gradle);
+    }
+    if has(&start, &MVNW) {
+        return Ok(SpringBootBuildTool::Maven);
+    }
+    if has(&start, &GRADLE_FILES) {
+        return Ok(SpringBootBuildTool::Gradle);
+    }
+    if has(&start, &["pom.xml"]) {
+        return Ok(SpringBootBuildTool::Maven);
+    }
+    for ancestor in start
+        .ancestors()
+        .skip(1)
+        .take(SPRING_WRAPPER_ANCESTOR_DEPTH)
+    {
+        if has(ancestor, &GRADLEW) {
+            return Ok(SpringBootBuildTool::Gradle);
+        }
+        if has(ancestor, &MVNW) {
+            return Ok(SpringBootBuildTool::Maven);
+        }
+    }
+    Err(format!(
+        "Could not detect a Spring Boot build tool in {dir} \
+         (no gradlew/mvnw/build.gradle/pom.xml); choose Gradle, Maven or JAR explicitly"
+    ))
+}
+
+/// `jdk_path`에서 `JAVA_HOME`을 파생한다. Gradle/Maven은 `java` 명령이 아니라 `JAVA_HOME`으로 JDK를 고른다.
+/// - `java` 실행 파일 → 심볼릭 링크를 해석(canonicalize)한 뒤 `parent.parent`. 그 아래에 실제
+///   `bin/java`가 있을 때만 채택한다(`/opt/homebrew/bin/java` 같은 shim이 엉뚱한 홈을 만들지 않게).
+/// - 디렉터리: `<dir>/bin/java`가 있으면 `<dir>`, `<dir>/java`가 있으면 `<dir>`의 부모(bin 디렉터리 입력)
+/// - 상대 경로(리터럴 `java` 포함)나 그 외는 None — 설정하지 않고 환경의 JAVA_HOME에 맡긴다.
+fn derive_java_home(jdk_path: Option<&str>) -> Option<std::path::PathBuf> {
+    let trimmed = jdk_path?.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let path = Path::new(trimmed);
+    // 리터럴 "java"나 상대 경로는 parent.parent가 빈 경로가 되어 JAVA_HOME으로 새어 나간다.
+    if !path.is_absolute() {
+        return None;
+    }
+    let name = crate::utils::java_executable_name();
+    if path.is_dir() {
+        if path.join("bin").join(name).exists() {
+            return Some(path.to_path_buf());
+        }
+        if path.join(name).exists() {
+            return path.parent().map(Path::to_path_buf);
+        }
+        return None;
+    }
+    if path.is_file() {
+        let home = path.canonicalize().ok()?.parent()?.parent()?.to_path_buf();
+        return home.join("bin").join(name).exists().then_some(home);
+    }
+    None
+}
+
+/// Spring Boot 구성의 (명령 문자열, 추가 환경변수)를 만든다.
+///
+/// Gradle: `<gradlew> bootRun ['--args=…']` + `JAVA_TOOL_OPTIONS`(VM options), `JAVA_HOME`
+/// Maven:  `<mvnw> spring-boot:run ['-Dspring-boot.run.*=…']` + `JAVA_HOME`
+/// Jar:    `java [vm] -jar <jar> [--spring.profiles.active=…] [args]`
+///
+/// `program_arguments`/`vm_options` 처리는 경로별로 다르다.
+/// - Jar: 셸에 원문 그대로 전달한다(Kotlin/Application과 같은 신뢰 모델 — 사용자의 셸 입력).
+/// - Gradle/Maven: 옵션 값 하나(`--args=…`, `-Dspring-boot.run.*=…`)로 통째 인용해 끼우므로 셸
+///   메타문자는 리터럴이며, 줄바꿈·제어문자는 거절한다. Gradle의 vm_options만 환경변수로 가 검사하지 않는다.
+///
+/// 작업 디렉터리 검사는 여기서 하지 않는다: 명시적 Gradle/Maven/Jar는 배너 뒤 스폰 직전의
+/// `verify_working_directory`가 보고한다. `Auto`만 디렉터리 없이는 명령을 만들 수 없어 Err다.
+fn build_spring_boot_command(
+    shell: Shell,
+    parts: &SpringBootCommandParts<'_>,
+) -> Result<(String, Vec<(String, String)>), String> {
+    let profiles = parts.profiles.trim();
+    validate_profiles(profiles)?;
+    let vm_options = parts.vm_options.trim();
+    let program_arguments = parts.program_arguments.trim();
+
+    let build_tool = match parts.build_tool {
+        SpringBootBuildTool::Auto => detect_spring_build_tool(parts.working_directory)?,
+        explicit => explicit,
+    };
+
+    let mut extra_env = Vec::new();
+    if matches!(
+        build_tool,
+        SpringBootBuildTool::Gradle | SpringBootBuildTool::Maven
+    ) && let Some(home) = derive_java_home(parts.jdk_path.map(String::as_str))
+    {
+        extra_env.push((
+            String::from("JAVA_HOME"),
+            home.to_string_lossy().into_owned(),
+        ));
+    }
+
+    let command = match build_tool {
+        SpringBootBuildTool::Gradle => {
+            let mut cmd_parts = vec![
+                spring_build_tool_invocation(shell, parts.working_directory, "gradlew", "gradle"),
+                gradle_boot_run_task(parts.module)?,
+            ];
+            let mut args = Vec::new();
+            if !profiles.is_empty() {
+                args.push(format!("--spring.profiles.active={profiles}"));
+            }
+            if !program_arguments.is_empty() {
+                reject_control_chars("Program arguments", program_arguments)?;
+                args.push(program_arguments.to_string());
+            }
+            if !args.is_empty() {
+                cmd_parts.push(quote_arg(shell, &format!("--args={}", args.join(" "))));
+            }
+            if !vm_options.is_empty() {
+                // JAVA_TOOL_OPTIONS는 셸을 거치지 않고 환경변수로 전달되므로 인용이 필요 없다.
+                extra_env.push((String::from("JAVA_TOOL_OPTIONS"), vm_options.to_string()));
+            }
+            cmd_parts.join(" ")
+        }
+        SpringBootBuildTool::Maven => {
+            let module = checked_spring_module(parts.module)?;
+            let mut cmd_parts = vec![spring_build_tool_invocation(
+                shell,
+                parts.working_directory,
+                "mvnw",
+                "mvn",
+            )];
+            // `-am`은 붙이지 않는다: 상위 라이브러리 모듈에서도 `spring-boot:run`이 실행되어
+            // main class가 없는 모듈이 실패한다. 형제 모듈은 로컬 저장소에 설치돼 있어야 한다.
+            if !module.is_empty() {
+                cmd_parts.push(String::from("-pl"));
+                cmd_parts.push(quote_arg(shell, module));
+            }
+            cmd_parts.push(String::from("spring-boot:run"));
+            if !profiles.is_empty() {
+                cmd_parts.push(quote_arg(
+                    shell,
+                    &format!("-Dspring-boot.run.profiles={profiles}"),
+                ));
+            }
+            if !vm_options.is_empty() {
+                reject_control_chars("VM options", vm_options)?;
+                cmd_parts.push(quote_arg(
+                    shell,
+                    &format!("-Dspring-boot.run.jvmArguments={vm_options}"),
+                ));
+            }
+            if !program_arguments.is_empty() {
+                reject_control_chars("Program arguments", program_arguments)?;
+                cmd_parts.push(quote_arg(
+                    shell,
+                    &format!("-Dspring-boot.run.arguments={program_arguments}"),
+                ));
+            }
+            cmd_parts.join(" ")
+        }
+        SpringBootBuildTool::Jar => {
+            let jar_path = parts.jar_path.trim();
+            if jar_path.is_empty() {
+                return Err(String::from("JAR path is required when build tool is JAR"));
+            }
+            let mut cmd_parts = java_command_prefix(parts.jdk_path, vm_options);
+            cmd_parts.push(String::from("-jar"));
+            cmd_parts.push(quote_arg(shell, jar_path));
+            if !profiles.is_empty() {
+                cmd_parts.push(format!("--spring.profiles.active={profiles}"));
+            }
+            if !program_arguments.is_empty() {
+                cmd_parts.push(program_arguments.to_string());
+            }
+            cmd_parts.join(" ")
+        }
+        SpringBootBuildTool::Auto => unreachable!("Auto is resolved above"),
+    };
+
+    Ok((command, extra_env))
+}
+
+/// 환경변수 이름 비교. Windows는 대소문자를 구분하지 않으므로 그 플랫폼에서만 무시한다.
+fn env_key_eq(a: &str, b: &str) -> bool {
+    if cfg!(windows) {
+        a.eq_ignore_ascii_case(b)
+    } else {
+        a == b
+    }
+}
+
+/// 사용자 `environment_variables` 위에 얹을 최종 추가 환경변수.
+/// `JAVA_TOOL_OPTIONS`는 사용자 값 뒤에 이어 붙이고(둘 다 살린다), `JAVA_HOME`은 사용자가 직접
+/// 지정했다면 그 값이 우선한다(명시적 의도). 그 외 키는 기존대로 추가 값이 덮어쓴다.
+/// 병합 대상은 구성의 `environment_variables`뿐이다 — 앱 프로세스의 ambient
+/// `JAVA_TOOL_OPTIONS`는 자식 프로세스가 상속만 할 뿐 여기서 합치지 않는다.
+fn effective_extra_env(
+    user_env: &std::collections::HashMap<String, String>,
+    extra_env: &[(String, String)],
+) -> Vec<(String, String)> {
+    let user_value = |name: &str| {
+        user_env
+            .iter()
+            .find(|(k, _)| env_key_eq(k, name))
+            .map(|(_, v)| v)
+    };
+    extra_env
+        .iter()
+        .filter_map(|(key, value)| {
+            if env_key_eq(key, "JAVA_HOME") {
+                return user_value(key)
+                    .is_none()
+                    .then(|| (key.clone(), value.clone()));
+            }
+            if env_key_eq(key, "JAVA_TOOL_OPTIONS") {
+                let merged = match user_value(key).filter(|v| !v.trim().is_empty()) {
+                    Some(user) => format!("{} {value}", user.trim_end()),
+                    None => value.clone(),
+                };
+                return Some((key.clone(), merged));
+            }
+            Some((key.clone(), value.clone()))
+        })
+        .collect()
+}
+
+/// 자식 프로세스에 주입할 전체 환경변수(사용자 값 → 추가 값 순). 앞에서 뒤로 순서대로
+/// 설정하면 뒤가 이기므로, 세 스폰 경로가 같은 결과를 내도록 이 함수 하나를 공유한다.
+/// `extra_env`는 `run_configuration_stream`이 이미 `effective_extra_env`로 병합한 값이어야 한다
+/// (`effective_extra_env`는 멱등이 아니라 여기서 다시 적용하면 사용자 값이 중복된다).
+fn resolved_process_env(
+    config: &RunConfiguration,
+    extra_env: &[(String, String)],
+) -> Vec<(String, String)> {
+    config
+        .environment_variables
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .chain(extra_env.iter().cloned())
+        .collect()
 }
 
 #[cfg(test)]
@@ -4094,7 +4575,7 @@ time.sleep(30)'";
                 program_arguments: String::new(),
             },
         };
-        let (cmd, env) = build_command(&config);
+        let (cmd, env) = build_command(&config).expect("kotlin builds");
         assert_eq!(cmd, "java -cp \"out\" MainKt");
         assert!(env.is_empty());
     }
@@ -4459,7 +4940,7 @@ time.sleep(30)'";
             },
             ..RunConfiguration::default()
         };
-        let (command_str, extra_env) = build_command(&config);
+        let (command_str, extra_env) = build_command(&config).expect("node builds");
         assert!(!command_str.contains("NODE_OPTIONS"));
         assert_eq!(
             extra_env,
@@ -4468,5 +4949,743 @@ time.sleep(30)'";
                 String::from("--max-old-space-size=4096")
             )]
         );
+    }
+
+    // ---- Spring Boot ----
+
+    /// 프로세스 없이 파일 존재만 필요한 테스트용 임시 디렉터리(드롭 시 삭제).
+    struct TempDir(std::path::PathBuf, String);
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("rcm-spring-{tag}-{}", Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).expect("temp dir");
+            let text = dir.to_string_lossy().into_owned();
+            Self(dir, text)
+        }
+
+        fn touch(&self, rel: &str) -> std::path::PathBuf {
+            let path = self.0.join(rel);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).expect("parent dir");
+            }
+            std::fs::write(&path, "").expect("touch");
+            path
+        }
+
+        fn str(&self) -> &str {
+            &self.1
+        }
+
+        /// 상위 3단계 wrapper 탐색이 임시 루트 밖(실제 홈/`/tmp`)으로 새지 않도록 4단계 깊이의
+        /// 프로젝트 디렉터리를 만든다.
+        fn deep(&self) -> String {
+            let dir = self.0.join("a/b/c/d");
+            std::fs::create_dir_all(&dir).expect("deep dir");
+            dir.to_string_lossy().into_owned()
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn spring_parts(build_tool: SpringBootBuildTool, dir: &str) -> SpringBootCommandParts<'_> {
+        SpringBootCommandParts {
+            build_tool,
+            module: "",
+            jar_path: "",
+            profiles: "",
+            jdk_path: None,
+            vm_options: "",
+            program_arguments: "",
+            working_directory: dir,
+        }
+    }
+
+    #[test]
+    fn gradle_boot_run_task_targets_the_named_project_only() {
+        assert_eq!(gradle_boot_run_task("").unwrap(), "bootRun");
+        assert_eq!(gradle_boot_run_task("  ").unwrap(), "bootRun");
+        assert_eq!(gradle_boot_run_task(":app").unwrap(), ":app:bootRun");
+        assert_eq!(gradle_boot_run_task("app").unwrap(), ":app:bootRun");
+        assert_eq!(
+            gradle_boot_run_task(" :services:api: ").unwrap(),
+            ":services:api:bootRun"
+        );
+        assert_eq!(gradle_boot_run_task(":").unwrap(), "bootRun");
+        assert_eq!(
+            gradle_boot_run_task("app/pspteller").unwrap(),
+            ":app:pspteller:bootRun"
+        );
+    }
+
+    #[test]
+    fn gradle_boot_run_task_rejects_shell_metacharacters() {
+        for bad in [
+            ":app;rm",
+            ":app bootRun",
+            ":a$b",
+            ":app::api",
+            "::",
+            "'app'",
+            ":app\nrm",
+        ] {
+            assert!(
+                gradle_boot_run_task(bad).is_err(),
+                "{bad:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn a_leading_dash_is_rejected_instead_of_reaching_the_build_tool_as_an_option() {
+        // Gradle은 항상 `:`를 앞에 붙이지만 Maven의 `-pl` 값은 그대로 전달되므로 입력 단계에서 막는다.
+        for bad in ["-x", "--init-script", "-P"] {
+            assert!(gradle_boot_run_task(bad).is_err(), "{bad}");
+            assert!(checked_spring_module(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn maven_command_selects_the_module_with_pl_before_the_goal() {
+        let dir = TempDir::new("module-maven");
+        for (shell, expected) in [
+            (Shell::Sh, "-pl 'app/pspteller' spring-boot:run"),
+            (Shell::PowerShell, "-pl 'app/pspteller' spring-boot:run"),
+        ] {
+            let mut parts = spring_parts(SpringBootBuildTool::Maven, dir.str());
+            parts.module = " app/pspteller ";
+
+            let (cmd, _) = build_spring_boot_command(shell, &parts).expect("maven");
+
+            assert!(cmd.ends_with(expected), "{cmd}");
+            assert!(!cmd.contains("-am"), "{cmd}");
+        }
+    }
+
+    #[test]
+    fn maven_command_without_a_module_has_no_pl() {
+        let dir = TempDir::new("module-maven-empty");
+        let parts = spring_parts(SpringBootBuildTool::Maven, dir.str());
+
+        let (cmd, _) = build_spring_boot_command(Shell::Sh, &parts).expect("maven");
+
+        assert!(!cmd.contains("-pl"), "{cmd}");
+    }
+
+    #[test]
+    fn maven_accepts_an_artifact_id_selector() {
+        let dir = TempDir::new("module-maven-artifact");
+        let mut parts = spring_parts(SpringBootBuildTool::Maven, dir.str());
+        parts.module = ":my-app";
+
+        let (cmd, _) = build_spring_boot_command(Shell::Sh, &parts).expect("maven");
+
+        assert!(cmd.ends_with("-pl ':my-app' spring-boot:run"), "{cmd}");
+    }
+
+    #[test]
+    fn gradle_command_uses_the_module_qualified_task() {
+        let dir = TempDir::new("module");
+        let mut parts = spring_parts(SpringBootBuildTool::Gradle, dir.str());
+        parts.module = ":adapter-app";
+
+        let (cmd, _) = build_spring_boot_command(Shell::Sh, &parts).expect("gradle");
+
+        assert!(cmd.ends_with("gradle :adapter-app:bootRun"), "{cmd}");
+    }
+
+    #[test]
+    fn auto_resolved_to_gradle_uses_the_module_in_both_shells() {
+        let dir = TempDir::new("module-auto");
+        dir.touch("settings.gradle");
+        for shell in [Shell::Sh, Shell::PowerShell] {
+            let mut parts = spring_parts(SpringBootBuildTool::Auto, dir.str());
+            parts.module = "app";
+
+            let (cmd, _) = build_spring_boot_command(shell, &parts).expect("auto gradle");
+
+            assert!(cmd.ends_with(":app:bootRun"), "{cmd}");
+        }
+    }
+
+    #[test]
+    fn an_invalid_module_fails_only_where_it_is_used() {
+        let dir = TempDir::new("module-invalid");
+        dir.touch("pom.xml");
+        for tool in [SpringBootBuildTool::Gradle, SpringBootBuildTool::Maven] {
+            let mut parts = spring_parts(tool, dir.str());
+            parts.module = ":app;rm";
+            assert!(
+                build_spring_boot_command(Shell::Sh, &parts).is_err(),
+                "{tool:?}"
+            );
+        }
+
+        // Jar는 모듈을 쓰지 않으므로 값이 남아 있어도 실행을 막지 않는다.
+        let mut jar = spring_parts(SpringBootBuildTool::Jar, "");
+        jar.jar_path = "app.jar";
+        jar.module = ":app;rm";
+        assert!(build_spring_boot_command(Shell::Sh, &jar).is_ok());
+    }
+
+    #[test]
+    fn module_is_ignored_by_jar() {
+        let mut jar = spring_parts(SpringBootBuildTool::Jar, "");
+        jar.jar_path = "app.jar";
+        jar.module = ":app";
+        let (cmd, _) = build_spring_boot_command(Shell::Sh, &jar).expect("jar");
+        assert!(!cmd.contains(":app"), "{cmd}");
+    }
+
+    #[test]
+    fn quote_arg_sh_escapes_single_quotes_and_neutralizes_metachars() {
+        assert_eq!(quote_arg(Shell::Sh, "a b"), "'a b'");
+        assert_eq!(quote_arg(Shell::Sh, "it's"), r"'it'\''s'");
+        assert_eq!(quote_arg(Shell::Sh, "a;b\"c$d"), "'a;b\"c$d'");
+        assert_eq!(quote_arg(Shell::Sh, "l1\nl2"), "'l1\nl2'");
+    }
+
+    #[test]
+    fn quote_arg_powershell_doubles_single_and_curly_quotes() {
+        assert_eq!(quote_arg(Shell::PowerShell, "it's"), "'it''s'");
+        assert_eq!(
+            quote_arg(Shell::PowerShell, "a\u{2019}b"),
+            "'a\u{2019}\u{2019}b'"
+        );
+        assert_eq!(quote_arg(Shell::PowerShell, "a;b\"c"), "'a;b\"c'");
+        assert_eq!(
+            quote_arg(Shell::PowerShell, "-Dspring-boot.run.profiles=dev"),
+            "'-Dspring-boot.run.profiles=dev'"
+        );
+    }
+
+    #[test]
+    fn profiles_whitelist_rejects_shell_metachars() {
+        assert!(validate_profiles("dev,local-1.x_y").is_ok());
+        assert!(validate_profiles("").is_ok());
+        for bad in ["dev;rm", "a b", "$(x)", "dev'", "한글", "a\nb"] {
+            assert!(validate_profiles(bad).is_err(), "{bad:?} must be rejected");
+        }
+        let mut parts = spring_parts(SpringBootBuildTool::Jar, "");
+        parts.jar_path = "app.jar";
+        parts.profiles = "dev;ls";
+        assert!(build_spring_boot_command(Shell::Sh, &parts).is_err());
+    }
+
+    #[test]
+    fn detect_prefers_wrapper_over_build_files_and_gradle_over_maven() {
+        let dir = TempDir::new("detect-prio");
+        dir.touch("pom.xml");
+        assert_eq!(
+            detect_spring_build_tool(dir.str()),
+            Ok(SpringBootBuildTool::Maven)
+        );
+        dir.touch("build.gradle.kts");
+        assert_eq!(
+            detect_spring_build_tool(dir.str()),
+            Ok(SpringBootBuildTool::Gradle)
+        );
+        dir.touch("mvnw");
+        assert_eq!(
+            detect_spring_build_tool(dir.str()),
+            Ok(SpringBootBuildTool::Maven)
+        );
+        dir.touch("gradlew");
+        assert_eq!(
+            detect_spring_build_tool(dir.str()),
+            Ok(SpringBootBuildTool::Gradle)
+        );
+    }
+
+    #[test]
+    fn detect_settings_gradle_only_is_gradle() {
+        let dir = TempDir::new("detect-settings");
+        dir.touch("settings.gradle");
+        assert_eq!(
+            detect_spring_build_tool(dir.str()),
+            Ok(SpringBootBuildTool::Gradle)
+        );
+    }
+
+    #[test]
+    fn detect_finds_ancestor_wrapper_but_never_falls_back_to_jar() {
+        let root = TempDir::new("detect-anc");
+        root.touch("mvnw");
+        root.touch("app/service/.keep");
+        let sub = root
+            .0
+            .join("app")
+            .join("service")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(
+            detect_spring_build_tool(&sub),
+            Ok(SpringBootBuildTool::Maven)
+        );
+
+        let empty = TempDir::new("detect-none");
+        let deep = empty.deep();
+        assert!(detect_spring_build_tool(&deep).is_err());
+        let mut parts = spring_parts(SpringBootBuildTool::Auto, &deep);
+        parts.jar_path = "app.jar";
+        assert!(build_spring_boot_command(Shell::Sh, &parts).is_err());
+    }
+
+    #[test]
+    fn explicit_gradle_maven_with_bad_dir_build_ok_with_system_tool() {
+        // 없는 디렉터리 보고는 배너 뒤 스폰 직전 검사의 몫이다(배너 순서 보존).
+        for (tool, expected) in [
+            (SpringBootBuildTool::Gradle, "gradle bootRun"),
+            (SpringBootBuildTool::Maven, "mvn spring-boot:run"),
+        ] {
+            for dir in ["", "/definitely/not/here/rcm"] {
+                let (cmd, _) =
+                    build_spring_boot_command(Shell::Sh, &spring_parts(tool, dir)).expect("builds");
+                assert_eq!(cmd, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn auto_with_bad_dir_errs_naming_the_directory() {
+        let err = build_spring_boot_command(
+            Shell::Sh,
+            &spring_parts(SpringBootBuildTool::Auto, "/definitely/not/here/rcm"),
+        )
+        .expect_err("must reject");
+        assert!(err.contains("/definitely/not/here/rcm"), "{err}");
+        assert!(
+            build_spring_boot_command(Shell::Sh, &spring_parts(SpringBootBuildTool::Auto, ""))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn nearest_directory_build_file_decides_tool_then_wrapper_walks_ancestors() {
+        let root = TempDir::new("nearest");
+        root.touch("a/b/c/d/mvnw");
+        root.touch("a/b/c/d/sub/build.gradle");
+        let sub = root.0.join("a/b/c/d/sub").to_string_lossy().into_owned();
+        // 가까운 디렉터리의 build.gradle이 이긴다 → Gradle. 조상에는 gradlew가 없으므로
+        // 조상의 mvnw는 무시되고 시스템 gradle로 폴백한다(도구 결정과 wrapper 탐색이 분리됨).
+        let (cmd, _) =
+            build_spring_boot_command(Shell::Sh, &spring_parts(SpringBootBuildTool::Auto, &sub))
+                .expect("auto");
+        assert_eq!(cmd, "gradle bootRun");
+    }
+
+    #[test]
+    fn extensionless_wrapper_does_not_shadow_ancestor_bat_on_powershell() {
+        let root = TempDir::new("ps-shadow");
+        let bat = root.touch("gradlew.bat");
+        root.touch("sub/gradlew");
+        let found = find_spring_wrapper(
+            Shell::PowerShell,
+            &root.0.join("sub").to_string_lossy(),
+            "gradlew",
+        );
+        assert_eq!(found, Some(bat));
+    }
+
+    #[test]
+    fn jar_path_metacharacters_are_literal() {
+        let mut parts = spring_parts(SpringBootBuildTool::Jar, "");
+        parts.jar_path = "/tmp/a $(x);b&c`d`'e.jar";
+        let (sh, _) = build_spring_boot_command(Shell::Sh, &parts).expect("jar");
+        assert!(sh.ends_with(r"-jar '/tmp/a $(x);b&c`d`'\''e.jar'"), "{sh}");
+        let (ps, _) = build_spring_boot_command(Shell::PowerShell, &parts).expect("jar ps");
+        assert!(ps.ends_with("-jar '/tmp/a $(x);b&c`d`''e.jar'"), "{ps}");
+    }
+
+    #[test]
+    fn resolved_process_env_feeds_spawn_and_merges_java_options() {
+        let mut config = RunConfiguration::default();
+        config
+            .environment_variables
+            .insert(String::from("JAVA_TOOL_OPTIONS"), String::from("-Duser=1"));
+        config
+            .environment_variables
+            .insert(String::from("JAVA_HOME"), String::from("/user/jdk"));
+        let raw = vec![
+            (String::from("JAVA_TOOL_OPTIONS"), String::from("-Xmx1g")),
+            (String::from("JAVA_HOME"), String::from("/derived")),
+        ];
+        let extra = effective_extra_env(&config.environment_variables, &raw);
+        let resolved = resolved_process_env(&config, &extra);
+        // 순서대로 적용하면 마지막 값이 이긴다.
+        let last = |name: &str| {
+            resolved
+                .iter()
+                .rev()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.as_str())
+        };
+        assert_eq!(last("JAVA_TOOL_OPTIONS"), Some("-Duser=1 -Xmx1g"));
+        assert_eq!(last("JAVA_HOME"), Some("/user/jdk"));
+
+        // 스폰 없이 Command 환경만 조회해 실제 호출부가 이 함수를 쓰는지 고정한다.
+        let cmd = create_process_command(&config, "true", &extra);
+        let envs: std::collections::HashMap<_, _> = cmd
+            .as_std()
+            .get_envs()
+            .filter_map(|(k, v)| Some((k.to_str()?.to_string(), v?.to_str()?.to_string())))
+            .collect();
+        assert_eq!(
+            envs.get("JAVA_TOOL_OPTIONS").map(String::as_str),
+            Some("-Duser=1 -Xmx1g")
+        );
+        assert_eq!(envs.get("JAVA_HOME").map(String::as_str), Some("/user/jdk"));
+    }
+
+    #[test]
+    fn effective_extra_env_is_not_idempotent_so_it_must_run_once() {
+        let mut user = std::collections::HashMap::new();
+        user.insert(String::from("JAVA_TOOL_OPTIONS"), String::from("-Duser=1"));
+        let raw = vec![(String::from("JAVA_TOOL_OPTIONS"), String::from("-Xmx1g"))];
+        let once = effective_extra_env(&user, &raw);
+        let twice = effective_extra_env(&user, &once);
+        assert_eq!(once[0].1, "-Duser=1 -Xmx1g");
+        assert_eq!(twice[0].1, "-Duser=1 -Duser=1 -Xmx1g");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn effective_env_matches_names_case_insensitively_on_windows() {
+        let mut user = std::collections::HashMap::new();
+        user.insert(String::from("java_home"), String::from("C:\\jdk"));
+        let extra = vec![(String::from("JAVA_HOME"), String::from("C:\\derived"))];
+        assert!(effective_extra_env(&user, &extra).is_empty());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn effective_env_matches_names_case_sensitively_on_unix() {
+        let mut user = std::collections::HashMap::new();
+        user.insert(String::from("java_home"), String::from("/x"));
+        let extra = vec![(String::from("JAVA_HOME"), String::from("/derived"))];
+        assert_eq!(effective_extra_env(&user, &extra), extra);
+    }
+
+    #[test]
+    fn detect_rejects_empty_or_missing_working_directory() {
+        assert!(detect_spring_build_tool("").is_err());
+        assert!(detect_spring_build_tool("/definitely/not/here/rcm").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gradle_uses_absolute_wrapper_with_sh_fallback_without_exec_bit() {
+        let dir = TempDir::new("gradle-wrap");
+        let wrapper = dir.touch("gradlew");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o644))
+                .expect("chmod");
+        }
+        let (cmd, env) = build_spring_boot_command(
+            Shell::Sh,
+            &spring_parts(SpringBootBuildTool::Gradle, dir.str()),
+        )
+        .expect("gradle");
+        // 새로 만든 파일은 실행 비트가 없다 → sh 폴백
+        assert_eq!(cmd, format!("sh '{}' bootRun", wrapper.display()));
+        assert!(env.is_empty());
+    }
+
+    #[test]
+    fn wrapper_invocation_covers_exec_fallback_and_powershell_prefix() {
+        let p = Path::new("/tmp/my proj/gradlew");
+        assert_eq!(
+            wrapper_invocation(Shell::Sh, p, true),
+            "'/tmp/my proj/gradlew'"
+        );
+        assert_eq!(
+            wrapper_invocation(Shell::Sh, p, false),
+            "sh '/tmp/my proj/gradlew'"
+        );
+        let win = Path::new(r"C:\My Proj\gradlew.bat");
+        assert_eq!(
+            wrapper_invocation(Shell::PowerShell, win, true),
+            r"& 'C:\My Proj\gradlew.bat'"
+        );
+    }
+
+    #[test]
+    fn windows_wrapper_candidates_prefer_bat_and_cmd() {
+        assert_eq!(
+            spring_wrapper_names(Shell::PowerShell, "gradlew"),
+            vec!["gradlew.bat", "gradlew.cmd"]
+        );
+        assert_eq!(spring_wrapper_names(Shell::Sh, "mvnw"), vec!["mvnw"]);
+
+        let dir = TempDir::new("win-wrap");
+        let bat = dir.touch("gradlew.bat");
+        let (cmd, _) = build_spring_boot_command(
+            Shell::PowerShell,
+            &spring_parts(SpringBootBuildTool::Gradle, dir.str()),
+        )
+        .expect("gradle ps");
+        assert_eq!(cmd, format!("& '{}' bootRun", bat.display()));
+    }
+
+    #[test]
+    fn wrapper_found_in_ancestor_within_three_levels_only() {
+        let root = TempDir::new("anc-depth");
+        root.touch("mvnw");
+        root.touch("a/b/c/.keep");
+        root.touch("a/b/c/d/.keep");
+        let three = root.0.join("a/b/c").to_string_lossy().into_owned();
+        let four = root.0.join("a/b/c/d").to_string_lossy().into_owned();
+        assert!(find_spring_wrapper(Shell::Sh, &three, "mvnw").is_some());
+        assert!(find_spring_wrapper(Shell::Sh, &four, "mvnw").is_none());
+    }
+
+    #[test]
+    fn missing_wrapper_falls_back_to_system_tools() {
+        let root = TempDir::new("sys-tool");
+        let deep = root.deep();
+        let (gradle, _) =
+            build_spring_boot_command(Shell::Sh, &spring_parts(SpringBootBuildTool::Gradle, &deep))
+                .expect("gradle");
+        assert_eq!(gradle, "gradle bootRun");
+        let (maven, _) =
+            build_spring_boot_command(Shell::Sh, &spring_parts(SpringBootBuildTool::Maven, &deep))
+                .expect("maven");
+        assert_eq!(maven, "mvn spring-boot:run");
+    }
+
+    #[test]
+    fn gradle_passes_profiles_and_args_via_quoted_args_and_vm_via_env() {
+        let dir = TempDir::new("gradle-args");
+        let mut parts = spring_parts(SpringBootBuildTool::Gradle, dir.str());
+        parts.profiles = "dev,local";
+        parts.program_arguments = "--port=9090 --name='x y'";
+        parts.vm_options = "-Xmx1g -Dfoo=bar";
+        let (cmd, env) = build_spring_boot_command(Shell::Sh, &parts).expect("gradle");
+        assert_eq!(
+            cmd,
+            r"gradle bootRun '--args=--spring.profiles.active=dev,local --port=9090 --name='\''x y'\'''"
+        );
+        assert_eq!(
+            env,
+            vec![(
+                String::from("JAVA_TOOL_OPTIONS"),
+                String::from("-Xmx1g -Dfoo=bar")
+            )]
+        );
+        assert!(!cmd.contains("Xmx"));
+
+        let (ps, _) = build_spring_boot_command(Shell::PowerShell, &parts).expect("gradle ps");
+        assert!(
+            ps.contains("'--args=--spring.profiles.active=dev,local --port=9090 --name=''x y'''")
+        );
+    }
+
+    #[test]
+    fn maven_quotes_whole_d_arguments() {
+        let dir = TempDir::new("maven-args");
+        let mut parts = spring_parts(SpringBootBuildTool::Maven, dir.str());
+        parts.profiles = "prod";
+        parts.vm_options = "-Xmx512m";
+        parts.program_arguments = "--a=1 --b=2";
+        let (cmd, env) = build_spring_boot_command(Shell::Sh, &parts).expect("maven");
+        assert_eq!(
+            cmd,
+            "mvn spring-boot:run '-Dspring-boot.run.profiles=prod' \
+             '-Dspring-boot.run.jvmArguments=-Xmx512m' '-Dspring-boot.run.arguments=--a=1 --b=2'"
+        );
+        assert!(env.is_empty());
+    }
+
+    #[test]
+    fn control_chars_rejected_only_where_embedded_in_wrapper_options() {
+        let dir = TempDir::new("ctl");
+        let mut gradle = spring_parts(SpringBootBuildTool::Gradle, dir.str());
+        gradle.program_arguments = "a\nb";
+        assert!(build_spring_boot_command(Shell::Sh, &gradle).is_err());
+        // Gradle의 vm_options는 환경변수로 가므로 셸에 끼지 않는다.
+        let mut gradle_vm = spring_parts(SpringBootBuildTool::Gradle, dir.str());
+        gradle_vm.vm_options = "-Da=b\n-Dc=d";
+        assert!(build_spring_boot_command(Shell::Sh, &gradle_vm).is_ok());
+
+        let mut maven_vm = spring_parts(SpringBootBuildTool::Maven, dir.str());
+        maven_vm.vm_options = "-Da\r=b";
+        assert!(build_spring_boot_command(Shell::Sh, &maven_vm).is_err());
+        let mut maven_args = spring_parts(SpringBootBuildTool::Maven, dir.str());
+        maven_args.program_arguments = "x\u{7}y";
+        assert!(build_spring_boot_command(Shell::Sh, &maven_args).is_err());
+        let mut tab = spring_parts(SpringBootBuildTool::Maven, dir.str());
+        tab.program_arguments = "x\ty";
+        assert!(build_spring_boot_command(Shell::Sh, &tab).is_ok());
+    }
+
+    #[test]
+    fn jar_requires_path_and_orders_arguments() {
+        let mut parts = spring_parts(SpringBootBuildTool::Jar, "");
+        assert!(build_spring_boot_command(Shell::Sh, &parts).is_err());
+
+        parts.jar_path = " build/app.jar ";
+        parts.profiles = "dev";
+        parts.vm_options = "-Xmx1g";
+        parts.program_arguments = "--x=1";
+        let (cmd, env) = build_spring_boot_command(Shell::Sh, &parts).expect("jar");
+        assert_eq!(
+            cmd,
+            "java -Xmx1g -jar 'build/app.jar' --spring.profiles.active=dev --x=1"
+        );
+        assert!(env.is_empty());
+    }
+
+    #[test]
+    fn java_prefix_shared_with_kotlin_trims_vm_options() {
+        assert_eq!(java_command_prefix(None, "  "), vec![String::from("java")]);
+        assert_eq!(
+            java_command_prefix(None, " -Xmx1g "),
+            vec![String::from("java"), String::from("-Xmx1g")]
+        );
+    }
+
+    #[test]
+    fn derive_java_home_handles_home_bin_dir_and_executable_inputs() {
+        let name = crate::utils::java_executable_name();
+        let jdk = TempDir::new("jdk");
+        let java = jdk.touch(&format!("bin/{name}"));
+
+        assert_eq!(derive_java_home(Some(jdk.str())), Some(jdk.0.clone()));
+        let bin_dir = jdk.0.join("bin").to_string_lossy().into_owned();
+        assert_eq!(derive_java_home(Some(&bin_dir)), Some(jdk.0.clone()));
+        // canonicalize 결과와 비교한다(macOS의 /var -> /private/var 등).
+        let canonical_home = jdk.0.canonicalize().expect("canonical");
+        assert_eq!(
+            derive_java_home(Some(&java.to_string_lossy())),
+            Some(canonical_home)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn derive_java_home_resolves_symlink_shim_and_rejects_fake_home() {
+        let jdk = TempDir::new("jdk-real");
+        jdk.touch("bin/java");
+        let shim_dir = TempDir::new("jdk-shim");
+        let shim = shim_dir.0.join("java");
+        std::os::unix::fs::symlink(jdk.0.join("bin/java"), &shim).expect("symlink");
+        assert_eq!(
+            derive_java_home(Some(&shim.to_string_lossy())),
+            Some(jdk.0.canonicalize().expect("canonical"))
+        );
+
+        // 심볼릭 링크가 아닌 독립 파일: parent.parent 아래에 bin/java가 없으면 None.
+        let lone = TempDir::new("jdk-lone");
+        let lone_java = lone.touch("java");
+        assert_eq!(derive_java_home(Some(&lone_java.to_string_lossy())), None);
+    }
+
+    #[test]
+    fn derive_java_home_returns_none_for_unusable_input() {
+        assert_eq!(derive_java_home(None), None);
+        assert_eq!(derive_java_home(Some("  ")), None);
+        assert_eq!(derive_java_home(Some("")), None);
+        assert_eq!(derive_java_home(Some("java")), None);
+        assert_eq!(derive_java_home(Some("bin/java")), None);
+        assert_eq!(derive_java_home(Some("/definitely/not/here/jdk")), None);
+        let empty = TempDir::new("jdk-empty");
+        assert_eq!(derive_java_home(Some(empty.str())), None);
+    }
+
+    #[test]
+    fn gradle_and_maven_export_derived_java_home() {
+        let name = crate::utils::java_executable_name();
+        let jdk = TempDir::new("jdk-env");
+        jdk.touch(&format!("bin/{name}"));
+        let proj = TempDir::new("proj-env");
+        let jdk_path = jdk.str().to_string();
+        for tool in [SpringBootBuildTool::Gradle, SpringBootBuildTool::Maven] {
+            let mut parts = spring_parts(tool, proj.str());
+            parts.jdk_path = Some(&jdk_path);
+            let (_, env) = build_spring_boot_command(Shell::Sh, &parts).expect("build");
+            assert_eq!(
+                env,
+                vec![(String::from("JAVA_HOME"), jdk.str().to_string())],
+                "{tool:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn effective_env_appends_java_tool_options_and_user_java_home_wins() {
+        let mut user = std::collections::HashMap::new();
+        user.insert(String::from("JAVA_TOOL_OPTIONS"), String::from("-Duser=1 "));
+        user.insert(String::from("JAVA_HOME"), String::from("/user/jdk"));
+        let extra = vec![
+            (String::from("JAVA_TOOL_OPTIONS"), String::from("-Xmx1g")),
+            (String::from("JAVA_HOME"), String::from("/derived")),
+            (String::from("NODE_OPTIONS"), String::from("--x")),
+        ];
+        assert_eq!(
+            effective_extra_env(&user, &extra),
+            vec![
+                (
+                    String::from("JAVA_TOOL_OPTIONS"),
+                    String::from("-Duser=1 -Xmx1g")
+                ),
+                (String::from("NODE_OPTIONS"), String::from("--x")),
+            ]
+        );
+
+        let none = std::collections::HashMap::new();
+        assert_eq!(effective_extra_env(&none, &extra), extra);
+    }
+
+    #[test]
+    fn build_command_routes_spring_boot_and_propagates_errors() {
+        let dir = TempDir::new("route");
+        let mut config = RunConfiguration {
+            working_directory: dir.str().to_string(),
+            type_data: ConfigTypeData::SpringBoot {
+                build_tool: SpringBootBuildTool::Auto,
+                module: String::new(),
+                jar_path: String::new(),
+                profiles: String::new(),
+                jdk_path: None,
+                vm_options: String::new(),
+                program_arguments: String::new(),
+            },
+            ..RunConfiguration::default()
+        };
+        assert!(build_command(&config).is_err());
+
+        dir.touch("pom.xml");
+        let (cmd, env) = build_command(&config).expect("maven detected");
+        assert_eq!(cmd, "mvn spring-boot:run");
+        assert!(env.is_empty());
+
+        // 빈 작업 디렉터리는 실행 시점에 거절되는 것이 의도다.
+        config.working_directory = String::new();
+        assert!(build_command(&config).is_err());
+    }
+
+    #[test]
+    fn build_command_wraps_existing_types_in_ok() {
+        let app = RunConfiguration {
+            type_data: ConfigTypeData::Application {
+                command: String::from("echo"),
+                arguments: String::from("hi"),
+            },
+            ..RunConfiguration::default()
+        };
+        assert_eq!(build_command(&app).expect("app").0, "echo hi");
+        let compound = RunConfiguration {
+            type_data: ConfigTypeData::Compound {
+                members: Vec::new(),
+                workspace: None,
+            },
+            ..RunConfiguration::default()
+        };
+        assert_eq!(build_command(&compound), Ok((String::new(), Vec::new())));
     }
 }

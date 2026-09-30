@@ -1,7 +1,7 @@
 use crate::messages::Message;
 use crate::models::{
     ConfigTypeData, ConfigurationType, ExecuteMode, ExecuteModeType, KotlinLaunchMode,
-    KotlinLaunchModeType, NodeCommand, PackageManager, RunConfiguration,
+    KotlinLaunchModeType, NodeCommand, PackageManager, RunConfiguration, SpringBootBuildTool,
 };
 use crate::services::McpPermission;
 use crate::utils::{
@@ -23,6 +23,8 @@ use uuid::Uuid;
 pub struct EditorLoadingState {
     pub file_dialog: FileDialogLoadingState,
     pub node: NodeLoadingState,
+    /// Spring Boot 모듈 감지 스캔이 진행 중인지
+    pub spring_boot_detecting: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -32,6 +34,8 @@ pub struct FileDialogLoadingState {
     pub interpreter: bool,
     pub kotlin_jar: bool,
     pub kotlin_jdk: bool,
+    pub spring_boot_jar: bool,
+    pub spring_boot_jdk: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -55,6 +59,8 @@ pub struct EditorSelectState {
     pub package_json: combo_box::State<String>,
     pub node_script: combo_box::State<String>,
     pub kotlin_launch_mode: combo_box::State<KotlinLaunchModeType>,
+    pub spring_build_tool: combo_box::State<SpringBootBuildTool>,
+    pub spring_boot_module: combo_box::State<String>,
     pub jdk: combo_box::State<String>,
 }
 
@@ -69,6 +75,8 @@ impl EditorSelectState {
             package_json: combo_box::State::new(Vec::new()),
             node_script: combo_box::State::new(Vec::new()),
             kotlin_launch_mode: combo_box::State::new(KotlinLaunchModeType::ALL.to_vec()),
+            spring_build_tool: combo_box::State::new(SpringBootBuildTool::ALL.to_vec()),
+            spring_boot_module: combo_box::State::new(Vec::new()),
             jdk: combo_box::State::new(vec![String::from("Default (system)")]),
         }
     }
@@ -88,6 +96,10 @@ impl EditorSelectState {
 
     pub fn set_node_scripts(&mut self, scripts: Vec<String>) {
         self.node_script = combo_box::State::new(scripts);
+    }
+
+    pub fn set_spring_boot_modules(&mut self, modules: Vec<String>) {
+        self.spring_boot_module = combo_box::State::new(modules);
     }
 }
 
@@ -184,6 +196,30 @@ pub fn view_configuration_editor<'a>(
             select_state,
             loading.file_dialog.kotlin_jar,
             loading.file_dialog.kotlin_jdk,
+        ),
+        ConfigTypeData::SpringBoot {
+            build_tool,
+            module,
+            jar_path,
+            profiles,
+            jdk_path,
+            vm_options,
+            program_arguments,
+        } => view_spring_boot_fields(
+            SpringBootFormValues {
+                build_tool,
+                module,
+                jar_path,
+                profiles,
+                vm_options,
+                program_arguments,
+                jdk_path: jdk_path.as_ref(),
+            },
+            available_jdks,
+            select_state,
+            loading.file_dialog.spring_boot_jar,
+            loading.file_dialog.spring_boot_jdk,
+            loading.spring_boot_detecting,
         ),
         ConfigTypeData::Compound { members, workspace } => {
             view_compound_fields(members, workspace.as_deref(), configurations, index)
@@ -2329,6 +2365,246 @@ fn view_kotlin_jdk_row<'a>(
             "Search JDK",
             current_label,
             Message::KotlinJdkChanged,
+        ))
+        .width(Length::Fill),
+        browse_btn,
+    ]
+    .spacing(10)
+    .align_y(Alignment::Center)
+    .width(Length::Fill)
+}
+
+/// Spring Boot 폼이 참조하는 값 묶음 (뷰 함수 인자 수를 줄이기 위함)
+struct SpringBootFormValues<'a> {
+    build_tool: &'a SpringBootBuildTool,
+    module: &'a String,
+    jar_path: &'a str,
+    profiles: &'a str,
+    vm_options: &'a str,
+    program_arguments: &'a str,
+    jdk_path: Option<&'a String>,
+}
+
+/// Spring Boot 타입 필드 렌더링
+///
+/// Build tool, 실행 모듈(Jar 제외), JAR 경로(Jar 전용), Profiles, JDK, VM options,
+/// program arguments
+fn view_spring_boot_fields<'a>(
+    values: SpringBootFormValues<'a>,
+    available_jdks: &'a [(String, String)],
+    select_state: &'a EditorSelectState,
+    is_loading_jar: bool,
+    is_loading_jdk: bool,
+    is_detecting_modules: bool,
+) -> Element<'a, Message> {
+    let mut col = column![view_spring_boot_build_tool_row(
+        values.build_tool,
+        select_state
+    )]
+    .width(Length::Fill);
+
+    // Jar는 모듈을 쓰지 않으므로 행을 숨긴다(값은 모델에 유지). Auto도 Gradle/Maven으로 풀린다.
+    if !matches!(values.build_tool, SpringBootBuildTool::Jar) {
+        col = col
+            .push(Space::new().height(10))
+            .push(view_spring_boot_module_row(
+                values.module,
+                values.build_tool,
+                select_state,
+                is_detecting_modules,
+            ));
+    }
+
+    // jar_path는 Jar일 때만 실행에 쓰이므로 다른 도구에서는 행을 숨긴다 (값은 모델에 유지).
+    if matches!(values.build_tool, SpringBootBuildTool::Jar) {
+        col = col
+            .push(Space::new().height(10))
+            .push(view_spring_boot_jar_path_row(
+                values.jar_path,
+                is_loading_jar,
+            ));
+    }
+
+    col.push(Space::new().height(10))
+        .push(view_spring_boot_profiles_row(values.profiles))
+        .push(Space::new().height(10))
+        .push(view_spring_boot_jdk_row(
+            values.jdk_path,
+            available_jdks,
+            select_state,
+            is_loading_jdk,
+        ))
+        .push(Space::new().height(10))
+        .push(view_spring_boot_vm_options_row(values.vm_options))
+        .push(Space::new().height(10))
+        .push(view_spring_boot_program_arguments_row(
+            values.program_arguments,
+        ))
+        .into()
+}
+
+fn view_spring_boot_build_tool_row<'a>(
+    build_tool: &'a SpringBootBuildTool,
+    select_state: &'a EditorSelectState,
+) -> iced::widget::Row<'a, Message> {
+    view_editor_row(
+        "Build Tool:",
+        editor_combo_box(
+            &select_state.spring_build_tool,
+            "Select build tool",
+            Some(build_tool),
+            Message::SpringBootBuildToolChanged,
+        )
+        .into(),
+    )
+}
+
+fn view_spring_boot_jar_path_row(
+    jar_path: &str,
+    is_loading_jar: bool,
+) -> iced::widget::Row<'_, Message> {
+    let path_input =
+        editor_input("Path to .jar", jar_path).on_input(Message::SpringBootJarPathChanged);
+
+    let mut browse_btn = icon_button(ICON_FOLDER_OPEN, None)
+        .padding(0)
+        .width(34)
+        .height(34);
+
+    if !is_loading_jar {
+        browse_btn = browse_btn.on_press(Message::BrowseSpringBootJarPath);
+    }
+
+    row![
+        container(text("JAR Path:").size(12).style(editor_label_style)).width(Length::Fixed(136.0)),
+        path_input,
+        browse_btn,
+    ]
+    .spacing(10)
+    .align_y(Alignment::Center)
+    .width(Length::Fill)
+}
+
+fn view_spring_boot_module_row<'a>(
+    module: &'a String,
+    build_tool: &SpringBootBuildTool,
+    select_state: &'a EditorSelectState,
+    is_detecting: bool,
+) -> iced::widget::Row<'a, Message> {
+    // 후보가 없으면 자유 입력, 있으면 목록에서 고르되 직접 타이핑도 그대로 반영한다.
+    let picker: Element<'a, Message> = if select_state.spring_boot_module.options().is_empty() {
+        editor_input(":app", module)
+            .on_input(Message::SpringBootModuleChanged)
+            .into()
+    } else {
+        editor_combo_box(
+            &select_state.spring_boot_module,
+            "Search module",
+            Some(module),
+            Message::SpringBootModuleChanged,
+        )
+        .on_input(Message::SpringBootModuleChanged)
+        .into()
+    };
+
+    let mut detect_btn = icon_button(ICON_REFRESH, None)
+        .padding(0)
+        .width(34)
+        .height(34);
+    if !is_detecting {
+        detect_btn = detect_btn.on_press(Message::DetectSpringBootModules);
+    }
+
+    let format_hint = match build_tool {
+        SpringBootBuildTool::Maven => "Maven -pl value, e.g. app/api or :artifactId.",
+        SpringBootBuildTool::Gradle => "Gradle project path, e.g. :app or :services:api.",
+        _ => "Gradle project path (e.g. :app) or Maven -pl value (e.g. app/api).",
+    };
+    let input = column![
+        row![container(picker).width(Length::Fill), detect_btn]
+            .spacing(10)
+            .align_y(Alignment::Center),
+        text(format!(
+            "{format_hint} Leave empty to run the working directory's project. Use the refresh \
+             button to find modules with @SpringBootApplication; needed when a multi-module \
+             root has modules without a main class."
+        ))
+        .size(11)
+        .style(editor_label_style),
+    ]
+    .spacing(4)
+    .width(Length::Fill);
+
+    view_editor_row("Module:", input.into())
+}
+
+fn view_spring_boot_profiles_row(profiles: &str) -> iced::widget::Row<'_, Message> {
+    view_editor_row(
+        "Profiles:",
+        editor_input("dev,local", profiles)
+            .on_input(Message::SpringBootProfilesChanged)
+            .into(),
+    )
+}
+
+fn view_spring_boot_vm_options_row(vm_options: &str) -> iced::widget::Row<'_, Message> {
+    let input = column![
+        editor_input("-Xmx2g -Dkey=value", vm_options)
+            .on_input(Message::SpringBootVmOptionsChanged),
+        text(
+            "Gradle: passed via JAVA_TOOL_OPTIONS. A running Gradle daemon may ignore it, \
+             and 'Picked up JAVA_TOOL_OPTIONS' will appear in the output."
+        )
+        .size(11)
+        .style(editor_label_style),
+    ]
+    .spacing(4)
+    .width(Length::Fill);
+
+    view_editor_row("VM Options:", input.into())
+}
+
+fn view_spring_boot_program_arguments_row(
+    program_arguments: &str,
+) -> iced::widget::Row<'_, Message> {
+    view_editor_row(
+        "Program Args:",
+        editor_input("arg1 arg2", program_arguments)
+            .on_input(Message::SpringBootProgramArgumentsChanged)
+            .into(),
+    )
+}
+
+fn view_spring_boot_jdk_row<'a>(
+    jdk_path: Option<&'a String>,
+    available_jdks: &'a [(String, String)],
+    select_state: &'a EditorSelectState,
+    is_loading_jdk: bool,
+) -> iced::widget::Row<'a, Message> {
+    let current_jdk = jdk_path.map_or("java", String::as_str);
+    // 감지 목록에서 레이블을 찾고, 없으면(수동 선택 경로) 원시 경로를 그대로 표시.
+    let current_label = available_jdks
+        .iter()
+        .find(|(_, path)| path == current_jdk)
+        .map(|(label, _)| label)
+        .or(jdk_path);
+
+    let mut browse_btn = icon_button(ICON_FOLDER_OPEN, None)
+        .padding(0)
+        .width(34)
+        .height(34);
+
+    if !is_loading_jdk {
+        browse_btn = browse_btn.on_press(Message::BrowseSpringBootJdk);
+    }
+
+    row![
+        container(text("JDK:").size(12).style(editor_label_style)).width(Length::Fixed(136.0)),
+        container(editor_combo_box(
+            &select_state.jdk,
+            "Search JDK",
+            current_label,
+            Message::SpringBootJdkChanged,
         ))
         .width(Length::Fill),
         browse_btn,
