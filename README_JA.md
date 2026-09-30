@@ -25,7 +25,7 @@ Rust と iced GUI フレームワークで開発されたクロスプラット�
 
 ### 構成管理
 - 実行構成の作成、編集、複製、削除
-- 構成タイプの選択 (Application, Shell Script, Node, Kotlin, Compound)
+- 構成タイプの選択 (Application, Shell Script, Node, Kotlin, Spring Boot, Compound)
 - Compound タイプは複数の構成をまとめて一括実行
 - コマンド、引数、作業ディレクトリの設定
 - Shell Script のインラインスクリプトをマルチライン エディタで記述
@@ -45,6 +45,20 @@ Rust と iced GUI フレームワークで開発されたクロスプラット�
 - `java` 経由で Kotlin/JVM アプリを実行 — Main class または JAR 起動モード
 - VM options (例: `-Xmx2g`) とプログラム引数の設定
 - JDK の自動検出 (JAVA_HOME, SDKMAN, macOS/Linux/Windows の標準的な場所) と手動指定
+
+### Spring Boot サポート
+- Auto / Gradle (`bootRun`) / Maven (`spring-boot:run`) / JAR のビルドツールで Spring Boot アプリを実行
+- Auto は作業ディレクトリで `gradlew` > `mvnw` > `build.gradle(.kts)`/`settings.gradle(.kts)` > `pom.xml` の順で検出し (JAR にはフォールバックしません)、wrapper は作業ディレクトリと最大 3 階層上まで探します
+- Auto で作業ディレクトリが不正な場合、コマンドバナーなしでエラーのみ表示されます
+- マルチモジュール: **Module** で実行するモジュールを 1 つ指定します。Gradle はプロジェクトパス (`:app`、`:services:api`、`app/api`) で `:app:bootRun` を実行し、Maven は `-pl` の値 (`app/api` または `:artifactId`) を使います。マルチモジュールのルートで修飾なしの `bootRun` を実行すると全モジュールで実行され、main class のないモジュールで失敗します
+- **Module** 横の更新ボタンでモジュールを検出します: `src/main` から `@SpringBootApplication` を探し (`build`、`target`、隠しディレクトリ・依存ディレクトリはスキップ、シンボリックリンクは辿りません)、候補が 1 つで入力が空なら自動入力、それ以外はドロップダウンに候補を表示します。Gradle の `projectDir` を既定と異なる場所に割り当てている場合、検出パスが誤ることがあります
+- Maven は `-am` なしで `-pl <module> spring-boot:run` を実行するため、兄弟モジュールは事前にインストール (`mvn install`) が必要です。使用可能な文字は英数字と `_ . - : /` で、`::`、`//`、`..`、先頭の `/` や `-` は不可です
+- Spring プロファイル (英数字と `_ . , -` のみ)、VM オプション、プログラム引数を設定
+- JDK を選択 (自動検出リストまたは手動パス) — Gradle/Maven では `JAVA_HOME` として適用
+- Gradle は VM オプションを `JAVA_TOOL_OPTIONS` で渡します。起動済みの Gradle デーモンは無視することがあり、出力に "Picked up JAVA_TOOL_OPTIONS" が混ざります
+- プログラム引数は JAR モードではシェルにそのまま、Gradle/Maven では引用符付きの単一オプション値として渡されます
+- 環境変数で指定した `JAVA_HOME` は、選択した JDK から導出した値より優先されます
+- 注意: 保存される構成ファイルはフォーマットバージョン 2 になり、古いバージョンのアプリは "newer version" メッセージを表示してファイルを開きません
 
 ### 実行セッション管理
 - 複数セッションの同時実行

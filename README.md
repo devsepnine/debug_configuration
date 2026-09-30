@@ -25,7 +25,7 @@ Grab the latest pre-built binary for your platform from the [Releases page](http
 
 ### Configuration Management
 - Create, edit, clone, and delete run configurations
-- Select configuration type (Application, Shell Script, Node, Kotlin, Compound)
+- Select configuration type (Application, Shell Script, Node, Kotlin, Spring Boot, Compound)
 - Compound type runs several configurations together as one group
 - Set command, arguments, and working directory
 - Write inline Shell Script text in a multi-line editor (monospace font,
@@ -46,6 +46,20 @@ Grab the latest pre-built binary for your platform from the [Releases page](http
 - Run Kotlin/JVM apps through `java` — Main class or JAR launch mode
 - Set VM options (e.g., `-Xmx2g`) and program arguments
 - Auto-detect JDKs (JAVA_HOME, SDKMAN, standard macOS/Linux/Windows locations) with manual override
+
+### Spring Boot Support
+- Run Spring Boot apps with Auto / Gradle (`bootRun`) / Maven (`spring-boot:run`) / JAR build tools
+- Auto detects, in the working directory, `gradlew` > `mvnw` > `build.gradle(.kts)`/`settings.gradle(.kts)` > `pom.xml` (never falls back to JAR); the wrapper is looked up in the working directory and up to 3 ancestor directories
+- An invalid working directory with Auto is reported without the command banner
+- Multi-module builds: set **Module** to run one module only. Gradle takes a project path (`:app`, `:services:api`, or `app/api`) and runs `:app:bootRun`; Maven takes a `-pl` value (`app/api` or `:artifactId`). An unqualified `bootRun` at a multi-module root runs in every module and fails on modules without a main class
+- Click the refresh button next to **Module** to detect modules: it scans `src/main` for `@SpringBootApplication` (skipping `build`, `target`, hidden and dependency directories, without following symlinks), fills the field when exactly one module is found and it is empty, and otherwise lists the candidates in a dropdown. A custom Gradle `projectDir` mapping can make the detected path wrong
+- Maven runs `-pl <module> spring-boot:run` without `-am`, so sibling modules must already be installed (`mvn install`); allowed characters are letters, digits, `_ . - : /` (no `::`, `//`, `..`, or a leading `/` or `-`)
+- Set Spring profiles (letters, digits, `_ . , -` only), VM options, and program arguments
+- Pick a JDK (auto-detected list or manual path); it is applied as `JAVA_HOME` for Gradle/Maven
+- Gradle passes VM options via `JAVA_TOOL_OPTIONS`; an already-running Gradle daemon may ignore it, and "Picked up JAVA_TOOL_OPTIONS" appears in the output
+- Program arguments are passed raw to the shell in JAR mode, but as one quoted option value for Gradle/Maven
+- A `JAVA_HOME` you set in environment variables wins over the one derived from the selected JDK
+- Note: saved configuration files now use format version 2, so older app versions show a "newer version" message and won't open them
 
 ### Execution Session Management
 - Run multiple sessions simultaneously

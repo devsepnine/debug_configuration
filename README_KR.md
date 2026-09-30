@@ -25,7 +25,7 @@ Rust와 iced GUI 프레임워크로 개발되었으며, 여러 프로그램 실�
 
 ### 구성 관리
 - 실행 구성 생성, 수정, 복제, 삭제
-- 구성 타입 선택 (Application, Shell Script, Node, Kotlin, Compound)
+- 구성 타입 선택 (Application, Shell Script, Node, Kotlin, Spring Boot, Compound)
 - Compound 타입은 여러 구성을 묶어 한 번에 실행
 - 명령어, 인자, 작업 디렉토리 설정
 - Shell Script 인라인 스크립트를 멀티라인 에디터로 작성 (고정폭 폰트,
@@ -45,6 +45,20 @@ Rust와 iced GUI 프레임워크로 개발되었으며, 여러 프로그램 실�
 - `java`로 Kotlin/JVM 앱 실행 — Main class 또는 JAR 실행 모드
 - VM options(예: `-Xmx2g`)와 프로그램 인자 설정
 - JDK 자동 감지 (JAVA_HOME, SDKMAN, macOS/Linux/Windows 표준 위치) + 수동 지정
+
+### Spring Boot 지원
+- Auto / Gradle(`bootRun`) / Maven(`spring-boot:run`) / JAR 빌드 도구로 Spring Boot 앱 실행
+- Auto는 작업 디렉터리에서 `gradlew` > `mvnw` > `build.gradle(.kts)`/`settings.gradle(.kts)` > `pom.xml` 순으로 감지하며(JAR로 폴백하지 않음), wrapper는 작업 디렉터리와 최대 3단계 상위 디렉터리까지 찾습니다
+- Auto에서 작업 디렉터리가 잘못되면 명령 배너 없이 오류만 표시됩니다
+- 멀티모듈: **Module**로 실행할 모듈을 하나 지정합니다. Gradle은 프로젝트 경로(`:app`, `:services:api`, `app/api`)로 `:app:bootRun`을 실행하고, Maven은 `-pl` 값(`app/api` 또는 `:artifactId`)을 씁니다. 멀티모듈 루트에서 한정자 없는 `bootRun`은 모든 모듈에서 실행되어 main class가 없는 모듈에서 실패합니다
+- **Module** 옆 새로고침 버튼으로 모듈을 감지합니다: `src/main`에서 `@SpringBootApplication`을 찾고(`build`, `target`, 숨김·의존성 디렉터리는 건너뛰며 심볼릭 링크는 따라가지 않음), 후보가 하나이고 입력이 비어 있으면 자동으로 채우고 아니면 드롭다운에 후보를 보여줍니다. Gradle `projectDir`을 기본값과 다르게 매핑한 프로젝트는 감지 경로가 틀릴 수 있습니다
+- Maven은 `-am` 없이 `-pl <module> spring-boot:run`을 실행하므로 형제 모듈이 미리 설치돼 있어야 합니다(`mvn install`). 허용 문자는 영문·숫자·`_ . - : /`이며 `::`, `//`, `..`, 앞자리 `/` 또는 `-`는 불가합니다
+- Spring 프로파일(영문·숫자·`_ . , -`만 허용), VM 옵션, 프로그램 인자 설정
+- JDK 선택(자동 감지 목록 또는 직접 경로) — Gradle/Maven에서는 `JAVA_HOME`으로 적용
+- Gradle은 VM 옵션을 `JAVA_TOOL_OPTIONS`로 전달합니다. 이미 실행 중인 Gradle 데몬은 무시할 수 있고 출력에 "Picked up JAVA_TOOL_OPTIONS"가 섞입니다
+- 프로그램 인자는 JAR 모드에서는 셸에 그대로, Gradle/Maven에서는 하나의 인용된 옵션 값으로 전달됩니다
+- 환경 변수에 직접 지정한 `JAVA_HOME`이 선택한 JDK에서 파생한 값보다 우선합니다
+- 참고: 저장되는 구성 파일이 포맷 버전 2로 바뀌어, 이전 버전 앱은 "newer version" 안내를 표시하며 파일을 열지 않습니다
 
 ### 실행 세션 관리
 - 다중 세션 동시 실행

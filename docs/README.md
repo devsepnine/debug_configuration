@@ -66,7 +66,7 @@ debug_configuration/
 
 ### 구성 타입 (Configuration Types)
 
-`ConfigurationType` enum: `Application`, `ShellScript`, `Node`, `Compound`
+`ConfigurationType` enum: `Application`, `ShellScript`, `Node`, `Kotlin`, `SpringBoot`, `Compound`
 (소스: `src/models/configuration.rs`)
 
 1. **Application**
@@ -85,7 +85,20 @@ debug_configuration/
    - package.json 자동 스캔 및 scripts 파싱
    - 패키지 매니저 자동 감지 (npm, yarn, pnpm)
 
-4. **Compound**
+4. **Kotlin**
+   - `java`로 Kotlin/JVM 앱 실행 (MainClass/Jar 모드)
+   - 필드: jdk_path, launch_mode, vm_options, program_arguments
+
+5. **Spring Boot**
+   - 빌드 도구 Auto/Gradle/Maven/Jar 선택 (Auto는 작업 디렉터리에서 `gradlew` > `mvnw` > `build.gradle(.kts)`/`settings.gradle(.kts)` > `pom.xml`, 없으면 오류; wrapper는 작업 디렉터리와 최대 3단계 상위까지 탐색; 작업 디렉터리가 잘못되면 명령 배너 없이 오류 보고)
+   - 프로그램 인자는 JAR 모드에서 셸에 그대로, Gradle/Maven에서는 하나의 인용된 옵션 값으로 전달
+   - 환경 변수에 직접 지정한 `JAVA_HOME`이 JDK에서 파생한 값보다 우선
+   - 멀티모듈: module로 실행할 모듈 지정 — Gradle은 프로젝트 경로(`:app`, `app/api`)로 `:app:bootRun`, Maven은 `-pl` 값(`app/api`, `:artifactId`; `-am` 없이 형제 모듈은 사전 설치 필요). 비우면 작업 디렉터리 프로젝트를 그대로 실행하며 Jar에서는 사용하지 않음
+   - Detect(모듈 옆 새로고침 버튼): `src/main`의 `@SpringBootApplication`을 스캔해 후보가 하나이고 값이 비어 있으면 자동으로 채우고, 여러 개면 드롭다운으로 선택(`[A-Za-z0-9_.:/-]`, `::`·`//`·`..`·앞자리 `/`·`-` 불가; 깊이·항목 수·파일 크기 상한 있음, 심볼릭 링크 미추적)
+   - 필드: build_tool, module, jar_path(Jar일 때만 사용), profiles(`[A-Za-z0-9_.,-]`만), jdk_path, vm_options, program_arguments
+   - Gradle의 VM 옵션은 `JAVA_TOOL_OPTIONS`로 전달되며 실행 중인 데몬은 무시할 수 있음
+
+6. **Compound**
    - 여러 구성을 묶어 한 번에 실행 (멤버는 다른 구성의 id 목록)
    - 지정한 워크스페이스 탭에서 실행하거나 현재 탭에서 실행
    - 필드: members(구성 id 목록), workspace(대상 탭 이름, 비면 현재 탭)
@@ -170,6 +183,18 @@ winresource = "0.1"
 ```
 
 ## 최근 변경 사항
+
+### 2026-09-30
+
+#### 추가됨
+- **Spring Boot 구성 타입**
+  - Auto/Gradle/Maven/JAR 실행, 프로파일, JDK 선택, VM 옵션, 프로그램 인자
+  - MCP `type_data`에 SpringBoot 추가(필드 길이 상한, profiles·module 문자셋 검증)
+  - 멀티모듈 실행 모듈 지정(`module`, Gradle `:app`/Maven `-pl`)과 `@SpringBootApplication` 모듈 감지(Detect)
+  - 개발 중 `gradle_module` 키로 저장된 파일도 별칭으로 읽음
+
+#### 변경됨
+- 구성 파일 포맷 버전 1 → 2 (`CURRENT_CONFIG_VERSION`). 이전 버전 앱은 "newer version" 안내를 표시하며 저장 파일을 열지 않음
 
 ### 2026-06-25
 
