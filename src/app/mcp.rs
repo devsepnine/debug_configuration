@@ -1137,10 +1137,14 @@ impl RunConfigManager {
     /// 파일 I/O를 Task 안에 두는 것은 이 앱의 초기화 규약이다 — Task를 폴링하지 않는 단위
     /// 테스트가 사용자 홈의 토큰 파일을 만들지 않는다. 토큰 파일 자체도 MCP를 처음 켤 때만
     /// 생기므로, 이 기능을 쓰지 않는 사용자의 홈에는 비밀 파일이 남지 않는다.
+    ///
+    /// 이미 토큰이 있거나 로드/재발급이 진행 중이면 아무것도 하지 않는다 — Apply 연타가
+    /// 같은 파일에 대한 작업을 겹쳐 발행하지 않게 한다.
     pub(super) fn mcp_token_task(&mut self) -> Task<Message> {
-        if self.mcp_token.is_some() {
+        if self.mcp_token.is_some() || self.mcp_token_loading {
             return Task::none();
         }
+        self.mcp_token_loading = true;
         self.mcp_status = McpServerStatus::Starting;
         Task::perform(
             async { crate::services::load_or_create_token() },
@@ -1154,6 +1158,7 @@ impl RunConfigManager {
         &mut self,
         result: Result<String, String>,
     ) -> Task<Message> {
+        self.mcp_token_loading = false;
         match result {
             Ok(token) => self.mcp_token = Some(token),
             Err(reason) => {
@@ -1184,6 +1189,7 @@ impl RunConfigManager {
         self.mcp_permission = defaults.mcp_permission;
         self.mcp_expose_env_values = defaults.mcp_expose_env_values;
         self.mcp_token = None;
+        self.mcp_token_loading = false;
         self.mcp_status = McpServerStatus::default();
         self.mcp_request_log = crate::services::McpRequestLog::default();
     }

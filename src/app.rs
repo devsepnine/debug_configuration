@@ -437,6 +437,9 @@ pub struct RunConfigManager {
     mcp_expose_env_values: bool,
     /// MCP Bearer 토큰. 서버를 처음 켤 때 `~/.run_config_mcp_token`에서 로드/생성한다
     mcp_token: Option<String>,
+    /// 토큰 로드/재발급이 진행 중인지. 결과가 도착하기 전에 Apply를 다시 눌러도 같은 파일을
+    /// 건드리는 작업이 겹치지 않게 한다.
+    mcp_token_loading: bool,
     /// MCP 리스너 상태 (설정 모달 표시용)
     mcp_status: McpServerStatus,
     /// 변경성 툴의 중복 요청 흡수 창. HTTP 재시도가 프로세스를 두 번 띄우거나 구성을 두 번
@@ -562,6 +565,7 @@ impl RunConfigManager {
             mcp_permission: settings.mcp_permission,
             mcp_expose_env_values: settings.mcp_expose_env_values,
             mcp_token: None,
+            mcp_token_loading: false,
             mcp_status: McpServerStatus::default(),
             mcp_request_log: McpRequestLog::default(),
             file_dialog: FileDialogState::default(),
@@ -682,6 +686,7 @@ impl RunConfigManager {
             }
             Message::OpenSettingsModal => self.handle_open_settings_modal(),
             Message::ConfirmSettingsModal => self.handle_confirm_settings_modal(),
+            Message::ApplySettingsModal => self.handle_apply_settings_modal(),
             Message::CancelSettingsModal => self.handle_cancel_settings_modal(),
             Message::SettingsToggleEnvironment(value) => {
                 self.handle_settings_toggle_environment(value)
@@ -5497,6 +5502,7 @@ impl RunConfigManager {
                 mcp_masked_token: self.mcp_token.as_deref().map(mask_token),
                 mcp_add_command: self.mcp_add_command(false),
                 mcp_status: self.mcp_status.label(),
+                can_apply: self.settings_modal_can_apply(),
             };
             layers = layers.push(view_settings_modal(props));
         }

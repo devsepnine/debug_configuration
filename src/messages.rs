@@ -192,7 +192,9 @@ pub enum Message {
     OpenSettingsModal,
     /// 설정 모달 OK — staging 검증 후 설정에 반영하고 저장
     ConfirmSettingsModal,
-    /// 설정 모달 Cancel — staging 폐기
+    /// 설정 모달 Apply — OK와 같이 반영·저장하되 모달은 유지
+    ApplySettingsModal,
+    /// 설정 모달 Cancel — 마지막 Apply 이후의 staging 변경 폐기
     CancelSettingsModal,
     /// 설정: 실행 시 Environment 라인 표시 토글
     SettingsToggleEnvironment(bool),

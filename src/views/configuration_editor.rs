@@ -779,6 +779,8 @@ pub struct SettingsModalView<'a> {
     pub mcp_add_command: String,
     /// 리스너 상태 한 줄.
     pub mcp_status: String,
+    /// Apply로 할 일이 있는지(변경 또는 토큰 재시도). 없으면 Apply를 비활성화한다.
+    pub can_apply: bool,
 }
 
 /// 앱 설정 모달 (반투명 배경 + 중앙 다이얼로그). env 모달과 동일한 오버레이/스타일을
@@ -852,6 +854,10 @@ pub fn view_settings_modal(props: SettingsModalView<'_>) -> Element<'_, Message>
         Space::new().width(Length::Fill),
         button(text("Cancel").size(13))
             .on_press(Message::CancelSettingsModal)
+            .padding([6, 16])
+            .style(modal_secondary_button_style),
+        button(text("Apply").size(13))
+            .on_press_maybe(props.can_apply.then_some(Message::ApplySettingsModal))
             .padding([6, 16])
             .style(modal_secondary_button_style),
         button(text("OK").size(13))
