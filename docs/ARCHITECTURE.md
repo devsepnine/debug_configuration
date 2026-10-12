@@ -44,8 +44,8 @@ Before adding a file in a new place, a new module, or an import that crosses uni
 
 - **Level**: MUST
 - **Rule**: `src/services/`는 `crate::app`, `crate::views`, `crate::widgets`, `crate::messages`를 참조하지 않는다. 서비스는 자기 이벤트 타입을 내고 `app`이 그것을 `Message`로 감싼다.
-- **Why**: 2026-10-12 결정(표준 방식). MCP(`src/services/mcp/mod.rs` → `McpEvent`, `McpRequest`)가 이미 이 방식이다. 서비스가 `Message`를 알면 `messages ↔ services` 순환이 생기고 서비스를 UI 없이 테스트할 수 없다.
-- **Evidence**: 1 file · `grep -rlE 'crate::(app|views|widgets|messages)(::|\b)' src/services`
+- **Why**: 2026-10-12 결정(표준 방식). MCP(`src/services/mcp/mod.rs` → `McpEvent`, `McpRequest`)와 실행(`src/services/executor.rs` → `RunEvent`)이 이 방식이다. 서비스가 `Message`를 알면 `messages ↔ services` 순환이 생기고 서비스를 UI 없이 테스트할 수 없다.
+- **Evidence**: 0 files · `grep -rlE 'crate::(app|views|widgets|messages)(::|\b)' src/services`
 - **Exceptions**: none
 - **Enforced by**: draft: CI grep
 
@@ -116,7 +116,6 @@ Before adding a file in a new place, a new module, or an import that crosses uni
 
 | Path | Rule | Decision |
 |---|---|---|
-| `src/services/executor.rs` | `arch-services-no-ui` | fix: `Message`를 직접 만들지 않고 실행 이벤트 타입을 내도록 바꾼 뒤 `app`이 `Message`로 감싼다. `messages ↔ services` 순환도 함께 사라진다 |
 | `src/models/pane.rs` | `arch-models-no-ui` | fix: `crate::widgets::pane_grid`의 `Axis`·`Configuration`·`Node`·`Pane`·`State`를 직접 쓴다. 레이아웃 트리를 모델 자체 타입으로 표현하거나 `app` 쪽으로 옮긴다 |
 | `src/utils.rs` | `arch-io-in-services` | fix: package.json 읽기·디렉터리 스캔(`std::fs`)과 런타임·JDK 감지(`process::Command`)를 `services`로 옮긴다 |
 | `src/app.rs` | `arch-io-in-services` | fix: 파일 다이얼로그(`rfd`), OS 알림(`notify_rust`), URL 열기(`open::that`), 업데이트 후 재실행(`process::Command`)을 `services`로 옮긴다 |

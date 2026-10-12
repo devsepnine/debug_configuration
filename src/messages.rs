@@ -2,7 +2,7 @@ use crate::models::{
     ConfigurationType, ExecuteModeType, KotlinLaunchModeType, NodeCommand, PackageManager,
     RunConfiguration, RunFailure, SpringBootBuildTool, StdinWriteError,
 };
-use crate::services::{McpEvent, McpPermission, McpRequest};
+use crate::services::{McpEvent, McpPermission, McpRequest, RunEvent};
 use crate::utils::CandidateScan;
 use crate::widgets::pane_grid;
 use iced::window;
@@ -520,6 +520,15 @@ pub enum Message {
     CloseWindow,
 }
 
+impl From<RunEvent> for Message {
+    fn from(event: RunEvent) -> Self {
+        match event {
+            RunEvent::Started(session_id, pid) => Message::ProcessStarted(session_id, pid),
+            RunEvent::Output(session_id, events) => Message::OutputReceived(session_id, events),
+            RunEvent::Completed(session_id, result) => Message::RunCompleted(session_id, result),
+        }
+    }
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigurationDropPosition {
     Before,

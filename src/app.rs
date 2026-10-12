@@ -1778,7 +1778,7 @@ impl RunConfigManager {
                     // SessionViewportResized가 보정한다.
                     self.last_seen_viewport,
                 ),
-                |msg| msg,
+                Message::from,
             );
         }
 
@@ -1848,7 +1848,7 @@ impl RunConfigManager {
                     // compound 멤버도 최근 pane 뷰포트로 스폰 (위 run 경로와 동일 근거).
                     self.last_seen_viewport,
                 ),
-                |msg| msg,
+                Message::from,
             ));
         }
 
@@ -4439,7 +4439,7 @@ impl RunConfigManager {
                 self.show_environment_on_run,
                 initial_viewport,
             ),
-            |msg| msg,
+            Message::from,
         )
     }
 

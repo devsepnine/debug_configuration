@@ -1,4 +1,3 @@
-use crate::messages::Message;
 use crate::models::{
     ConfigTypeData, ExecuteMode, KotlinLaunchMode, NodeCommand, OutputEvent, PackageManager,
     RunConfiguration, RunFailure, SpringBootBuildTool,
@@ -15,6 +14,18 @@ use std::time::Duration;
 use tokio::process::{Child, ChildStderr, ChildStdout};
 use tokio::time::{Instant, sleep_until};
 use uuid::Uuid;
+
+/// 실행 스트림이 내는 이벤트. 서비스는 UI의 `Message`를 모르고, `app`이
+/// `Message::from`으로 감싼다(`docs/ARCHITECTURE.md` → `arch-services-no-ui`).
+#[derive(Debug, Clone)]
+pub enum RunEvent {
+    /// 프로세스 시작됨 (세션 ID, PID)
+    Started(Uuid, u32),
+    /// 출력 이벤트 배치 (세션 ID, 이벤트)
+    Output(Uuid, Vec<OutputEvent>),
+    /// 실행 완료 (세션 ID, 종료 코드 또는 실패 사유)
+    Completed(Uuid, Result<i32, RunFailure>),
+}
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -451,19 +462,19 @@ fn quote_if_needed(path: &str) -> String {
 /// * `cancel_flag` - 프로세스 취소를 위한 플래그
 ///
 /// # Returns
-/// 실행 중 발생하는 이벤트를 담은 Message 스트림
+/// 실행 중 발생하는 이벤트를 담은 `RunEvent` 스트림
 /// 스트림 태스크가 RunCompleted를 보내지 못한 채 종료되면(패닉 unwind 등) 세션이
 /// `is_running` 상태로 영구 고착되고 종료 알림/exit code도 영영 오지 않는다. 이 가드는
 /// 정상 종료 시 `disarm`되며, armed인 채로 drop되면 종료 보장용 RunCompleted(Err)를
 /// best-effort(try_send)로 발행한다.
 struct CompletionGuard {
-    output: iced::futures::channel::mpsc::Sender<Message>,
+    output: iced::futures::channel::mpsc::Sender<RunEvent>,
     session_id: Uuid,
     armed: bool,
 }
 
 impl CompletionGuard {
-    fn new(output: iced::futures::channel::mpsc::Sender<Message>, session_id: Uuid) -> Self {
+    fn new(output: iced::futures::channel::mpsc::Sender<RunEvent>, session_id: Uuid) -> Self {
         Self {
             output,
             session_id,
@@ -506,7 +517,7 @@ impl Drop for CompletionGuard {
             }
         }
         if self.armed {
-            let _ = self.output.try_send(Message::RunCompleted(
+            let _ = self.output.try_send(RunEvent::Completed(
                 self.session_id,
                 Err(RunFailure::Failed(String::from(
                     "Run interrupted unexpectedly",
@@ -539,10 +550,10 @@ pub fn run_configuration_stream(
     cancel_flag: Arc<AtomicBool>,
     show_env: bool,
     initial_viewport: Option<(u16, u16)>,
-) -> impl iced::futures::Stream<Item = Message> {
+) -> impl iced::futures::Stream<Item = RunEvent> {
     stream::channel(
         100,
-        move |mut output: iced::futures::channel::mpsc::Sender<Message>| async move {
+        move |mut output: iced::futures::channel::mpsc::Sender<RunEvent>| async move {
             // PTY가 없는 기타 플랫폼에서는 초기 뷰포트를 쓸 곳이 없다.
             #[cfg(not(any(unix, windows)))]
             let _ = initial_viewport;
@@ -615,7 +626,7 @@ pub fn run_configuration_stream(
                         );
                         use iced::futures::SinkExt;
                         let _ = output
-                            .send(Message::OutputReceived(
+                            .send(RunEvent::Output(
                                 session_id,
                                 vec![OutputEvent::Line(banner)],
                             ))
@@ -1201,7 +1212,7 @@ fn single_line(fragment: &str) -> String {
 }
 
 async fn send_command_info(
-    output: &mut iced::futures::channel::mpsc::Sender<Message>,
+    output: &mut iced::futures::channel::mpsc::Sender<RunEvent>,
     session_id: Uuid,
     config: &RunConfiguration,
     command_str: &str,
@@ -1242,9 +1253,7 @@ async fn send_command_info(
     }
     events.extend(lines_to_events(&tail));
 
-    let _ = output
-        .send(Message::OutputReceived(session_id, events))
-        .await;
+    let _ = output.send(RunEvent::Output(session_id, events)).await;
 }
 
 /// PTY 세션 파이프라인: ProcessStarted → 조립 루프 → (취소 시 종료 처리) → RunCompleted.
@@ -1252,7 +1261,7 @@ async fn send_command_info(
 /// 이 파이프라인 자체는 공유된다.
 #[cfg(any(unix, windows))]
 async fn handle_pty_process(
-    output: &mut iced::futures::channel::mpsc::Sender<Message>,
+    output: &mut iced::futures::channel::mpsc::Sender<RunEvent>,
     session_id: Uuid,
     mut pty: PtyProcess,
     cancel_flag: Arc<AtomicBool>,
@@ -1260,7 +1269,7 @@ async fn handle_pty_process(
     use iced::futures::SinkExt;
 
     if let Some(pid) = pty.pid {
-        let _ = output.send(Message::ProcessStarted(session_id, pid)).await;
+        let _ = output.send(RunEvent::Started(session_id, pid)).await;
     }
 
     match pty_output_loop(
@@ -1301,7 +1310,7 @@ enum PtyLoopEnd {
 /// 모든 종료 경로는 반환 전에 잔여 배치를 flush한다 (RunCompleted보다 출력이 먼저).
 #[cfg(unix)]
 async fn pty_output_loop(
-    output: &mut iced::futures::channel::mpsc::Sender<Message>,
+    output: &mut iced::futures::channel::mpsc::Sender<RunEvent>,
     session_id: Uuid,
     chunks_rx: &mut tokio::sync::mpsc::Receiver<Vec<u8>>,
     exit_rx: &mut tokio::sync::oneshot::Receiver<Result<i32, String>>,
@@ -1414,7 +1423,7 @@ const CONPTY_EOF_FAILSAFE: Duration = Duration::from_secs(5);
 /// failsafe는 청크가 흐르는 동안 굶는데 그게 정확한 의미 — 진행 중엔 실링 불필요).
 #[cfg(windows)]
 async fn pty_output_loop(
-    output: &mut iced::futures::channel::mpsc::Sender<Message>,
+    output: &mut iced::futures::channel::mpsc::Sender<RunEvent>,
     session_id: Uuid,
     chunks_rx: &mut tokio::sync::mpsc::Receiver<Vec<u8>>,
     exit_rx: &mut tokio::sync::oneshot::Receiver<Result<i32, String>>,
@@ -1534,7 +1543,7 @@ const PTY_FLUSH_MAX_BYTES: usize = 256 * 1024;
 /// 이벤트 배치를 한 개의 `OutputReceived`로 전송. 비어 있으면 no-op.
 #[cfg(any(unix, windows))]
 async fn flush_event_batch(
-    output: &mut iced::futures::channel::mpsc::Sender<Message>,
+    output: &mut iced::futures::channel::mpsc::Sender<RunEvent>,
     session_id: Uuid,
     batch: &mut EventBatch,
 ) {
@@ -1544,9 +1553,7 @@ async fn flush_event_batch(
         return;
     }
     let events = batch.take();
-    let _ = output
-        .send(Message::OutputReceived(session_id, events))
-        .await;
+    let _ = output.send(RunEvent::Output(session_id, events)).await;
 }
 
 /// PTY 자식 종료: SIGTERM(그룹, 가드 포함) → 2s 대기 → SIGKILL → waiter reap 대기.
@@ -1604,7 +1611,7 @@ async fn terminate_and_reap_pty(
 }
 
 async fn handle_spawned_process(
-    output: &mut iced::futures::channel::mpsc::Sender<Message>,
+    output: &mut iced::futures::channel::mpsc::Sender<RunEvent>,
     session_id: Uuid,
     mut child: Child,
     cancel_flag: Arc<AtomicBool>,
@@ -1649,14 +1656,14 @@ async fn handle_spawned_process(
 }
 
 async fn send_process_started(
-    output: &mut iced::futures::channel::mpsc::Sender<Message>,
+    output: &mut iced::futures::channel::mpsc::Sender<RunEvent>,
     session_id: Uuid,
     child: &Child,
 ) {
     use iced::futures::SinkExt;
 
     if let Some(pid) = child.id() {
-        let _ = output.send(Message::ProcessStarted(session_id, pid)).await;
+        let _ = output.send(RunEvent::Started(session_id, pid)).await;
     }
 }
 
@@ -1699,7 +1706,7 @@ const OUTPUT_FLUSH_MAX_BYTES: usize = 16 * 1024;
 /// 필요 없다. 종료(취소/EOF) 직전에는 반드시 남은 배치를 flush해, 마지막 출력이
 /// 호출자가 보내는 RunCompleted(종료 배너)보다 먼저 도착하도록 한다.
 async fn process_output_loop<O, E>(
-    output: &mut iced::futures::channel::mpsc::Sender<Message>,
+    output: &mut iced::futures::channel::mpsc::Sender<RunEvent>,
     session_id: Uuid,
     stdout_reader: &mut Option<tokio::io::BufReader<O>>,
     stderr_reader: &mut Option<tokio::io::BufReader<E>>,
@@ -2073,7 +2080,7 @@ impl LineAssembler {
 
 /// 누적된 배치를 한 개의 `OutputReceived` 메시지로 전송하고 버퍼를 비운다. 비어 있으면 no-op.
 async fn flush_batch(
-    output: &mut iced::futures::channel::mpsc::Sender<Message>,
+    output: &mut iced::futures::channel::mpsc::Sender<RunEvent>,
     session_id: Uuid,
     batch: &mut String,
     batch_lines: &mut usize,
@@ -2086,10 +2093,7 @@ async fn flush_batch(
     let payload = std::mem::take(batch);
     *batch_lines = 0;
     let _ = output
-        .send(Message::OutputReceived(
-            session_id,
-            lines_to_events(&payload),
-        ))
+        .send(RunEvent::Output(session_id, lines_to_events(&payload)))
         .await;
 }
 
@@ -2103,7 +2107,7 @@ async fn wait_flush_deadline(flush_at: Option<Instant>) {
 }
 
 async fn wait_for_process(
-    output: &mut iced::futures::channel::mpsc::Sender<Message>,
+    output: &mut iced::futures::channel::mpsc::Sender<RunEvent>,
     session_id: Uuid,
     child: &mut Child,
     cancel_flag: &Arc<AtomicBool>,
@@ -2139,13 +2143,13 @@ async fn wait_for_process(
 }
 
 async fn send_run_result(
-    output: &mut iced::futures::channel::mpsc::Sender<Message>,
+    output: &mut iced::futures::channel::mpsc::Sender<RunEvent>,
     session_id: Uuid,
     result: Result<i32, RunFailure>,
 ) {
     use iced::futures::SinkExt;
 
-    let _ = output.send(Message::RunCompleted(session_id, result)).await;
+    let _ = output.send(RunEvent::Completed(session_id, result)).await;
 }
 
 /// 취소된 프로세스를 종료하고 반드시 reap한다.
@@ -2988,7 +2992,7 @@ mod tests {
         };
         let session_id = Uuid::new_v4();
 
-        let messages: Vec<Message> = run_configuration_stream(
+        let messages: Vec<RunEvent> = run_configuration_stream(
             config,
             session_id,
             Arc::new(AtomicBool::new(false)),
@@ -3001,7 +3005,7 @@ mod tests {
         assert!(
             !messages
                 .iter()
-                .any(|message| matches!(message, Message::ProcessStarted(..))),
+                .any(|message| matches!(message, RunEvent::Started(..))),
             "스폰이 일어났다: {messages:?}"
         );
 
@@ -3010,12 +3014,12 @@ mod tests {
         // 초록인 채 그 목적만 사라진다.
         let banner = messages
             .iter()
-            .position(|message| matches!(message, Message::OutputReceived(..)))
+            .position(|message| matches!(message, RunEvent::Output(..)))
             .expect("배너가 먼저 나가야 한다");
         let completed: Vec<usize> = messages
             .iter()
             .enumerate()
-            .filter(|(_, message)| matches!(message, Message::RunCompleted(..)))
+            .filter(|(_, message)| matches!(message, RunEvent::Completed(..)))
             .map(|(at, _)| at)
             .collect();
 
@@ -3029,7 +3033,7 @@ mod tests {
         assert!(banner < completed[0], "배너가 완료보다 앞이어야 한다");
 
         match &messages[completed[0]] {
-            Message::RunCompleted(_, Err(RunFailure::Failed(reason))) => {
+            RunEvent::Completed(_, Err(RunFailure::Failed(reason))) => {
                 assert!(reason.contains("Working directory"), "{reason}");
             }
             other => panic!("실패로 끝나야 한다: {other:?}"),
@@ -3273,11 +3277,11 @@ mod tests {
         use iced::futures::StreamExt;
 
         /// 수신된 메시지에서 OutputReceived 이벤트만 평탄화.
-        fn collect_events(messages: &[Message]) -> Vec<OutputEvent> {
+        fn collect_events(messages: &[RunEvent]) -> Vec<OutputEvent> {
             messages
                 .iter()
                 .filter_map(|m| match m {
-                    Message::OutputReceived(_, events) => Some(events.clone()),
+                    RunEvent::Output(_, events) => Some(events.clone()),
                     _ => None,
                 })
                 .flatten()
@@ -3288,7 +3292,7 @@ mod tests {
         /// 취소 직전 emit_partial 어느 쪽이 실어 보내든 — 관측 가능한 불변식만 단언).
         #[tokio::test]
         async fn cancel_delivers_open_partial_line_and_returns_cancelled() {
-            let (mut tx, mut rx) = iced::futures::channel::mpsc::channel::<Message>(100);
+            let (mut tx, mut rx) = iced::futures::channel::mpsc::channel::<RunEvent>(100);
             let cancel = Arc::new(AtomicBool::new(false));
             let (chunks_tx, mut chunks_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
             let (_exit_tx, mut exit_rx) = tokio::sync::oneshot::channel::<Result<i32, String>>();
@@ -3330,7 +3334,7 @@ mod tests {
         /// 기다려 Completed로 끝나야 한다 (oneshot 이중 폴 없이).
         #[tokio::test]
         async fn eof_before_exit_awaits_status_then_completes() {
-            let (mut tx, mut rx) = iced::futures::channel::mpsc::channel::<Message>(100);
+            let (mut tx, mut rx) = iced::futures::channel::mpsc::channel::<RunEvent>(100);
             let cancel = Arc::new(AtomicBool::new(false));
             let (chunks_tx, mut chunks_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
             let (exit_tx, mut exit_rx) = tokio::sync::oneshot::channel::<Result<i32, String>>();
@@ -3369,7 +3373,7 @@ mod tests {
         /// 기록한 뒤에도 EOF까지 드레인하고, 늦게 도착한 출력을 보존해야 한다.
         #[tokio::test]
         async fn exit_before_eof_keeps_draining_grandchild_output() {
-            let (mut tx, mut rx) = iced::futures::channel::mpsc::channel::<Message>(100);
+            let (mut tx, mut rx) = iced::futures::channel::mpsc::channel::<RunEvent>(100);
             let cancel = Arc::new(AtomicBool::new(false));
             let (chunks_tx, mut chunks_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
             let (exit_tx, mut exit_rx) = tokio::sync::oneshot::channel::<Result<i32, String>>();
@@ -3416,7 +3420,7 @@ mod tests {
         #[cfg(windows)]
         #[tokio::test(start_paused = true)]
         async fn failsafe_rolls_while_teardown_drain_flows() {
-            let (mut tx, mut rx) = iced::futures::channel::mpsc::channel::<Message>(1000);
+            let (mut tx, mut rx) = iced::futures::channel::mpsc::channel::<RunEvent>(1000);
             let cancel = Arc::new(AtomicBool::new(false));
             let (chunks_tx, mut chunks_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
             let (exit_tx, mut exit_rx) = tokio::sync::oneshot::channel::<Result<i32, String>>();
@@ -3472,7 +3476,7 @@ mod tests {
         /// "Run interrupted unexpectedly"로 은폐). Cancelled{exit_taken}이 재await를 건너뛴다.
         #[tokio::test]
         async fn cancel_after_exit_does_not_repoll_consumed_oneshot() {
-            let (mut tx, _rx) = iced::futures::channel::mpsc::channel::<Message>(100);
+            let (mut tx, _rx) = iced::futures::channel::mpsc::channel::<RunEvent>(100);
             let cancel = Arc::new(AtomicBool::new(false));
             let (_chunks_tx, mut chunks_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
             let (exit_tx, mut exit_rx) = tokio::sync::oneshot::channel::<Result<i32, String>>();
@@ -4589,7 +4593,7 @@ time.sleep(30)'";
     async fn output_loop_terminates_when_one_reader_eofs_first() {
         use tokio::io::BufReader;
 
-        let (mut tx, _rx) = iced::futures::channel::mpsc::channel::<Message>(100);
+        let (mut tx, _rx) = iced::futures::channel::mpsc::channel::<RunEvent>(100);
         let cancel = Arc::new(AtomicBool::new(false));
 
         // stdout: 데이터 후 EOF / stderr: 즉시 EOF (실제 "echo 후 종료" 시나리오 재현).
@@ -4623,7 +4627,7 @@ time.sleep(30)'";
         use iced::futures::StreamExt;
         use tokio::io::BufReader;
 
-        let (mut tx, mut rx) = iced::futures::channel::mpsc::channel::<Message>(1000);
+        let (mut tx, mut rx) = iced::futures::channel::mpsc::channel::<RunEvent>(1000);
         let cancel = Arc::new(AtomicBool::new(false));
 
         let mut data = Vec::new();
@@ -4655,7 +4659,7 @@ time.sleep(30)'";
         // (EOF 시 잔여 부분 배치 flush가 누락 없이 마지막 줄들까지 보내는지도 검증).
         let mut reconstructed = String::new();
         for msg in &messages {
-            if let Message::OutputReceived(_, events) = msg {
+            if let RunEvent::Output(_, events) = msg {
                 for event in events {
                     match event {
                         crate::models::OutputEvent::Line(text)
@@ -4678,7 +4682,7 @@ time.sleep(30)'";
         // 인메모리 read는 즉시 완료되어 16ms 타이머가 거의 발화하지 않으므로 여유 상한 20).
         let output_msgs = messages
             .iter()
-            .filter(|m| matches!(m, Message::OutputReceived(_, _)))
+            .filter(|m| matches!(m, RunEvent::Output(_, _)))
             .count();
         assert!(
             output_msgs < 200,
@@ -4743,7 +4747,7 @@ time.sleep(30)'";
         let mut lines: Vec<String> = Vec::new();
         let mut banner_events: Vec<String> = Vec::new();
         while let Some(msg) = rx.next().await {
-            if let Message::OutputReceived(_, events) = msg {
+            if let RunEvent::Output(_, events) = msg {
                 for event in events {
                     match event {
                         crate::models::OutputEvent::EnvBanner(text) => {
@@ -4797,7 +4801,7 @@ time.sleep(30)'";
             drop(tx);
             let mut out = String::new();
             while let Some(msg) = rx.next().await {
-                if let Message::OutputReceived(_, events) = msg {
+                if let RunEvent::Output(_, events) = msg {
                     for event in events {
                         match event {
                             crate::models::OutputEvent::Line(text)
