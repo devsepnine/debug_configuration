@@ -4,16 +4,14 @@ use crate::models::{
     KotlinLaunchModeType, PackageManager, RunConfiguration, RunFailure, RunSession, SearchState,
     SessionStatusKind, SpringBootBuildTool,
 };
+use crate::services::detection::{CandidateScan, SpringModuleFlavor};
 use crate::services::{
     AppSettings, McpPermission, McpRequestLog, UpdateOutcome, check_latest_release, export_text,
     force_kill_process_tree, load_or_migrate_store, load_settings, mask_token, mcp_server,
     register_running_pid, resolve_spring_build_tool, run_configuration_stream, save_settings,
     save_to_store, terminate_session_process, unregister_running_pid,
 };
-use crate::utils::{
-    CandidateScan, DIALOG_CANCELLED, ICON_DELETE, ICON_PLAY, ICON_REFRESH, ICON_STOP,
-    SpringModuleFlavor,
-};
+use crate::utils::{DIALOG_CANCELLED, ICON_DELETE, ICON_PLAY, ICON_REFRESH, ICON_STOP};
 use crate::views::shared::icon_tooltip;
 use crate::views::{
     ConfirmDeleteModalView, ConfirmUpdateModalView, EditorLoadingState, EditorSelectState,
@@ -380,7 +378,7 @@ fn resolve_and_scan_spring_boot_modules(
     let resolved = resolve_spring_build_tool(tool, root)?;
     let flavor = spring_module_flavor(resolved)
         .ok_or_else(|| String::from("Modules are not used with the JAR build tool"))?;
-    Ok(crate::utils::scan_spring_boot_modules(
+    Ok(crate::services::detection::scan_spring_boot_modules(
         std::path::Path::new(root),
         flavor,
     ))
@@ -411,8 +409,10 @@ fn scan_kotlin_candidates(root: &str, kind: CandidateKind) -> Result<CandidateSc
         ));
     }
     Ok(match kind {
-        CandidateKind::KotlinMainClass => crate::utils::scan_kotlin_main_classes(path),
-        CandidateKind::KotlinJar => crate::utils::scan_jar_artifacts(path),
+        CandidateKind::KotlinMainClass => {
+            crate::services::detection::scan_kotlin_main_classes(path)
+        }
+        CandidateKind::KotlinJar => crate::services::detection::scan_jar_artifacts(path),
         CandidateKind::SpringModule => {
             return Err(String::from("Spring modules are scanned separately"));
         }
@@ -452,9 +452,8 @@ async fn scan_node_metadata(
     project_dir: String,
     working_dir: String,
 ) -> (Uuid, Vec<String>, Vec<String>) {
-    use crate::utils::{
-        find_all_package_jsons, find_package_json, parse_scripts, to_relative_path,
-    };
+    use crate::services::detection::{find_all_package_jsons, find_package_json, parse_scripts};
+    use crate::utils::to_relative_path;
     use std::path::Path;
 
     tokio::task::spawn_blocking(move || {
@@ -713,13 +712,13 @@ impl RunConfigManager {
 
         // 1. Node Runtime 감지 (백그라운드)
         tasks.push(Task::perform(
-            async { crate::utils::detect_node_runtimes() },
+            async { crate::services::detection::detect_node_runtimes() },
             Message::NodeRuntimesDetected,
         ));
 
         // 1-1. JDK 감지 (백그라운드)
         tasks.push(Task::perform(
-            async { crate::utils::detect_jdks() },
+            async { crate::services::detection::detect_jdks() },
             Message::JdksDetected,
         ));
 
@@ -2306,7 +2305,8 @@ impl RunConfigManager {
 
                 return Task::perform(
                     async move {
-                        use crate::utils::{find_all_package_jsons, to_relative_path};
+                        use crate::services::detection::find_all_package_jsons;
+                        use crate::utils::to_relative_path;
                         use std::path::Path;
 
                         let project_dir = Path::new(&dir_path);
@@ -4778,7 +4778,8 @@ impl RunConfigManager {
 
     /// Node `package.json` 목록 로드 (`project_directory`에서)
     fn load_node_package_jsons(&mut self, config_id: Uuid, project_directory: &str) {
-        use crate::utils::{find_all_package_jsons, to_relative_path};
+        use crate::services::detection::find_all_package_jsons;
+        use crate::utils::to_relative_path;
         use std::path::Path;
 
         let project_dir = Path::new(project_directory);
@@ -4795,7 +4796,7 @@ impl RunConfigManager {
 
     /// Node package scripts 로드 (package.json에서)
     fn load_node_scripts(&mut self, config_id: Uuid, working_dir: &str) {
-        use crate::utils::{find_package_json, parse_scripts};
+        use crate::services::detection::{find_package_json, parse_scripts};
         use std::path::Path;
 
         let path = Path::new(working_dir);

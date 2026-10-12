@@ -2330,7 +2330,7 @@ struct NodeCommandParts<'a> {
 }
 
 fn build_node_command(parts: NodeCommandParts<'_>) -> String {
-    use crate::utils::detect_package_manager;
+    use crate::services::detection::detect_package_manager;
     use std::path::Path;
 
     // 패키지 매니저 결정
@@ -2505,7 +2505,7 @@ fn resolve_java_executable(jdk_path: Option<&String>) -> String {
 
     let candidate = std::path::Path::new(trimmed);
     if candidate.is_dir() {
-        let name = crate::utils::java_executable_name();
+        let name = crate::services::detection::java_executable_name();
         let home_bin = candidate.join("bin").join(name);
         if home_bin.exists() {
             return quote_if_needed(&home_bin.to_string_lossy());
@@ -2771,7 +2771,7 @@ fn derive_java_home(jdk_path: Option<&str>) -> Option<std::path::PathBuf> {
     if !path.is_absolute() {
         return None;
     }
-    let name = crate::utils::java_executable_name();
+    let name = crate::services::detection::java_executable_name();
     if path.is_dir() {
         if path.join("bin").join(name).exists() {
             return Some(path.to_path_buf());
@@ -5584,7 +5584,7 @@ time.sleep(30)'";
 
     #[test]
     fn derive_java_home_handles_home_bin_dir_and_executable_inputs() {
-        let name = crate::utils::java_executable_name();
+        let name = crate::services::detection::java_executable_name();
         let jdk = TempDir::new("jdk");
         let java = jdk.touch(&format!("bin/{name}"));
 
@@ -5632,7 +5632,7 @@ time.sleep(30)'";
 
     #[test]
     fn gradle_and_maven_export_derived_java_home() {
-        let name = crate::utils::java_executable_name();
+        let name = crate::services::detection::java_executable_name();
         let jdk = TempDir::new("jdk-env");
         jdk.touch(&format!("bin/{name}"));
         let proj = TempDir::new("proj-env");

@@ -1,3 +1,4 @@
+pub mod detection;
 mod executor;
 mod mcp;
 mod self_update;

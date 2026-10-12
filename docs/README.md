@@ -20,7 +20,7 @@ debug_configuration/
 │   │   └── mcp.rs           # MCP 요청 핸들러 (툴별 처리, 권한 게이트, 감사 문구)
 │   ├── messages.rs          # Elm Architecture 메시지 타입 정의
 │   ├── ansi.rs              # ANSI 색상 코드 파싱
-│   ├── utils.rs             # 공통 유틸 (Node Runtime 감지, package.json 파싱, 아이콘)
+│   ├── utils.rs             # 공통 유틸 (아이콘, 텍스트 폭·말줄임, 상대 경로)
 │   ├── env_string.rs        # 환경변수 KEY=value 문자열 파싱/직렬화
 │   ├── models/
 │   │   ├── mod.rs           # 모델 모듈 재export
@@ -29,6 +29,7 @@ debug_configuration/
 │   │   └── session.rs       # RunSession, SearchState, 세션 상태
 │   ├── services/
 │   │   ├── mod.rs           # 서비스 모듈 재export
+│   │   ├── detection.rs     # 로컬 환경 감지 (package.json, Node 런타임, JDK, Spring/Kotlin 후보)
 │   │   ├── executor.rs      # 프로세스 실행 및 명령어 빌드, PID 추적
 │   │   ├── mcp/             # 로컬 MCP 서버 (docs/MCP.md)
 │   │   │   ├── mod.rs       # 공개 표면: 서버 스트림, McpRequest/McpOutcome, McpPermission

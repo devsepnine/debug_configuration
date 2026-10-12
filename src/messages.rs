@@ -2,8 +2,8 @@ use crate::models::{
     ConfigurationType, ExecuteModeType, KotlinLaunchModeType, NodeCommand, PackageManager,
     RunConfiguration, RunFailure, SpringBootBuildTool, StdinWriteError,
 };
+use crate::services::detection::CandidateScan;
 use crate::services::{McpEvent, McpPermission, McpRequest, RunEvent};
-use crate::utils::CandidateScan;
 use crate::widgets::pane_grid;
 use iced::window;
 use std::path::PathBuf;

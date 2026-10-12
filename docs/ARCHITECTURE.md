@@ -19,9 +19,9 @@ Before adding a file in a new place, a new module, or an import that crosses uni
 | `views` | `src/views/` | 상태 조각을 받아 `Element`를 만드는 뷰 함수와 `*View` props | `messages`, `models`, `widgets`, `utils`, `ansi`, `env_string`, `services`(타입만) |
 | `widgets` | `src/widgets/` | 재사용 커스텀 위젯(`pane_grid`, `configuration_list`, `title_bar_drag`)과 pane 레이아웃 상태(`pane_layout`) | `messages`, `models`, `utils`, `services`(타입만) |
 | `messages` | `src/messages.rs` | `Message` 열거형과 메시지 페이로드 타입 | `models`, `services`(이벤트 타입), `widgets`(위젯 이벤트 타입), `utils` |
-| `services` | `src/services/` | 부수 효과: 프로세스 실행, 파일 저장, 업데이트, MCP 서버 | `models`, `utils` |
+| `services` | `src/services/` | 부수 효과: 프로세스 실행, 파일 저장, 로컬 환경 감지, 업데이트, MCP 서버 | `models`, `utils` |
 | `models` | `src/models/` | 도메인 데이터 타입(구성, 세션, 환경변수)과 그 불변식 | `ansi` |
-| `utils` | `src/utils.rs` | 아이콘 상수, 텍스트 헬퍼, 런타임·JDK·package.json 감지 | `models` |
+| `utils` | `src/utils.rs` | 아이콘 상수와 순수 텍스트·경로 헬퍼 | none |
 | `ansi` | `src/ansi.rs` | ANSI 이스케이프를 `TextSegment`로 파싱 | none |
 | `env_string` | `src/env_string.rs` | `KEY=value;...` 문자열 파싱·직렬화 | none |
 
@@ -116,7 +116,6 @@ Before adding a file in a new place, a new module, or an import that crosses uni
 
 | Path | Rule | Decision |
 |---|---|---|
-| `src/utils.rs` | `arch-io-in-services` | fix: package.json 읽기·디렉터리 스캔(`std::fs`)과 런타임·JDK 감지(`process::Command`)를 `services`로 옮긴다 |
 | `src/app.rs` | `arch-io-in-services` | fix: 파일 다이얼로그(`rfd`), OS 알림(`notify_rust`), URL 열기(`open::that`), 업데이트 후 재실행(`process::Command`)을 `services`로 옮긴다 |
 | `src/views/configuration_editor.rs` | `arch-modal-views-file` | accepted until moved: 기존 6개 모달 뷰 |
 
