@@ -1,6 +1,7 @@
 pub mod detection;
 mod executor;
 mod mcp;
+pub mod platform;
 mod self_update;
 mod storage;
 mod update_check;

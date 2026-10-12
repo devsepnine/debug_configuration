@@ -38,6 +38,7 @@ debug_configuration/
 │   │   │   ├── tools.rs     # 툴 카탈로그·스키마·인자 파싱, 권한 필터
 │   │   │   ├── token.rs     # Bearer 토큰 생성·로드·퍼미션(0600)
 │   │   │   └── dedup.rs     # request_id 중복 흡수 창
+│   │   ├── platform.rs      # 파일 다이얼로그, 데스크톱 알림, URL 열기, 업데이트 후 재실행
 │   │   ├── storage.rs       # 구성 파일 저장/로드 (버전 envelope), AppSettings
 │   │   └── update_check.rs  # GitHub Releases 최신 버전 확인
 │   ├── views/

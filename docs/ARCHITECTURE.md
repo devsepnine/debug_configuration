@@ -1,7 +1,7 @@
 # RunConfigManager Architecture Rules
 
 Verified at `97e9cfc` · `2026-10-12` · Structural view: none · Feature map: `docs/FEATURES.md`
-Premises: 단일 바이너리 크레이트(`Cargo.toml`, workspace 없음), iced 0.14 Elm 구조(`update`/`view`/`subscription`). 경계 lint는 없다. 단위는 `src/main.rs`가 선언하는 최상위 모듈이다.
+Premises: 단일 바이너리 크레이트(`Cargo.toml`, workspace 없음), iced 0.14 Elm 구조(`update`/`view`/`subscription`). 경계 lint는 없다. 단위는 `src/main.rs`가 선언하는 최상위 모듈이다. 규칙은 운영 코드에 적용한다. 각 파일 끝의 `#[cfg(test)] mod tests`는 픽스처를 위해 `std::fs` 등을 쓸 수 있으므로 측정에서 뺀다(Evidence의 grep은 테스트 모듈 앞까지만 센 결과다).
 
 ## How to use these rules
 
@@ -80,8 +80,8 @@ Before adding a file in a new place, a new module, or an import that crosses uni
 
 - **Level**: MUST
 - **Rule**: 파일 시스템(`std::fs`, `tokio::fs`), 프로세스 실행(`process::Command`, `tokio::process`, `portable_pty`), 파일 다이얼로그(`rfd`), 네트워크(`reqwest`, `hyper`), 플랫폼 경로(`dirs`), URL 열기(`open`), OS 알림(`notify_rust`)은 `src/services/` 안에서만 쓴다. 환경변수 읽기(`std::env`)와 스레드 생성은 이 규칙 밖이다.
-- **Why**: 2026-10-12 결정(표준 방식). 부수 효과를 한 단위에 모아야 테스트에서 막을 지점이 하나가 된다. 지금은 테스트 빌드에서 URL을 열지 않으려고 `src/app.rs`가 `#[cfg(not(test))]` 가드를 직접 두고 있다.
-- **Evidence**: 3 files · `grep -rlE 'std::fs|\bfs::|tokio::(fs|process)|process::Command|portable_pty|rfd::|AsyncFileDialog|reqwest::|hyper::|dirs::|\bopen::|notify_rust' src | grep -v '^src/services/'`
+- **Why**: 2026-10-12 결정(표준 방식). 부수 효과를 한 단위에 모아야 테스트에서 막을 지점이 하나가 된다. 예: 테스트 빌드에서 브라우저를 열지 않는 가드는 `src/services/platform.rs` → `open_url` 한 곳에 있다.
+- **Evidence**: 1 file(`src/main.rs`, 예외), 운영 코드만 · `grep -rlE 'std::fs|\bfs::|tokio::(fs|process)|process::Command|portable_pty|rfd::|AsyncFileDialog|reqwest::|hyper::|dirs::|\bopen::|notify_rust' src | grep -v '^src/services/'`
 - **Exceptions**: `src/main.rs`, 진입점에서 `notify_rust::set_application`으로 알림 앱을 한 번 등록한다(앱 실행 전에만 가능)
 - **Enforced by**: draft: CI grep
 
@@ -116,7 +116,6 @@ Before adding a file in a new place, a new module, or an import that crosses uni
 
 | Path | Rule | Decision |
 |---|---|---|
-| `src/app.rs` | `arch-io-in-services` | fix: 파일 다이얼로그(`rfd`), OS 알림(`notify_rust`), URL 열기(`open::that`), 업데이트 후 재실행(`process::Command`)을 `services`로 옮긴다 |
 | `src/views/configuration_editor.rs` | `arch-modal-views-file` | accepted until moved: 기존 6개 모달 뷰 |
 
 ## Decisions
