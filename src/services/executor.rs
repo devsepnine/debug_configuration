@@ -1682,7 +1682,7 @@ fn take_process_streams(
 }
 
 /// 출력 배치 flush 주기(약 한 프레임). 자식이 로그를 폭주시킬 때 stdout 한 줄마다
-/// Message를 보내면 iced UI 스레드가 줄 수만큼 update()+view()+draw()를 돌려 포화되고
+/// 이벤트(→ `Message`)를 보내면 iced UI 스레드가 줄 수만큼 update()+view()+draw()를 돌려 포화되고
 /// 입력(스크롤/클릭)이 starvation 된다. 줄을 모아 이 주기마다 한 번에 보내 UI 메시지 비율을
 /// 출력량과 무관하게 ~60/s로 묶는다. app 측은 이미 멀티라인 페이로드를 처리한다
 /// (handle_output_received가 output.lines() 순회, add_output_line이 '\n' 분할).

@@ -122,9 +122,9 @@ Before adding a file in a new place, a new module, or an import that crosses uni
 
 | Date | Question | Answer |
 |---|---|---|
-| `2026-10-12` | models/pane.rs(현 `src/widgets/pane_layout.rs`)가 `crate::widgets::pane_grid`를 직접 쓴다. 모델이 UI 위젯에 의존해도 되는가 | 표준 방식을 따른다. models는 UI에 의존하지 않는 MUST 규칙으로 두고 pane.rs는 고칠 위반으로 기록한다 |
-| `2026-10-12` | `executor.rs`는 `Message`를 직접 보내고 MCP는 자기 이벤트 타입을 낸다. 새 service는 어느 쪽인가 | 표준 방식으로 규칙을 추가한다. services는 자기 이벤트 타입을 내고 app이 감싼다(MUST). executor.rs는 고칠 위반 |
-| `2026-10-12` | 파일 I/O·프로세스 실행이 `utils.rs`와 `app.rs`에도 있다 | 표준 방식으로 작성한다. I/O는 services에만 둔다(MUST). 두 파일은 고칠 위반 |
+| `2026-10-12` | models/pane.rs(현 `src/widgets/pane_layout.rs`)가 `crate::widgets::pane_grid`를 직접 쓴다. 모델이 UI 위젯에 의존해도 되는가 | 표준 방식을 따른다. models는 UI에 의존하지 않는 MUST 규칙으로 두고 pane.rs는 고칠 위반으로 기록한다. 해소: `0c6a29f` |
+| `2026-10-12` | `executor.rs`는 `Message`를 직접 보내고 MCP는 자기 이벤트 타입을 낸다. 새 service는 어느 쪽인가 | 표준 방식으로 규칙을 추가한다. services는 자기 이벤트 타입을 내고 app이 감싼다(MUST). executor.rs는 고칠 위반. 해소: `b847304` |
+| `2026-10-12` | 파일 I/O·프로세스 실행이 `utils.rs`와 `app.rs`에도 있다 | 표준 방식으로 작성한다. I/O는 services에만 둔다(MUST). 두 파일은 고칠 위반. 해소: `fb820de`(utils), `b93d694`(app) |
 | `2026-10-12` | 모달 뷰 6개가 `configuration_editor.rs`에 있다. 새 모달 뷰는 어디인가 | 마이그레이션. 새 모달 뷰는 `<new> src/views/modals.rs`, 기존 6개는 옮길 때까지 허용 |
 
 "표준 방식"은 iced/Elm 계층 구조의 일반 관례를 뜻한다: 도메인 모델은 UI를 모르고, 서비스는 UI 메시지가 아니라 자기 이벤트를 내며, 부수 효과는 서비스 계층에 모은다. 2026-10-12에 사용자가 이 해석과 세 규칙의 MUST 수준을 확인했다.
