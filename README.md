@@ -31,6 +31,8 @@ Grab the latest pre-built binary for your platform from the [Releases page](http
 - Write inline Shell Script text in a multi-line editor (monospace font,
   Enter for new lines, bounded height with internal scrolling)
 - Manage environment variables (add, edit, delete)
+- Enable or disable each environment variable with the checkbox in the editor; disabled ones stay
+  saved but are not passed to runs
 - Reorder configurations with drag and drop
 - Save configurations (versioned JSON format)
 - Export selected configurations to a file / import from a file with selective merge

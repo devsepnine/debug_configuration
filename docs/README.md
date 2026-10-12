@@ -25,6 +25,7 @@ debug_configuration/
 │   ├── models/
 │   │   ├── mod.rs           # 모델 모듈 재export
 │   │   ├── configuration.rs # RunConfiguration, ConfigurationType, ConfigTypeData, NodeCommand
+│   │   ├── env_vars.rs      # EnvVars/EnvEntry (환경변수 목록, 항목별 활성 여부, 키 유일성)
 │   │   ├── session.rs       # RunSession, SearchState, 세션 상태
 │   │   └── pane.rs          # Pane/WorkspaceTab 레이아웃 상태
 │   ├── services/

@@ -131,12 +131,15 @@ claude mcp add --transport http runconfig http://127.0.0.1:47355/mcp \
 ### Read only
 
 **`list_configurations`** — 저장된 구성 전체의 `id` · `name` · `type` ·
-`working_directory` · `environment_variable_keys`. **값은 마스킹된 형태로도 실리지 않는다**
-(키만). 값이 필요하면 구성 하나를 `get_configuration`으로 읽는다.
+`working_directory` · `environment_variable_keys` · `disabled_environment_variable_keys`.
+**값은 마스킹된 형태로도 실리지 않는다**(키만). `environment_variable_keys`는 비활성 키도
+포함하고, 그중 실행에 전달되지 않는 키가 `disabled_environment_variable_keys`에 따로 실린다. 값이 필요하면 구성 하나를 `get_configuration`으로 읽는다.
 
 **`get_configuration(configuration)`** — 구성 하나의 전체 상세. `configuration`은 id(UUID)
 또는 **정확한** 이름이다. `type_data`가 타입별 필드를 그대로 싣는다 — 편집 툴에 넘길
 `type_data`는 이 응답에서 복사해 고치는 것이 정해진 사용법이다.
+`environment_variables`는 입력 순서를 지킨 `[{key, value, enabled}]` 배열이다. `enabled: false`인
+항목은 저장만 되고 실행에는 전달되지 않는다. 키는 활성·비활성을 통틀어 유일하다.
 
 **`list_sessions`** — 세션별 `session_id` · `config_id` · `config_name` · `state` · `exit_code` ·
 `error` · `started_at_unix_ms` · `duration_ms` · `line_count`. 나머지 세션 툴이 인자로 받는
@@ -211,7 +214,11 @@ compound인 경우다(중첩 실행을 하지 않는다). 그래서 `sessions`�
 **`configuration`도 마스킹 토글을 따른다**(5장) — 환경변수 값을 실어 성공한 쓰기조차 기본
 설정에서는 값이 `<hidden>`으로 돌아온다. 방금 쓴 값을 되읽어 확인하는 용도로는 쓸 수 없다.
 
-**`create_configuration(name, working_directory, type_data, environment_variables?, request_id?)`**
+**`create_configuration(name, working_directory, type_data, environment_variables?, disabled_environment_variables?, request_id?)`**
+
+- `disabled_environment_variables`(키 배열)에 든 변수는 저장만 되고 실행에는 전달되지 않는
+  상태로 만들어진다. 모든 키가 `environment_variables`에 있어야 한다 — 없는 키는 오타로 보고
+  `-32602`로 거절한다. 무시하면 끄려던 변수가 켜진 채 만들어진다
 
 - `id`는 앱이 정해 응답에 싣는다. 호출자가 줄 수 없다
 - `name`은 중복일 수 없고 **UUID 모양일 수 없다** — 이름이 다른 툴에서 구성을 지목하는
@@ -245,6 +252,12 @@ compound인 경우다(중첩 실행을 하지 않는다). 그래서 `sessions`�
   `remove_environment_variables`(키 배열)로 키 단위로만 편집한다. 읽은 값이 마스킹돼
   있을 수 있어(5장) 되돌려 쓰는 것을 정상 사용법으로 만들지 않기 위한 것이다
 - 한 키가 양쪽에 다 실리면 **설정이 이긴다**(제거를 먼저 적용한다)
+- 활성 여부는 `enable_environment_variables` · `disable_environment_variables`(키 배열)로
+  바꾼다. 설정 **뒤에** 적용하므로 새 키를 넣고 같은 호출에서 끌 수 있다. 없는 키는 무시한다.
+  같은 키가 두 목록에 다 실리면 `-32602`로 거절한다 — 어느 순서로 적용해도 한쪽 의도를 버리게
+  된다
+- `set_environment_variables`로 기존 키의 값을 바꾸면 그 키의 활성 여부는 그대로다. 새 키는
+  활성으로 들어간다
 - `type_data`는 실리면 **객체 전체를 교체한다**
 - `working_directory`의 빈 값은 **결과 타입**을 기준으로 판정한다 — 패치를 적용한 뒤의
   타입이 Compound나 Node면 허용되고, 그 밖이면 거절된다. Node로 남거나 Node가 되는 패치는
@@ -306,7 +319,8 @@ compound인 경우다(중첩 실행을 하지 않는다). 그래서 `sessions`�
 
 `Expose environment variable values`가 꺼져 있으면(기본):
 
-- `get_configuration`의 환경변수 **값**이 `<hidden>`으로 바뀐다. 키는 그대로 보인다
+- `get_configuration`의 환경변수 **값**이 `<hidden>`으로 바뀐다. 키와 `enabled`는 그대로
+  보인다. 비활성 항목의 값도 똑같이 가린다 — 꺼 둔 값도 비밀일 수 있다
 - `read_session_output`에서 실행 배너(`Environment: …`)가 가려진다. **입도가 위 항목과 다르다** —
   `get_configuration`은 값만 가리고 키를 남기지만, 배너는 줄 전체가 `Environment: <hidden>`으로
   바뀌어 키까지 사라진다. 값 자체가 `; k=`를 담을 수 있어 `k=v; k=v`를 쌍으로 쪼개면 키로
@@ -380,7 +394,7 @@ MCP 요청은 GUI 버튼과 같은 update 루프 안에서 처리되고, 실행�
 - **저장소를 읽지 못했으면 편집을 거절한다.** 로드가 실패한 상태에서 편집을 받아 주면
   빈 목록에 만든 구성 하나가 저장소 파일을 덮어쓰고, 저장은 백업을 남기지 않아 수기로
   복구할 수 있었던 파일이 사라진다. 로드가 끝나기 전에도 거절한다
-- **환경변수가 실제로 바뀌면** 그 구성에 대해 열려 있던 env 모달과 벌크 편집 드래프트를
+- **환경변수가 실제로 바뀌면**(활성 여부만 바뀐 경우 포함) 그 구성에 대해 열려 있던 env 모달과 벌크 편집 드래프트를
   버린다. 남겨 두면 사용자의 Confirm 한 번이 에이전트의 변경을 조용히 되돌린다. 개명만
   하는 호출은 드래프트를 건드리지 않는다
 - **디렉터리·타입이 바뀌면** Node 메타데이터 캐시(스크립트·package.json 목록)를 **버린다**.
