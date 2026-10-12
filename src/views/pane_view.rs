@@ -1,5 +1,5 @@
 use crate::messages::Message;
-use crate::models::{Pane, RunSession, SessionStatusKind, compile_search_regex};
+use crate::models::{RunSession, SessionStatusKind, compile_search_regex};
 use crate::utils::{
     ICON_ARROW_DOWN_FILL, ICON_ARROW_DOWN_LINE, ICON_CLOSE, ICON_ERASER, ICON_MORE,
     ICON_PANE_MAXIMIZE, ICON_PANE_RESTORE, ICON_REFRESH, ICON_SAVE, ICON_SEARCH, ICON_STOP,
@@ -11,6 +11,7 @@ use crate::views::shared::{
 };
 use crate::views::terminal::view_terminal_for_session;
 use crate::widgets::pane_grid;
+use crate::widgets::pane_layout::Pane;
 use iced::widget::Space;
 use iced::{
     Alignment, Background, Border, Color, Element, Length, Theme, border,

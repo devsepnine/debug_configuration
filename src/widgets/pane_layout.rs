@@ -1,4 +1,4 @@
-use crate::widgets::pane_grid;
+use super::pane_grid;
 use std::collections::HashMap;
 use uuid::Uuid;
 

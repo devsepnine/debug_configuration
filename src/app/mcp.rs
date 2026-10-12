@@ -18,7 +18,8 @@ use super::RunConfigManager;
 use crate::ansi::TextSegment;
 use crate::messages::Message;
 use crate::models::{
-    ConfigTypeData, RunConfiguration, RunSession, SessionStatusKind, StdinWriteError,
+    ConfigTypeData, EnvEntry, EnvVars, RunConfiguration, RunSession, SessionStatusKind,
+    StdinWriteError,
 };
 use crate::services::{
     CreateConfigurationArgs, DedupLookup, DedupScope, DeleteConfigurationArgs, MAX_SEARCH_MATCHES,
@@ -603,7 +604,15 @@ impl RunConfigManager {
         let mut config = RunConfiguration {
             name: spec.name,
             working_directory: spec.working_directory,
-            environment_variables: spec.environment_variables,
+            environment_variables: EnvVars::from_entries(
+                sorted_by_key(spec.environment_variables)
+                    .into_iter()
+                    .map(|(key, value)| EnvEntry {
+                        enabled: !spec.disabled_environment_variables.contains(&key),
+                        key,
+                        value,
+                    }),
+            ),
             type_data: spec.type_data,
             // id는 앱이 정한다 — `Default`가 만드는 v4를 쓰므로 생성 규칙이 한 군데에만 있다.
             ..RunConfiguration::default()
@@ -720,14 +729,22 @@ impl RunConfigManager {
         }
 
         let config = &mut self.configurations[index];
-        // 제거를 먼저 적용하므로, 한 키가 양쪽 목록에 다 실려 오면 설정이 이긴다.
+        // 제거를 먼저 적용하므로, 한 키가 양쪽 목록에 다 실려 오면 설정이 이긴다. 활성 토글은
+        // 설정 뒤에 적용해 "새 키를 넣고 바로 끈다"를 한 호출로 할 수 있게 한다. enable과
+        // disable에 같은 키가 실리는 호출은 파서가 거절한다(`parse_call`).
         let mut env_changed = false;
+        let env = &mut config.environment_variables;
         for key in &patch.remove_environment_variables {
-            env_changed |= config.environment_variables.remove(key).is_some();
+            env_changed |= env.remove(key);
         }
-        for (key, value) in patch.set_environment_variables {
-            env_changed |= config.environment_variables.get(&key) != Some(&value);
-            config.environment_variables.insert(key, value);
+        for (key, value) in sorted_by_key(patch.set_environment_variables) {
+            env_changed |= env.set(key, value);
+        }
+        for key in &patch.enable_environment_variables {
+            env_changed |= env.set_enabled(key, true);
+        }
+        for key in &patch.disable_environment_variables {
+            env_changed |= env.set_enabled(key, false);
         }
         let mut renamed = false;
         if let Some(new_name) = patch.name {
@@ -753,11 +770,11 @@ impl RunConfigManager {
         let changed = env_changed || renamed || directory_changed || type_data_changed;
 
         if env_changed {
-            // 대량 편집기의 초안은 구성의 환경변수를 직렬화해 채워 둔 사본이다. 남겨 두면
+            // 대량 편집기의 초안은 구성의 활성 환경변수를 직렬화해 채워 둔 사본이다. 남겨 두면
             // 사용자가 Apply를 누르는 순간 이 변경이 조용히 되돌아간다. 초안을 버리는 대가는
             // 사용자가 입력하던 내용이지만, 그쪽은 눈에 보이고 되돌림은 보이지 않는다.
             self.env_bulk_inputs.remove(&config_id);
-            // 열린 모달의 `entries`도 같은 종류의 사본이고, Confirm은 그것으로 맵을 **통째로**
+            // 열린 모달의 `entries`도 같은 종류의 사본이고, Confirm은 그것으로 목록을 **통째로**
             // 교체한다(`handle_confirm_env_modal`) — 초안보다 피해가 크다. 갱신하지 않고 닫는
             // 것은 사용자가 입력하던 내용과의 병합 규칙을 새로 만들지 않기 위한 것이며, 삭제
             // 경로가 같은 상황에서 하는 일과 같다(`handle_delete_configuration`).
@@ -1367,6 +1384,14 @@ fn derive_node_working_directory(config: &mut RunConfiguration) {
 /// 토글에 따라 통과·거절이 갈리면 같은 호출이 앱 설정에 따라 다르게 동작하고, 호출자는 그 이유를
 /// 알 수 없다. 토글이 꺼진 채로 조회한 구성을 그대로 되돌려 쓰면 실제 비밀이 자리표시자로
 /// 덮이는데, 그 손실은 되돌릴 수 없다.
+/// MCP 인자는 JSON 객체라 순서가 없다(`HashMap`). `EnvVars`는 순서를 보존하므로, 정렬 없이
+/// 넣으면 같은 호출이 프로세스마다 다른 순서의 목록을 만든다.
+fn sorted_by_key(map: HashMap<String, String>) -> Vec<(String, String)> {
+    let mut pairs: Vec<_> = map.into_iter().collect();
+    pairs.sort_by(|a, b| a.0.cmp(&b.0));
+    pairs
+}
+
 fn reject_masked_env(values: &HashMap<String, String>) -> Result<(), String> {
     for (key, value) in values {
         if value == MASKED_VALUE {
@@ -1422,14 +1447,16 @@ fn find_session(sessions: &[RunSession], session_id: Uuid) -> Option<&RunSession
 }
 
 /// 목록용 요약. 환경변수는 **키만** 싣는다 — 목록 조회 한 번으로 모든 비밀이 새는 것을 막는다.
+/// `environment_variable_keys`는 비활성 키도 포함한다 — 이름이 이미 쓰이고 있다는 사실은
+/// 활성 여부와 무관하게 set이 기존 항목을 고친다는 뜻이기 때문이다.
 fn configuration_summary(config: &RunConfiguration) -> Value {
-    let mut env_keys: Vec<&str> = config
-        .environment_variables
-        .keys()
-        .map(String::as_str)
+    let entries = config.environment_variables.entries();
+    let env_keys: Vec<&str> = entries.iter().map(|e| e.key.as_str()).collect();
+    let disabled_keys: Vec<&str> = entries
+        .iter()
+        .filter(|e| !e.enabled)
+        .map(|e| e.key.as_str())
         .collect();
-    // HashMap 순회는 순서가 불정이라, 같은 구성을 두 번 조회하면 순서가 달라 보인다.
-    env_keys.sort_unstable();
 
     json!({
         "id": config.id,
@@ -1440,6 +1467,7 @@ fn configuration_summary(config: &RunConfiguration) -> Value {
         "type": serde_json::to_value(config.config_type()).unwrap_or(Value::Null),
         "working_directory": config.working_directory,
         "environment_variable_keys": env_keys,
+        "disabled_environment_variable_keys": disabled_keys,
     })
 }
 
@@ -1452,9 +1480,9 @@ fn configuration_detail(config: &RunConfiguration, expose_env: bool) -> Result<V
     if !expose_env
         && let Some(env) = value
             .get_mut("environment_variables")
-            .and_then(Value::as_object_mut)
+            .and_then(Value::as_array_mut)
     {
-        for slot in env.values_mut() {
+        for slot in env.iter_mut().filter_map(|entry| entry.get_mut("value")) {
             *slot = json!(MASKED_VALUE);
         }
     }
@@ -1618,14 +1646,23 @@ mod tests {
     use std::time::Duration;
     use tokio::sync::mpsc;
 
+    fn env_value<'a>(config: &'a RunConfiguration, key: &str) -> Option<&'a str> {
+        config
+            .environment_variables
+            .get(key)
+            .map(|e| e.value.as_str())
+    }
+
     fn configuration(name: &str) -> RunConfiguration {
         RunConfiguration {
             name: name.to_string(),
             working_directory: "/tmp/project".to_string(),
-            environment_variables: HashMap::from([
+            environment_variables: [
                 ("API_TOKEN".to_string(), "super-secret".to_string()),
                 ("MODE".to_string(), "debug".to_string()),
-            ]),
+            ]
+            .into_iter()
+            .collect(),
             type_data: ConfigTypeData::Application {
                 command: "echo".to_string(),
                 arguments: "hello".to_string(),
@@ -1671,6 +1708,7 @@ mod tests {
 
         assert_eq!(summary["environment_variable_keys"][0], "API_TOKEN");
         assert_eq!(summary["environment_variable_keys"][1], "MODE");
+        assert_eq!(summary["disabled_environment_variable_keys"], json!([]));
         assert!(
             !rendered.contains("super-secret"),
             "summary must never carry env values: {rendered}"
@@ -1682,8 +1720,11 @@ mod tests {
         let config = configuration("build");
         let detail = configuration_detail(&config, false).expect("serialized");
 
-        assert_eq!(detail["environment_variables"]["API_TOKEN"], MASKED_VALUE);
-        assert_eq!(detail["environment_variables"]["MODE"], MASKED_VALUE);
+        let env = &detail["environment_variables"];
+        assert_eq!(env[0]["key"], "API_TOKEN");
+        assert_eq!(env[0]["value"], MASKED_VALUE);
+        assert_eq!(env[0]["enabled"], true);
+        assert_eq!(env[1]["value"], MASKED_VALUE);
         assert!(!detail.to_string().contains("super-secret"));
         // 타입별 필드는 저장 포맷(내부 태그) 그대로 실린다.
         assert_eq!(detail["type_data"]["type"], "Application");
@@ -1721,7 +1762,24 @@ mod tests {
     #[test]
     fn detail_reveals_env_values_when_the_toggle_is_on() {
         let detail = configuration_detail(&configuration("build"), true).expect("serialized");
-        assert_eq!(detail["environment_variables"]["API_TOKEN"], "super-secret");
+        assert_eq!(detail["environment_variables"][0]["value"], "super-secret");
+    }
+
+    #[test]
+    fn summary_and_detail_report_disabled_variables() {
+        let mut config = configuration("build");
+        config.environment_variables.set_enabled("API_TOKEN", false);
+
+        let summary = configuration_summary(&config);
+        assert_eq!(
+            summary["disabled_environment_variable_keys"],
+            json!(["API_TOKEN"])
+        );
+        assert_eq!(summary["environment_variable_keys"][0], "API_TOKEN");
+
+        let detail = configuration_detail(&config, false).expect("serialized");
+        assert_eq!(detail["environment_variables"][0]["enabled"], false);
+        assert!(!detail.to_string().contains("super-secret"));
     }
 
     #[test]
@@ -3111,6 +3169,7 @@ mod tests {
             name: name.to_string(),
             working_directory: "/tmp/new".to_string(),
             environment_variables: HashMap::new(),
+            disabled_environment_variables: Vec::new(),
             type_data: ConfigTypeData::Application {
                 command: "echo".to_string(),
                 arguments: String::new(),
@@ -3132,6 +3191,8 @@ mod tests {
             type_data: None,
             set_environment_variables: HashMap::new(),
             remove_environment_variables: Vec::new(),
+            enable_environment_variables: Vec::new(),
+            disable_environment_variables: Vec::new(),
             request_id: None,
         }
     }
@@ -3187,7 +3248,8 @@ mod tests {
         let failure = failure_of(respond_to(&mut app, op));
 
         assert_eq!(
-            app.configurations[0].environment_variables["API_TOKEN"], "super-secret",
+            env_value(&app.configurations[0], "API_TOKEN"),
+            Some("super-secret"),
             "실제 값이 남아 있어야 한다"
         );
         assert!(failure.contains(MASKED_VALUE), "{failure}");
@@ -3238,11 +3300,55 @@ mod tests {
         let config = &app.configurations[0];
         assert_eq!(config.working_directory, "/tmp/moved");
         assert_eq!(config.name, "build");
-        assert_eq!(config.environment_variables["API_TOKEN"], "super-secret");
+        assert_eq!(env_value(config, "API_TOKEN"), Some("super-secret"));
         assert!(matches!(
             config.type_data,
             ConfigTypeData::Application { .. }
         ));
+    }
+
+    #[test]
+    fn created_and_added_variables_are_ordered_by_key() {
+        let mut app = app_at_edit_tier();
+        let op = McpOp::CreateConfiguration(Box::new(CreateConfigurationArgs {
+            environment_variables: HashMap::from([
+                (String::from("C"), String::from("3")),
+                (String::from("A"), String::from("1")),
+                (String::from("B"), String::from("2")),
+            ]),
+            ..create_args("ordered")
+        }));
+        payload_of(respond_to(&mut app, op));
+
+        let config = app.configurations.last().expect("created");
+        let keys: Vec<&str> = config
+            .environment_variables
+            .active()
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(keys, vec!["A", "B", "C"]);
+    }
+
+    #[test]
+    fn a_configuration_can_be_created_with_disabled_variables() {
+        let mut app = app_at_edit_tier();
+        let op = McpOp::CreateConfiguration(Box::new(CreateConfigurationArgs {
+            environment_variables: HashMap::from([
+                (String::from("ON"), String::from("1")),
+                (String::from("OFF"), String::from("2")),
+            ]),
+            disabled_environment_variables: vec![String::from("OFF")],
+            ..create_args("toggled")
+        }));
+        payload_of(respond_to(&mut app, op));
+
+        let env = &app
+            .configurations
+            .last()
+            .expect("created")
+            .environment_variables;
+        assert_eq!(env.active().collect::<Vec<_>>(), vec![("ON", "1")]);
+        assert_eq!(env.get("OFF").map(|e| e.enabled), Some(false));
     }
 
     #[test]
@@ -3258,9 +3364,73 @@ mod tests {
 
         payload_of(respond_to(&mut app, op));
 
+        let config = &app.configurations[0];
+        assert_eq!(env_value(config, "MODE"), Some("release"));
+        assert_eq!(env_value(config, "API_TOKEN"), None);
+    }
+
+    #[test]
+    fn an_update_disables_and_enables_environment_variables() {
+        let mut app = app_at_edit_tier();
+        let op = McpOp::UpdateConfiguration(Box::new(UpdateConfigurationArgs {
+            disable_environment_variables: vec!["API_TOKEN".to_string()],
+            ..patch("build")
+        }));
+        let payload = payload_of(respond_to(&mut app, op));
+
+        assert_eq!(payload["changed"], json!(true));
         let env = &app.configurations[0].environment_variables;
-        assert_eq!(env["MODE"], "release");
-        assert!(!env.contains_key("API_TOKEN"));
+        assert!(!env.get("API_TOKEN").expect("kept").enabled);
+        assert_eq!(env.active().collect::<Vec<_>>(), vec![("MODE", "debug")]);
+
+        let op = McpOp::UpdateConfiguration(Box::new(UpdateConfigurationArgs {
+            enable_environment_variables: vec!["API_TOKEN".to_string()],
+            ..patch("build")
+        }));
+        payload_of(respond_to(&mut app, op));
+        assert!(
+            app.configurations[0]
+                .environment_variables
+                .get("API_TOKEN")
+                .unwrap()
+                .enabled
+        );
+    }
+
+    #[test]
+    fn setting_a_disabled_variable_keeps_it_disabled_and_a_new_one_can_start_disabled() {
+        let mut app = app_at_edit_tier();
+        app.configurations[0]
+            .environment_variables
+            .set_enabled("MODE", false);
+        let op = McpOp::UpdateConfiguration(Box::new(UpdateConfigurationArgs {
+            set_environment_variables: HashMap::from([
+                ("MODE".to_string(), "release".to_string()),
+                ("NEW".to_string(), "x".to_string()),
+            ]),
+            disable_environment_variables: vec!["NEW".to_string()],
+            ..patch("build")
+        }));
+        payload_of(respond_to(&mut app, op));
+
+        let env = &app.configurations[0].environment_variables;
+        let mode = env.get("MODE").expect("kept");
+        assert_eq!((mode.value.as_str(), mode.enabled), ("release", false));
+        assert!(!env.get("NEW").expect("added").enabled);
+    }
+
+    #[test]
+    fn disabling_an_already_disabled_variable_changes_nothing() {
+        let mut app = app_at_edit_tier();
+        app.configurations[0]
+            .environment_variables
+            .set_enabled("MODE", false);
+        let op = McpOp::UpdateConfiguration(Box::new(UpdateConfigurationArgs {
+            disable_environment_variables: vec!["MODE".to_string(), "NEVER_SET".to_string()],
+            ..patch("build")
+        }));
+        let payload = payload_of(respond_to(&mut app, op));
+        assert_eq!(payload["changed"], json!(false));
     }
 
     #[test]
@@ -3421,7 +3591,8 @@ mod tests {
 
         assert!(message.contains("request_id"), "{message}");
         assert_eq!(
-            app.configurations[0].environment_variables["MODE"], "debug",
+            env_value(&app.configurations[0], "MODE"),
+            Some("debug"),
             "거절된 패치는 적용되지 않는다"
         );
     }
@@ -3502,7 +3673,8 @@ mod tests {
         payload_of(respond_to(&mut app, op));
 
         assert_eq!(
-            app.configurations[0].environment_variables["MODE"], "release",
+            env_value(&app.configurations[0], "MODE"),
+            Some("release"),
             "제거가 먼저 적용되므로 설정이 이긴다"
         );
     }
@@ -3640,7 +3812,7 @@ mod tests {
         let config_id = app.configurations[0].id;
         app.env_modal = Some(crate::app::env_modal::EnvModalState {
             config_id,
-            entries: vec![(String::from("MODE"), String::from("debug"))],
+            entries: vec![crate::models::EnvEntry::enabled("MODE", "debug")],
             focused_cell: crate::app::env_modal::ModalCell {
                 row: 0,
                 kind: crate::app::env_modal::ModalCellKind::Key,
@@ -3657,10 +3829,7 @@ mod tests {
         payload_of(respond_to(&mut app, op));
 
         assert!(app.env_modal.is_none());
-        assert_eq!(
-            app.configurations[0].environment_variables["MODE"],
-            "release"
-        );
+        assert_eq!(env_value(&app.configurations[0], "MODE"), Some("release"));
     }
 
     #[test]
@@ -3670,7 +3839,7 @@ mod tests {
         let config_id = app.configurations[0].id;
         app.env_modal = Some(crate::app::env_modal::EnvModalState {
             config_id,
-            entries: vec![(String::from("MODE"), String::from("typing"))],
+            entries: vec![crate::models::EnvEntry::enabled("MODE", "typing")],
             focused_cell: crate::app::env_modal::ModalCell {
                 row: 0,
                 kind: crate::app::env_modal::ModalCellKind::Key,
@@ -3687,7 +3856,7 @@ mod tests {
             .env_modal
             .as_ref()
             .expect("사용자의 모달이 살아 있어야 한다");
-        assert_eq!(modal.entries[0].1, "typing");
+        assert_eq!(modal.entries[0].value, "typing");
     }
 
     /// 낡은 목록이 남으면 사용자가 편집기에서 이전 프로젝트의 스크립트를 고를 수 있다.

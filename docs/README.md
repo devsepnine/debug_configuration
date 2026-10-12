@@ -20,15 +20,16 @@ debug_configuration/
 │   │   └── mcp.rs           # MCP 요청 핸들러 (툴별 처리, 권한 게이트, 감사 문구)
 │   ├── messages.rs          # Elm Architecture 메시지 타입 정의
 │   ├── ansi.rs              # ANSI 색상 코드 파싱
-│   ├── utils.rs             # 공통 유틸 (Node Runtime 감지, package.json 파싱, 아이콘)
+│   ├── utils.rs             # 공통 유틸 (아이콘, 텍스트 폭·말줄임, 상대 경로)
 │   ├── env_string.rs        # 환경변수 KEY=value 문자열 파싱/직렬화
 │   ├── models/
 │   │   ├── mod.rs           # 모델 모듈 재export
 │   │   ├── configuration.rs # RunConfiguration, ConfigurationType, ConfigTypeData, NodeCommand
-│   │   ├── session.rs       # RunSession, SearchState, 세션 상태
-│   │   └── pane.rs          # Pane/WorkspaceTab 레이아웃 상태
+│   │   ├── env_vars.rs      # EnvVars/EnvEntry (환경변수 목록, 항목별 활성 여부, 키 유일성)
+│   │   └── session.rs       # RunSession, SearchState, 세션 상태
 │   ├── services/
 │   │   ├── mod.rs           # 서비스 모듈 재export
+│   │   ├── detection.rs     # 로컬 환경 감지 (package.json, Node 런타임, JDK, Spring/Kotlin 후보)
 │   │   ├── executor.rs      # 프로세스 실행 및 명령어 빌드, PID 추적
 │   │   ├── mcp/             # 로컬 MCP 서버 (docs/MCP.md)
 │   │   │   ├── mod.rs       # 공개 표면: 서버 스트림, McpRequest/McpOutcome, McpPermission
@@ -37,6 +38,7 @@ debug_configuration/
 │   │   │   ├── tools.rs     # 툴 카탈로그·스키마·인자 파싱, 권한 필터
 │   │   │   ├── token.rs     # Bearer 토큰 생성·로드·퍼미션(0600)
 │   │   │   └── dedup.rs     # request_id 중복 흡수 창
+│   │   ├── platform.rs      # 파일 다이얼로그, 데스크톱 알림, URL 열기, 업데이트 후 재실행
 │   │   ├── storage.rs       # 구성 파일 저장/로드 (버전 envelope), AppSettings
 │   │   └── update_check.rs  # GitHub Releases 최신 버전 확인
 │   ├── views/
@@ -52,6 +54,7 @@ debug_configuration/
 │   └── widgets/
 │       ├── mod.rs                  # 위젯 모듈 재export
 │       ├── configuration_list.rs   # 드래그 가능한 구성 리스트 위젯
+│       ├── pane_layout.rs          # Pane/WorkspaceTab 레이아웃 상태 (pane_grid 상태와 동기화)
 │       └── pane_grid/              # 커스텀 pane_grid 위젯 (분할/드래그/리사이즈)
 ├── assets/                  # SVG 아이콘 (mingcute, remix icon)
 ├── fonts/                   # D2Coding 폰트

@@ -246,7 +246,7 @@ ls -la package-lock.json yarn.lock pnpm-lock.yaml
 **해결**:
 - 더 작은 디렉토리 선택
 - node_modules가 많은 경로 피하기
-- 현재 깊이 제한: 5 레벨 (utils.rs에서 조정 가능)
+- 현재 깊이 제한: 5 레벨 (`src/services/detection.rs` → `find_all_package_jsons`에서 조정 가능)
 
 ### 6. PowerShell 경로 파싱 에러
 

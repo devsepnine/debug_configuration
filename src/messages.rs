@@ -2,8 +2,8 @@ use crate::models::{
     ConfigurationType, ExecuteModeType, KotlinLaunchModeType, NodeCommand, PackageManager,
     RunConfiguration, RunFailure, SpringBootBuildTool, StdinWriteError,
 };
-use crate::services::{McpEvent, McpPermission, McpRequest};
-use crate::utils::CandidateScan;
+use crate::services::detection::CandidateScan;
+use crate::services::{McpEvent, McpPermission, McpRequest, RunEvent};
 use crate::widgets::pane_grid;
 use iced::window;
 use std::path::PathBuf;
@@ -219,7 +219,9 @@ pub enum Message {
     EnvModalRowKeyChanged(usize, String),
     /// 모달 row의 값 입력 변경 (인덱스, 새 값). 인덱스가 범위 밖이면 새 row 추가.
     EnvModalRowValueChanged(usize, String),
-    /// 모달 row 복제 — 동일 (key, value)을 entries 끝에 새로 push (인덱스)
+    /// 모달 row 활성/비활성 토글 (인덱스, 활성 여부). 비활성 row는 실행에 주입되지 않는다.
+    EnvModalToggleEntry(usize, bool),
+    /// 모달 row 복제 — 동일 (key, value)을 원본 바로 다음에 활성 상태로 insert (인덱스)
     EnvModalDuplicateEntry(usize),
     /// 모달 row 제거 (인덱스)
     EnvModalRemoveEntry(usize),
@@ -518,6 +520,15 @@ pub enum Message {
     CloseWindow,
 }
 
+impl From<RunEvent> for Message {
+    fn from(event: RunEvent) -> Self {
+        match event {
+            RunEvent::Started(session_id, pid) => Message::ProcessStarted(session_id, pid),
+            RunEvent::Output(session_id, events) => Message::OutputReceived(session_id, events),
+            RunEvent::Completed(session_id, result) => Message::RunCompleted(session_id, result),
+        }
+    }
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigurationDropPosition {
     Before,

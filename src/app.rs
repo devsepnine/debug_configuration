@@ -1,19 +1,18 @@
 use crate::messages::{ConfigurationDropPosition, Message, StdinBarKey, ViewMode};
 use crate::models::{
     ConfigTypeData, ConfigurationType, ExecuteMode, ExecuteModeType, KotlinLaunchMode,
-    KotlinLaunchModeType, LayoutId, PackageManager, RunConfiguration, RunFailure, RunSession,
-    SearchState, SessionStatusKind, SpringBootBuildTool, WorkspaceTab,
+    KotlinLaunchModeType, PackageManager, RunConfiguration, RunFailure, RunSession, SearchState,
+    SessionStatusKind, SpringBootBuildTool,
 };
+use crate::services::detection::{CandidateScan, SpringModuleFlavor};
+use crate::services::platform;
 use crate::services::{
     AppSettings, McpPermission, McpRequestLog, UpdateOutcome, check_latest_release, export_text,
     force_kill_process_tree, load_or_migrate_store, load_settings, mask_token, mcp_server,
     register_running_pid, resolve_spring_build_tool, run_configuration_stream, save_settings,
     save_to_store, terminate_session_process, unregister_running_pid,
 };
-use crate::utils::{
-    CandidateScan, DIALOG_CANCELLED, ICON_DELETE, ICON_PLAY, ICON_REFRESH, ICON_STOP,
-    SpringModuleFlavor,
-};
+use crate::utils::{DIALOG_CANCELLED, ICON_DELETE, ICON_PLAY, ICON_REFRESH, ICON_STOP};
 use crate::views::shared::icon_tooltip;
 use crate::views::{
     ConfirmDeleteModalView, ConfirmUpdateModalView, EditorLoadingState, EditorSelectState,
@@ -24,6 +23,7 @@ use crate::views::{
     view_workspace_tab_bar,
 };
 use crate::widgets::pane_grid;
+use crate::widgets::pane_layout::{LayoutId, WorkspaceTab};
 use crate::widgets::title_bar_drag::TitleBarDragArea;
 use iced::{
     Alignment, Background, Border, Color, Element, Event, Length, Point, Size, Subscription, Task,
@@ -33,7 +33,6 @@ use iced::{
     },
     window,
 };
-use rfd::AsyncFileDialog;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
@@ -231,32 +230,15 @@ fn unique_clone_name(base_name: &str, existing_names: &[&str]) -> String {
     candidate
 }
 
-/// 네이티브 파일/폴더 선택 다이얼로그를 여는 Task 생성 (4개 browse 핸들러 공통).
-/// 취소 시 `DIALOG_CANCELLED` 센티넬을 Err로 반환한다.
+/// 네이티브 파일/폴더 선택 다이얼로그를 여는 Task 생성 (browse 핸들러 공통).
+/// 다이얼로그 자체는 `services::platform::pick_path`가 연다.
 fn pick_path_task(
     title: &'static str,
     filter: Option<(&'static str, &'static [&'static str])>,
     folder: bool,
     on_done: fn(Result<String, String>) -> Message,
 ) -> Task<Message> {
-    Task::perform(
-        async move {
-            let mut dialog = AsyncFileDialog::new().set_title(title);
-            if let Some((name, extensions)) = filter {
-                dialog = dialog.add_filter(name, extensions);
-            }
-            let handle = if folder {
-                dialog.pick_folder().await
-            } else {
-                dialog.pick_file().await
-            };
-            match handle {
-                Some(handle) => Ok(handle.path().to_string_lossy().to_string()),
-                None => Err(String::from(DIALOG_CANCELLED)),
-            }
-        },
-        on_done,
-    )
+    Task::perform(platform::pick_path(title, filter, folder), on_done)
 }
 
 /// 다이얼로그 결과 에러를 일관된 상태 메시지로 변환. 취소는 `{noun} cancelled`,
@@ -266,79 +248,6 @@ fn cancellable_status(error: &str, noun: &str) -> String {
         format!("{noun} cancelled")
     } else {
         format!("{noun} failed: {error}")
-    }
-}
-
-/// 백그라운드(비포커스) 상태에서 실행이 끝났을 때 OS 데스크톱 알림을 표시.
-/// 정상 종료/비정상 종료/스폰 실패를 모두 구분해 알리며, UI 스레드를 막지
-/// 않도록 별도 스레드에서 발행하고 발행 실패는 조용히 무시한다.
-fn notify_run_finished(name: &str, result: Result<i32, &str>) {
-    let (summary, body) = match result {
-        Ok(0) => (
-            String::from("Run finished"),
-            format!("{name} completed successfully"),
-        ),
-        Ok(code) => (
-            String::from("Run failed"),
-            format!("{name} exited with code {code}"),
-        ),
-        Err(error) => (
-            String::from("Run failed"),
-            format!("{name} failed: {error}"),
-        ),
-    };
-
-    std::thread::spawn(move || {
-        // app_id를 지정하지 않으면 Windows에서 PowerShell AppUserModelID로
-        // 폴백한다. 커스텀 AUMID는 Start Menu 등록이 선행되어야 토스트가 뜨므로,
-        // 미패키징 앱에서는 폴백을 그대로 사용하는 편이 안전하다.
-        let _ = notify_rust::Notification::new()
-            .summary(&summary)
-            .body(&body)
-            .show();
-    });
-}
-
-/// 새 버전 발견 시 OS 데스크톱 알림을 표시한다. 토스트 클릭으로 링크를 여는
-/// 동작은 플랫폼별 편차가 커 신뢰할 수 없으므로, 알림은 안내용으로만 쓰고
-/// 실제 다운로드 진입점은 상태바의 클릭 가능한 링크가 영속적으로 제공한다.
-/// UI 스레드를 막지 않도록 별도 스레드에서 발행하고 실패는 조용히 무시한다.
-fn notify_update_available(latest: &str, url: &str) {
-    let summary = String::from("Update available");
-    let body = format!("Version {latest} is available.\n{url}");
-
-    std::thread::spawn(move || {
-        let _ = notify_rust::Notification::new()
-            .summary(&summary)
-            .body(&body)
-            .show();
-    });
-}
-
-/// 인앱 업데이트 적용 후 재실행 계획을 실행한다. spawn 성공 여부만 확인하며,
-/// 프로세스 종료는 호출 측(`handle_update_install_completed`)이 담당한다.
-/// - macOS: 새 번들을 `open -n`으로 실행 (이미 제자리에 설치된 상태)
-/// - Windows: 검증된 MSI를 `msiexec /i`(full UI)로 실행 — 설치·재실행은 설치관리자가 담당
-/// - Linux: 교체된 바이너리를 그대로 재실행
-fn execute_relaunch(plan: &crate::services::RelaunchPlan) -> Result<(), String> {
-    use crate::services::RelaunchPlan;
-    match plan {
-        RelaunchPlan::MacOs { app_path } => std::process::Command::new("open")
-            .arg("-n")
-            .arg(app_path)
-            .spawn()
-            .map(|_| ())
-            .map_err(|e| format!("failed to launch updated app: {e}")),
-        RelaunchPlan::Windows { msi_path } => std::process::Command::new("msiexec")
-            .arg("/i")
-            .arg(msi_path)
-            .spawn()
-            .map(|_| ())
-            .map_err(|e| format!("failed to launch installer: {e}")),
-        RelaunchPlan::Linux { exe_path } => std::process::Command::new(exe_path)
-            .spawn()
-            .map(|_| ())
-            .map_err(|e| format!("failed to relaunch: {e}")),
     }
 }
 
@@ -379,7 +288,7 @@ fn resolve_and_scan_spring_boot_modules(
     let resolved = resolve_spring_build_tool(tool, root)?;
     let flavor = spring_module_flavor(resolved)
         .ok_or_else(|| String::from("Modules are not used with the JAR build tool"))?;
-    Ok(crate::utils::scan_spring_boot_modules(
+    Ok(crate::services::detection::scan_spring_boot_modules(
         std::path::Path::new(root),
         flavor,
     ))
@@ -410,8 +319,10 @@ fn scan_kotlin_candidates(root: &str, kind: CandidateKind) -> Result<CandidateSc
         ));
     }
     Ok(match kind {
-        CandidateKind::KotlinMainClass => crate::utils::scan_kotlin_main_classes(path),
-        CandidateKind::KotlinJar => crate::utils::scan_jar_artifacts(path),
+        CandidateKind::KotlinMainClass => {
+            crate::services::detection::scan_kotlin_main_classes(path)
+        }
+        CandidateKind::KotlinJar => crate::services::detection::scan_jar_artifacts(path),
         CandidateKind::SpringModule => {
             return Err(String::from("Spring modules are scanned separately"));
         }
@@ -451,9 +362,8 @@ async fn scan_node_metadata(
     project_dir: String,
     working_dir: String,
 ) -> (Uuid, Vec<String>, Vec<String>) {
-    use crate::utils::{
-        find_all_package_jsons, find_package_json, parse_scripts, to_relative_path,
-    };
+    use crate::services::detection::{find_all_package_jsons, find_package_json, parse_scripts};
+    use crate::utils::to_relative_path;
     use std::path::Path;
 
     tokio::task::spawn_blocking(move || {
@@ -493,7 +403,7 @@ pub struct RunConfigManager {
     status_message: String,
 
     /// 각 구성별 환경변수 메인 input의 raw text (`config_id` -> `KEY=val;...`)
-    /// `None`이면 `environment_variables`를 직렬화한 값을 표시
+    /// `None`이면 `environment_variables`의 활성 항목을 직렬화한 값을 표시
     env_bulk_inputs: HashMap<Uuid, String>,
     /// 환경변수 편집 모달 상태 (`Some`이면 모달 열림)
     env_modal: Option<EnvModalState>,
@@ -712,13 +622,13 @@ impl RunConfigManager {
 
         // 1. Node Runtime 감지 (백그라운드)
         tasks.push(Task::perform(
-            async { crate::utils::detect_node_runtimes() },
+            async { crate::services::detection::detect_node_runtimes() },
             Message::NodeRuntimesDetected,
         ));
 
         // 1-1. JDK 감지 (백그라운드)
         tasks.push(Task::perform(
-            async { crate::utils::detect_jdks() },
+            async { crate::services::detection::detect_jdks() },
             Message::JdksDetected,
         ));
 
@@ -912,6 +822,7 @@ impl RunConfigManager {
             | Message::CancelEnvModal
             | Message::EnvModalRowKeyChanged(_, _)
             | Message::EnvModalRowValueChanged(_, _)
+            | Message::EnvModalToggleEntry(_, _)
             | Message::EnvModalDuplicateEntry(_)
             | Message::EnvModalRemoveEntry(_)
             | Message::EnvModalFocusNext
@@ -1152,6 +1063,9 @@ impl RunConfigManager {
             }
             Message::EnvModalRowValueChanged(idx, value) => {
                 self.handle_env_modal_row_value_changed(idx, value)
+            }
+            Message::EnvModalToggleEntry(idx, enabled) => {
+                self.handle_env_modal_toggle_entry(idx, enabled)
             }
             Message::EnvModalDuplicateEntry(idx) => self.handle_env_modal_duplicate_entry(idx),
             Message::EnvModalRemoveEntry(idx) => self.handle_env_modal_remove_entry(idx),
@@ -1774,7 +1688,7 @@ impl RunConfigManager {
                     // SessionViewportResized가 보정한다.
                     self.last_seen_viewport,
                 ),
-                |msg| msg,
+                Message::from,
             );
         }
 
@@ -1844,7 +1758,7 @@ impl RunConfigManager {
                     // compound 멤버도 최근 pane 뷰포트로 스폰 (위 run 경로와 동일 근거).
                     self.last_seen_viewport,
                 ),
-                |msg| msg,
+                Message::from,
             ));
         }
 
@@ -2301,7 +2215,8 @@ impl RunConfigManager {
 
                 return Task::perform(
                     async move {
-                        use crate::utils::{find_all_package_jsons, to_relative_path};
+                        use crate::services::detection::find_all_package_jsons;
+                        use crate::utils::to_relative_path;
                         use std::path::Path;
 
                         let project_dir = Path::new(&dir_path);
@@ -3318,7 +3233,7 @@ impl RunConfigManager {
                     self.status_message = format!("Completed (exit code: {code})");
                     // 창이 백그라운드일 때만 데스크톱 알림 (보고 있는 실행은 알리지 않음)
                     if !self.is_window_focused {
-                        notify_run_finished(&config_name, Ok(code));
+                        platform::notify_run_finished(&config_name, Ok(code));
                     }
                 }
                 // 사유를 남기지 않는다 — `status_kind()`가 그것으로 `Stopped`와 `Errored`를
@@ -3337,7 +3252,7 @@ impl RunConfigManager {
                     self.status_message = format!("Failed: {reason}");
                     // 스폰/실행 실패도 백그라운드면 알림 (가장 중요한 실패 케이스)
                     if !self.is_window_focused {
-                        notify_run_finished(&config_name, Err(&reason));
+                        platform::notify_run_finished(&config_name, Err(&reason));
                     }
                 }
             }
@@ -3357,13 +3272,7 @@ impl RunConfigManager {
     fn handle_open_url(&mut self, url: &str) -> Task<Message> {
         // 결과를 반영한다. Linux에 xdg-open(xdg-utils)이 없으면 Err가 나는데,
         // 무시하면 "Opening URL"만 표시되고 아무 일도 안 일어나 혼란을 준다.
-        // 테스트 빌드는 실제로 열지 않는다 — 이 경로를 지나는 유닛 테스트가
-        // cargo test마다 개발 머신에 진짜 브라우저 탭(가짜 릴리스 페이지 404 등)을
-        // 띄우는 사고가 실제로 있었다. 상태 메시지 계약만 동일하게 유지한다.
-        #[cfg(test)]
-        let result: std::io::Result<()> = Ok(());
-        #[cfg(not(test))]
-        let result = open::that(url);
+        let result = platform::open_url(url);
         self.status_message = match result {
             Ok(()) => format!("Opening URL: {url}"),
             Err(error) => format!("Failed to open URL: {error}"),
@@ -3404,7 +3313,7 @@ impl RunConfigManager {
                 ..
             }) => {
                 self.status_message = format!("Update available: v{latest}");
-                notify_update_available(&latest, &url);
+                platform::notify_update_available(&latest, &url);
                 self.update_available = Some(AvailableUpdate {
                     latest,
                     url,
@@ -3485,7 +3394,7 @@ impl RunConfigManager {
                     };
                     return Task::none();
                 }
-                match execute_relaunch(&plan) {
+                match platform::execute_relaunch(&plan) {
                     Ok(()) => {
                         // 시그널 핸들러(main.rs)와 동일한 종료 경로: 자식 정리 후 즉시 종료.
                         // 위 가드로 실행 중 세션은 없지만, 방어적으로 정리한다.
@@ -4435,7 +4344,7 @@ impl RunConfigManager {
                 self.show_environment_on_run,
                 initial_viewport,
             ),
-            |msg| msg,
+            Message::from,
         )
     }
 
@@ -4773,7 +4682,8 @@ impl RunConfigManager {
 
     /// Node `package.json` 목록 로드 (`project_directory`에서)
     fn load_node_package_jsons(&mut self, config_id: Uuid, project_directory: &str) {
-        use crate::utils::{find_all_package_jsons, to_relative_path};
+        use crate::services::detection::find_all_package_jsons;
+        use crate::utils::to_relative_path;
         use std::path::Path;
 
         let project_dir = Path::new(project_directory);
@@ -4790,7 +4700,7 @@ impl RunConfigManager {
 
     /// Node package scripts 로드 (package.json에서)
     fn load_node_scripts(&mut self, config_id: Uuid, working_dir: &str) {
-        use crate::utils::{find_package_json, parse_scripts};
+        use crate::services::detection::{find_package_json, parse_scripts};
         use std::path::Path;
 
         let path = Path::new(working_dir);
@@ -4832,7 +4742,7 @@ impl RunConfigManager {
         let id = config.id;
         self.env_bulk_inputs
             .entry(id)
-            .or_insert_with(|| crate::env_string::serialize_env_map(&config.environment_variables));
+            .or_insert_with(|| env_modal::active_env_text(&config.environment_variables));
     }
 
     /// ScriptText 에디터 버퍼를 모델과 동기화한다 — `update()` 말미에 매 메시지 후

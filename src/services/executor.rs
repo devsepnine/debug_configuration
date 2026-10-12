@@ -1,4 +1,3 @@
-use crate::messages::Message;
 use crate::models::{
     ConfigTypeData, ExecuteMode, KotlinLaunchMode, NodeCommand, OutputEvent, PackageManager,
     RunConfiguration, RunFailure, SpringBootBuildTool,
@@ -15,6 +14,18 @@ use std::time::Duration;
 use tokio::process::{Child, ChildStderr, ChildStdout};
 use tokio::time::{Instant, sleep_until};
 use uuid::Uuid;
+
+/// 실행 스트림이 내는 이벤트. 서비스는 UI의 `Message`를 모르고, `app`이
+/// `Message::from`으로 감싼다(`docs/ARCHITECTURE.md` → `arch-services-no-ui`).
+#[derive(Debug, Clone)]
+pub enum RunEvent {
+    /// 프로세스 시작됨 (세션 ID, PID)
+    Started(Uuid, u32),
+    /// 출력 이벤트 배치 (세션 ID, 이벤트)
+    Output(Uuid, Vec<OutputEvent>),
+    /// 실행 완료 (세션 ID, 종료 코드 또는 실패 사유)
+    Completed(Uuid, Result<i32, RunFailure>),
+}
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -451,19 +462,19 @@ fn quote_if_needed(path: &str) -> String {
 /// * `cancel_flag` - 프로세스 취소를 위한 플래그
 ///
 /// # Returns
-/// 실행 중 발생하는 이벤트를 담은 Message 스트림
+/// 실행 중 발생하는 이벤트를 담은 `RunEvent` 스트림
 /// 스트림 태스크가 RunCompleted를 보내지 못한 채 종료되면(패닉 unwind 등) 세션이
 /// `is_running` 상태로 영구 고착되고 종료 알림/exit code도 영영 오지 않는다. 이 가드는
 /// 정상 종료 시 `disarm`되며, armed인 채로 drop되면 종료 보장용 RunCompleted(Err)를
 /// best-effort(try_send)로 발행한다.
 struct CompletionGuard {
-    output: iced::futures::channel::mpsc::Sender<Message>,
+    output: iced::futures::channel::mpsc::Sender<RunEvent>,
     session_id: Uuid,
     armed: bool,
 }
 
 impl CompletionGuard {
-    fn new(output: iced::futures::channel::mpsc::Sender<Message>, session_id: Uuid) -> Self {
+    fn new(output: iced::futures::channel::mpsc::Sender<RunEvent>, session_id: Uuid) -> Self {
         Self {
             output,
             session_id,
@@ -506,7 +517,7 @@ impl Drop for CompletionGuard {
             }
         }
         if self.armed {
-            let _ = self.output.try_send(Message::RunCompleted(
+            let _ = self.output.try_send(RunEvent::Completed(
                 self.session_id,
                 Err(RunFailure::Failed(String::from(
                     "Run interrupted unexpectedly",
@@ -539,10 +550,10 @@ pub fn run_configuration_stream(
     cancel_flag: Arc<AtomicBool>,
     show_env: bool,
     initial_viewport: Option<(u16, u16)>,
-) -> impl iced::futures::Stream<Item = Message> {
+) -> impl iced::futures::Stream<Item = RunEvent> {
     stream::channel(
         100,
-        move |mut output: iced::futures::channel::mpsc::Sender<Message>| async move {
+        move |mut output: iced::futures::channel::mpsc::Sender<RunEvent>| async move {
             // PTY가 없는 기타 플랫폼에서는 초기 뷰포트를 쓸 곳이 없다.
             #[cfg(not(any(unix, windows)))]
             let _ = initial_viewport;
@@ -615,7 +626,7 @@ pub fn run_configuration_stream(
                         );
                         use iced::futures::SinkExt;
                         let _ = output
-                            .send(Message::OutputReceived(
+                            .send(RunEvent::Output(
                                 session_id,
                                 vec![OutputEvent::Line(banner)],
                             ))
@@ -1201,7 +1212,7 @@ fn single_line(fragment: &str) -> String {
 }
 
 async fn send_command_info(
-    output: &mut iced::futures::channel::mpsc::Sender<Message>,
+    output: &mut iced::futures::channel::mpsc::Sender<RunEvent>,
     session_id: Uuid,
     config: &RunConfiguration,
     command_str: &str,
@@ -1224,11 +1235,12 @@ async fn send_command_info(
     // 환경변수는 더 이상 Command 문자열에 보이지 않으므로 별도 라인으로 표시해 가시성 유지.
     // 단, 설정에서 끄면(show_env=false) 출력하지 않는다. `Line`이 아니라 `EnvBanner`로 보내는
     // 이유는 그 variant의 문서에 있다 — 이 줄이 배너라는 사실을 아는 곳은 여기뿐이다.
-    if show_env && (!config.environment_variables.is_empty() || !extra_env.is_empty()) {
+    let has_user_env = config.environment_variables.active().next().is_some();
+    if show_env && (has_user_env || !extra_env.is_empty()) {
         let mut pairs: Vec<(String, String)> = config
             .environment_variables
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
+            .active()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
         pairs.sort_by(|a, b| a.0.cmp(&b.0));
         pairs.extend(extra_env.iter().cloned());
@@ -1241,9 +1253,7 @@ async fn send_command_info(
     }
     events.extend(lines_to_events(&tail));
 
-    let _ = output
-        .send(Message::OutputReceived(session_id, events))
-        .await;
+    let _ = output.send(RunEvent::Output(session_id, events)).await;
 }
 
 /// PTY 세션 파이프라인: ProcessStarted → 조립 루프 → (취소 시 종료 처리) → RunCompleted.
@@ -1251,7 +1261,7 @@ async fn send_command_info(
 /// 이 파이프라인 자체는 공유된다.
 #[cfg(any(unix, windows))]
 async fn handle_pty_process(
-    output: &mut iced::futures::channel::mpsc::Sender<Message>,
+    output: &mut iced::futures::channel::mpsc::Sender<RunEvent>,
     session_id: Uuid,
     mut pty: PtyProcess,
     cancel_flag: Arc<AtomicBool>,
@@ -1259,7 +1269,7 @@ async fn handle_pty_process(
     use iced::futures::SinkExt;
 
     if let Some(pid) = pty.pid {
-        let _ = output.send(Message::ProcessStarted(session_id, pid)).await;
+        let _ = output.send(RunEvent::Started(session_id, pid)).await;
     }
 
     match pty_output_loop(
@@ -1300,7 +1310,7 @@ enum PtyLoopEnd {
 /// 모든 종료 경로는 반환 전에 잔여 배치를 flush한다 (RunCompleted보다 출력이 먼저).
 #[cfg(unix)]
 async fn pty_output_loop(
-    output: &mut iced::futures::channel::mpsc::Sender<Message>,
+    output: &mut iced::futures::channel::mpsc::Sender<RunEvent>,
     session_id: Uuid,
     chunks_rx: &mut tokio::sync::mpsc::Receiver<Vec<u8>>,
     exit_rx: &mut tokio::sync::oneshot::Receiver<Result<i32, String>>,
@@ -1413,7 +1423,7 @@ const CONPTY_EOF_FAILSAFE: Duration = Duration::from_secs(5);
 /// failsafe는 청크가 흐르는 동안 굶는데 그게 정확한 의미 — 진행 중엔 실링 불필요).
 #[cfg(windows)]
 async fn pty_output_loop(
-    output: &mut iced::futures::channel::mpsc::Sender<Message>,
+    output: &mut iced::futures::channel::mpsc::Sender<RunEvent>,
     session_id: Uuid,
     chunks_rx: &mut tokio::sync::mpsc::Receiver<Vec<u8>>,
     exit_rx: &mut tokio::sync::oneshot::Receiver<Result<i32, String>>,
@@ -1533,7 +1543,7 @@ const PTY_FLUSH_MAX_BYTES: usize = 256 * 1024;
 /// 이벤트 배치를 한 개의 `OutputReceived`로 전송. 비어 있으면 no-op.
 #[cfg(any(unix, windows))]
 async fn flush_event_batch(
-    output: &mut iced::futures::channel::mpsc::Sender<Message>,
+    output: &mut iced::futures::channel::mpsc::Sender<RunEvent>,
     session_id: Uuid,
     batch: &mut EventBatch,
 ) {
@@ -1543,9 +1553,7 @@ async fn flush_event_batch(
         return;
     }
     let events = batch.take();
-    let _ = output
-        .send(Message::OutputReceived(session_id, events))
-        .await;
+    let _ = output.send(RunEvent::Output(session_id, events)).await;
 }
 
 /// PTY 자식 종료: SIGTERM(그룹, 가드 포함) → 2s 대기 → SIGKILL → waiter reap 대기.
@@ -1603,7 +1611,7 @@ async fn terminate_and_reap_pty(
 }
 
 async fn handle_spawned_process(
-    output: &mut iced::futures::channel::mpsc::Sender<Message>,
+    output: &mut iced::futures::channel::mpsc::Sender<RunEvent>,
     session_id: Uuid,
     mut child: Child,
     cancel_flag: Arc<AtomicBool>,
@@ -1648,14 +1656,14 @@ async fn handle_spawned_process(
 }
 
 async fn send_process_started(
-    output: &mut iced::futures::channel::mpsc::Sender<Message>,
+    output: &mut iced::futures::channel::mpsc::Sender<RunEvent>,
     session_id: Uuid,
     child: &Child,
 ) {
     use iced::futures::SinkExt;
 
     if let Some(pid) = child.id() {
-        let _ = output.send(Message::ProcessStarted(session_id, pid)).await;
+        let _ = output.send(RunEvent::Started(session_id, pid)).await;
     }
 }
 
@@ -1674,7 +1682,7 @@ fn take_process_streams(
 }
 
 /// 출력 배치 flush 주기(약 한 프레임). 자식이 로그를 폭주시킬 때 stdout 한 줄마다
-/// Message를 보내면 iced UI 스레드가 줄 수만큼 update()+view()+draw()를 돌려 포화되고
+/// 이벤트(→ `Message`)를 보내면 iced UI 스레드가 줄 수만큼 update()+view()+draw()를 돌려 포화되고
 /// 입력(스크롤/클릭)이 starvation 된다. 줄을 모아 이 주기마다 한 번에 보내 UI 메시지 비율을
 /// 출력량과 무관하게 ~60/s로 묶는다. app 측은 이미 멀티라인 페이로드를 처리한다
 /// (handle_output_received가 output.lines() 순회, add_output_line이 '\n' 분할).
@@ -1698,7 +1706,7 @@ const OUTPUT_FLUSH_MAX_BYTES: usize = 16 * 1024;
 /// 필요 없다. 종료(취소/EOF) 직전에는 반드시 남은 배치를 flush해, 마지막 출력이
 /// 호출자가 보내는 RunCompleted(종료 배너)보다 먼저 도착하도록 한다.
 async fn process_output_loop<O, E>(
-    output: &mut iced::futures::channel::mpsc::Sender<Message>,
+    output: &mut iced::futures::channel::mpsc::Sender<RunEvent>,
     session_id: Uuid,
     stdout_reader: &mut Option<tokio::io::BufReader<O>>,
     stderr_reader: &mut Option<tokio::io::BufReader<E>>,
@@ -2072,7 +2080,7 @@ impl LineAssembler {
 
 /// 누적된 배치를 한 개의 `OutputReceived` 메시지로 전송하고 버퍼를 비운다. 비어 있으면 no-op.
 async fn flush_batch(
-    output: &mut iced::futures::channel::mpsc::Sender<Message>,
+    output: &mut iced::futures::channel::mpsc::Sender<RunEvent>,
     session_id: Uuid,
     batch: &mut String,
     batch_lines: &mut usize,
@@ -2085,10 +2093,7 @@ async fn flush_batch(
     let payload = std::mem::take(batch);
     *batch_lines = 0;
     let _ = output
-        .send(Message::OutputReceived(
-            session_id,
-            lines_to_events(&payload),
-        ))
+        .send(RunEvent::Output(session_id, lines_to_events(&payload)))
         .await;
 }
 
@@ -2102,7 +2107,7 @@ async fn wait_flush_deadline(flush_at: Option<Instant>) {
 }
 
 async fn wait_for_process(
-    output: &mut iced::futures::channel::mpsc::Sender<Message>,
+    output: &mut iced::futures::channel::mpsc::Sender<RunEvent>,
     session_id: Uuid,
     child: &mut Child,
     cancel_flag: &Arc<AtomicBool>,
@@ -2138,13 +2143,13 @@ async fn wait_for_process(
 }
 
 async fn send_run_result(
-    output: &mut iced::futures::channel::mpsc::Sender<Message>,
+    output: &mut iced::futures::channel::mpsc::Sender<RunEvent>,
     session_id: Uuid,
     result: Result<i32, RunFailure>,
 ) {
     use iced::futures::SinkExt;
 
-    let _ = output.send(Message::RunCompleted(session_id, result)).await;
+    let _ = output.send(RunEvent::Completed(session_id, result)).await;
 }
 
 /// 취소된 프로세스를 종료하고 반드시 reap한다.
@@ -2325,7 +2330,7 @@ struct NodeCommandParts<'a> {
 }
 
 fn build_node_command(parts: NodeCommandParts<'_>) -> String {
-    use crate::utils::detect_package_manager;
+    use crate::services::detection::detect_package_manager;
     use std::path::Path;
 
     // 패키지 매니저 결정
@@ -2500,7 +2505,7 @@ fn resolve_java_executable(jdk_path: Option<&String>) -> String {
 
     let candidate = std::path::Path::new(trimmed);
     if candidate.is_dir() {
-        let name = crate::utils::java_executable_name();
+        let name = crate::services::detection::java_executable_name();
         let home_bin = candidate.join("bin").join(name);
         if home_bin.exists() {
             return quote_if_needed(&home_bin.to_string_lossy());
@@ -2766,7 +2771,7 @@ fn derive_java_home(jdk_path: Option<&str>) -> Option<std::path::PathBuf> {
     if !path.is_absolute() {
         return None;
     }
-    let name = crate::utils::java_executable_name();
+    let name = crate::services::detection::java_executable_name();
     if path.is_dir() {
         if path.join("bin").join(name).exists() {
             return Some(path.to_path_buf());
@@ -2913,18 +2918,18 @@ fn env_key_eq(a: &str, b: &str) -> bool {
     }
 }
 
-/// 사용자 `environment_variables` 위에 얹을 최종 추가 환경변수.
+/// 사용자 `environment_variables`(활성 항목) 위에 얹을 최종 추가 환경변수.
 /// `JAVA_TOOL_OPTIONS`는 사용자 값 뒤에 이어 붙이고(둘 다 살린다), `JAVA_HOME`은 사용자가 직접
 /// 지정했다면 그 값이 우선한다(명시적 의도). 그 외 키는 기존대로 추가 값이 덮어쓴다.
 /// 병합 대상은 구성의 `environment_variables`뿐이다 — 앱 프로세스의 ambient
 /// `JAVA_TOOL_OPTIONS`는 자식 프로세스가 상속만 할 뿐 여기서 합치지 않는다.
 fn effective_extra_env(
-    user_env: &std::collections::HashMap<String, String>,
+    user_env: &crate::models::EnvVars,
     extra_env: &[(String, String)],
 ) -> Vec<(String, String)> {
     let user_value = |name: &str| {
         user_env
-            .iter()
+            .active()
             .find(|(k, _)| env_key_eq(k, name))
             .map(|(_, v)| v)
     };
@@ -2958,8 +2963,8 @@ fn resolved_process_env(
 ) -> Vec<(String, String)> {
     config
         .environment_variables
-        .iter()
-        .map(|(k, v)| (k.clone(), v.clone()))
+        .active()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
         .chain(extra_env.iter().cloned())
         .collect()
 }
@@ -2987,7 +2992,7 @@ mod tests {
         };
         let session_id = Uuid::new_v4();
 
-        let messages: Vec<Message> = run_configuration_stream(
+        let messages: Vec<RunEvent> = run_configuration_stream(
             config,
             session_id,
             Arc::new(AtomicBool::new(false)),
@@ -3000,7 +3005,7 @@ mod tests {
         assert!(
             !messages
                 .iter()
-                .any(|message| matches!(message, Message::ProcessStarted(..))),
+                .any(|message| matches!(message, RunEvent::Started(..))),
             "스폰이 일어났다: {messages:?}"
         );
 
@@ -3009,12 +3014,12 @@ mod tests {
         // 초록인 채 그 목적만 사라진다.
         let banner = messages
             .iter()
-            .position(|message| matches!(message, Message::OutputReceived(..)))
+            .position(|message| matches!(message, RunEvent::Output(..)))
             .expect("배너가 먼저 나가야 한다");
         let completed: Vec<usize> = messages
             .iter()
             .enumerate()
-            .filter(|(_, message)| matches!(message, Message::RunCompleted(..)))
+            .filter(|(_, message)| matches!(message, RunEvent::Completed(..)))
             .map(|(at, _)| at)
             .collect();
 
@@ -3028,7 +3033,7 @@ mod tests {
         assert!(banner < completed[0], "배너가 완료보다 앞이어야 한다");
 
         match &messages[completed[0]] {
-            Message::RunCompleted(_, Err(RunFailure::Failed(reason))) => {
+            RunEvent::Completed(_, Err(RunFailure::Failed(reason))) => {
                 assert!(reason.contains("Working directory"), "{reason}");
             }
             other => panic!("실패로 끝나야 한다: {other:?}"),
@@ -3272,11 +3277,11 @@ mod tests {
         use iced::futures::StreamExt;
 
         /// 수신된 메시지에서 OutputReceived 이벤트만 평탄화.
-        fn collect_events(messages: &[Message]) -> Vec<OutputEvent> {
+        fn collect_events(messages: &[RunEvent]) -> Vec<OutputEvent> {
             messages
                 .iter()
                 .filter_map(|m| match m {
-                    Message::OutputReceived(_, events) => Some(events.clone()),
+                    RunEvent::Output(_, events) => Some(events.clone()),
                     _ => None,
                 })
                 .flatten()
@@ -3287,7 +3292,7 @@ mod tests {
         /// 취소 직전 emit_partial 어느 쪽이 실어 보내든 — 관측 가능한 불변식만 단언).
         #[tokio::test]
         async fn cancel_delivers_open_partial_line_and_returns_cancelled() {
-            let (mut tx, mut rx) = iced::futures::channel::mpsc::channel::<Message>(100);
+            let (mut tx, mut rx) = iced::futures::channel::mpsc::channel::<RunEvent>(100);
             let cancel = Arc::new(AtomicBool::new(false));
             let (chunks_tx, mut chunks_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
             let (_exit_tx, mut exit_rx) = tokio::sync::oneshot::channel::<Result<i32, String>>();
@@ -3329,7 +3334,7 @@ mod tests {
         /// 기다려 Completed로 끝나야 한다 (oneshot 이중 폴 없이).
         #[tokio::test]
         async fn eof_before_exit_awaits_status_then_completes() {
-            let (mut tx, mut rx) = iced::futures::channel::mpsc::channel::<Message>(100);
+            let (mut tx, mut rx) = iced::futures::channel::mpsc::channel::<RunEvent>(100);
             let cancel = Arc::new(AtomicBool::new(false));
             let (chunks_tx, mut chunks_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
             let (exit_tx, mut exit_rx) = tokio::sync::oneshot::channel::<Result<i32, String>>();
@@ -3368,7 +3373,7 @@ mod tests {
         /// 기록한 뒤에도 EOF까지 드레인하고, 늦게 도착한 출력을 보존해야 한다.
         #[tokio::test]
         async fn exit_before_eof_keeps_draining_grandchild_output() {
-            let (mut tx, mut rx) = iced::futures::channel::mpsc::channel::<Message>(100);
+            let (mut tx, mut rx) = iced::futures::channel::mpsc::channel::<RunEvent>(100);
             let cancel = Arc::new(AtomicBool::new(false));
             let (chunks_tx, mut chunks_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
             let (exit_tx, mut exit_rx) = tokio::sync::oneshot::channel::<Result<i32, String>>();
@@ -3415,7 +3420,7 @@ mod tests {
         #[cfg(windows)]
         #[tokio::test(start_paused = true)]
         async fn failsafe_rolls_while_teardown_drain_flows() {
-            let (mut tx, mut rx) = iced::futures::channel::mpsc::channel::<Message>(1000);
+            let (mut tx, mut rx) = iced::futures::channel::mpsc::channel::<RunEvent>(1000);
             let cancel = Arc::new(AtomicBool::new(false));
             let (chunks_tx, mut chunks_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
             let (exit_tx, mut exit_rx) = tokio::sync::oneshot::channel::<Result<i32, String>>();
@@ -3471,7 +3476,7 @@ mod tests {
         /// "Run interrupted unexpectedly"로 은폐). Cancelled{exit_taken}이 재await를 건너뛴다.
         #[tokio::test]
         async fn cancel_after_exit_does_not_repoll_consumed_oneshot() {
-            let (mut tx, _rx) = iced::futures::channel::mpsc::channel::<Message>(100);
+            let (mut tx, _rx) = iced::futures::channel::mpsc::channel::<RunEvent>(100);
             let cancel = Arc::new(AtomicBool::new(false));
             let (_chunks_tx, mut chunks_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
             let (exit_tx, mut exit_rx) = tokio::sync::oneshot::channel::<Result<i32, String>>();
@@ -4567,7 +4572,7 @@ time.sleep(30)'";
             id: Uuid::new_v4(),
             name: String::from("k"),
             working_directory: String::from("."),
-            environment_variables: std::collections::HashMap::new(),
+            environment_variables: crate::models::EnvVars::default(),
             type_data: ConfigTypeData::Kotlin {
                 jdk_path: None,
                 launch_mode: kotlin_main_class("MainKt", "out"),
@@ -4588,7 +4593,7 @@ time.sleep(30)'";
     async fn output_loop_terminates_when_one_reader_eofs_first() {
         use tokio::io::BufReader;
 
-        let (mut tx, _rx) = iced::futures::channel::mpsc::channel::<Message>(100);
+        let (mut tx, _rx) = iced::futures::channel::mpsc::channel::<RunEvent>(100);
         let cancel = Arc::new(AtomicBool::new(false));
 
         // stdout: 데이터 후 EOF / stderr: 즉시 EOF (실제 "echo 후 종료" 시나리오 재현).
@@ -4622,7 +4627,7 @@ time.sleep(30)'";
         use iced::futures::StreamExt;
         use tokio::io::BufReader;
 
-        let (mut tx, mut rx) = iced::futures::channel::mpsc::channel::<Message>(1000);
+        let (mut tx, mut rx) = iced::futures::channel::mpsc::channel::<RunEvent>(1000);
         let cancel = Arc::new(AtomicBool::new(false));
 
         let mut data = Vec::new();
@@ -4654,7 +4659,7 @@ time.sleep(30)'";
         // (EOF 시 잔여 부분 배치 flush가 누락 없이 마지막 줄들까지 보내는지도 검증).
         let mut reconstructed = String::new();
         for msg in &messages {
-            if let Message::OutputReceived(_, events) = msg {
+            if let RunEvent::Output(_, events) = msg {
                 for event in events {
                     match event {
                         crate::models::OutputEvent::Line(text)
@@ -4677,7 +4682,7 @@ time.sleep(30)'";
         // 인메모리 read는 즉시 완료되어 16ms 타이머가 거의 발화하지 않으므로 여유 상한 20).
         let output_msgs = messages
             .iter()
-            .filter(|m| matches!(m, Message::OutputReceived(_, _)))
+            .filter(|m| matches!(m, RunEvent::Output(_, _)))
             .count();
         assert!(
             output_msgs < 200,
@@ -4730,10 +4735,10 @@ time.sleep(30)'";
         };
         config
             .environment_variables
-            .insert("TOKEN".to_string(), "a\nSECRET=b".to_string());
+            .set("TOKEN".to_string(), "a\nSECRET=b".to_string());
         config
             .environment_variables
-            .insert("CARRIAGE".to_string(), "x\rSECRET=c".to_string());
+            .set("CARRIAGE".to_string(), "x\rSECRET=c".to_string());
 
         let (mut tx, mut rx) = mpsc::channel(16);
         send_command_info(&mut tx, Uuid::new_v4(), &config, "echo hi", &[], true).await;
@@ -4742,7 +4747,7 @@ time.sleep(30)'";
         let mut lines: Vec<String> = Vec::new();
         let mut banner_events: Vec<String> = Vec::new();
         while let Some(msg) = rx.next().await {
-            if let Message::OutputReceived(_, events) = msg {
+            if let RunEvent::Output(_, events) = msg {
                 for event in events {
                     match event {
                         crate::models::OutputEvent::EnvBanner(text) => {
@@ -4788,7 +4793,7 @@ time.sleep(30)'";
         };
         config
             .environment_variables
-            .insert("FOO".to_string(), "bar".to_string());
+            .set("FOO".to_string(), "bar".to_string());
 
         async fn header(config: &RunConfiguration, show_env: bool) -> String {
             let (mut tx, mut rx) = mpsc::channel(16);
@@ -4796,7 +4801,7 @@ time.sleep(30)'";
             drop(tx);
             let mut out = String::new();
             while let Some(msg) = rx.next().await {
-                if let Message::OutputReceived(_, events) = msg {
+                if let RunEvent::Output(_, events) = msg {
                     for event in events {
                         match event {
                             crate::models::OutputEvent::Line(text)
@@ -5306,10 +5311,10 @@ time.sleep(30)'";
         let mut config = RunConfiguration::default();
         config
             .environment_variables
-            .insert(String::from("JAVA_TOOL_OPTIONS"), String::from("-Duser=1"));
+            .set(String::from("JAVA_TOOL_OPTIONS"), String::from("-Duser=1"));
         config
             .environment_variables
-            .insert(String::from("JAVA_HOME"), String::from("/user/jdk"));
+            .set(String::from("JAVA_HOME"), String::from("/user/jdk"));
         let raw = vec![
             (String::from("JAVA_TOOL_OPTIONS"), String::from("-Xmx1g")),
             (String::from("JAVA_HOME"), String::from("/derived")),
@@ -5342,9 +5347,37 @@ time.sleep(30)'";
     }
 
     #[test]
+    fn disabled_env_entries_are_not_injected_or_merged() {
+        use crate::models::{EnvEntry, EnvVars};
+        let off = |k: &str, v: &str| EnvEntry {
+            enabled: false,
+            ..EnvEntry::enabled(k, v)
+        };
+        let config = RunConfiguration {
+            environment_variables: EnvVars::from_entries([
+                EnvEntry::enabled("ON", "1"),
+                off("OFF", "2"),
+                off("JAVA_HOME", "/disabled/jdk"),
+            ]),
+            ..RunConfiguration::default()
+        };
+        let raw = vec![(String::from("JAVA_HOME"), String::from("/derived"))];
+        // 꺼진 JAVA_HOME은 사용자 지정으로 치지 않으므로 파생 값이 살아남아야 한다.
+        let extra = effective_extra_env(&config.environment_variables, &raw);
+        assert_eq!(extra, raw);
+
+        let resolved = resolved_process_env(&config, &extra);
+        assert!(resolved.iter().all(|(k, _)| k != "OFF"));
+        assert!(resolved.contains(&(String::from("ON"), String::from("1"))));
+        assert!(!resolved.iter().any(|(_, v)| v == "/disabled/jdk"));
+    }
+
+    #[test]
     fn effective_extra_env_is_not_idempotent_so_it_must_run_once() {
-        let mut user = std::collections::HashMap::new();
-        user.insert(String::from("JAVA_TOOL_OPTIONS"), String::from("-Duser=1"));
+        let user: crate::models::EnvVars =
+            [(String::from("JAVA_TOOL_OPTIONS"), String::from("-Duser=1"))]
+                .into_iter()
+                .collect();
         let raw = vec![(String::from("JAVA_TOOL_OPTIONS"), String::from("-Xmx1g"))];
         let once = effective_extra_env(&user, &raw);
         let twice = effective_extra_env(&user, &once);
@@ -5355,8 +5388,8 @@ time.sleep(30)'";
     #[cfg(windows)]
     #[test]
     fn effective_env_matches_names_case_insensitively_on_windows() {
-        let mut user = std::collections::HashMap::new();
-        user.insert(String::from("java_home"), String::from("C:\\jdk"));
+        let mut user = crate::models::EnvVars::default();
+        user.set(String::from("java_home"), String::from("C:\\jdk"));
         let extra = vec![(String::from("JAVA_HOME"), String::from("C:\\derived"))];
         assert!(effective_extra_env(&user, &extra).is_empty());
     }
@@ -5364,8 +5397,8 @@ time.sleep(30)'";
     #[cfg(not(windows))]
     #[test]
     fn effective_env_matches_names_case_sensitively_on_unix() {
-        let mut user = std::collections::HashMap::new();
-        user.insert(String::from("java_home"), String::from("/x"));
+        let mut user = crate::models::EnvVars::default();
+        user.set(String::from("java_home"), String::from("/x"));
         let extra = vec![(String::from("JAVA_HOME"), String::from("/derived"))];
         assert_eq!(effective_extra_env(&user, &extra), extra);
     }
@@ -5551,7 +5584,7 @@ time.sleep(30)'";
 
     #[test]
     fn derive_java_home_handles_home_bin_dir_and_executable_inputs() {
-        let name = crate::utils::java_executable_name();
+        let name = crate::services::detection::java_executable_name();
         let jdk = TempDir::new("jdk");
         let java = jdk.touch(&format!("bin/{name}"));
 
@@ -5599,7 +5632,7 @@ time.sleep(30)'";
 
     #[test]
     fn gradle_and_maven_export_derived_java_home() {
-        let name = crate::utils::java_executable_name();
+        let name = crate::services::detection::java_executable_name();
         let jdk = TempDir::new("jdk-env");
         jdk.touch(&format!("bin/{name}"));
         let proj = TempDir::new("proj-env");
@@ -5618,9 +5651,9 @@ time.sleep(30)'";
 
     #[test]
     fn effective_env_appends_java_tool_options_and_user_java_home_wins() {
-        let mut user = std::collections::HashMap::new();
-        user.insert(String::from("JAVA_TOOL_OPTIONS"), String::from("-Duser=1 "));
-        user.insert(String::from("JAVA_HOME"), String::from("/user/jdk"));
+        let mut user = crate::models::EnvVars::default();
+        user.set(String::from("JAVA_TOOL_OPTIONS"), String::from("-Duser=1 "));
+        user.set(String::from("JAVA_HOME"), String::from("/user/jdk"));
         let extra = vec![
             (String::from("JAVA_TOOL_OPTIONS"), String::from("-Xmx1g")),
             (String::from("JAVA_HOME"), String::from("/derived")),
@@ -5637,7 +5670,7 @@ time.sleep(30)'";
             ]
         );
 
-        let none = std::collections::HashMap::new();
+        let none = crate::models::EnvVars::default();
         assert_eq!(effective_extra_env(&none, &extra), extra);
     }
 

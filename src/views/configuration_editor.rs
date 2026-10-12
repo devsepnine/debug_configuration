@@ -1,7 +1,8 @@
 use crate::messages::Message;
 use crate::models::{
-    ConfigTypeData, ConfigurationType, ExecuteMode, ExecuteModeType, KotlinLaunchMode,
-    KotlinLaunchModeType, NodeCommand, PackageManager, RunConfiguration, SpringBootBuildTool,
+    ConfigTypeData, ConfigurationType, EnvEntry, EnvVars, ExecuteMode, ExecuteModeType,
+    KotlinLaunchMode, KotlinLaunchModeType, NodeCommand, PackageManager, RunConfiguration,
+    SpringBootBuildTool, duplicate_key_indices,
 };
 use crate::services::McpPermission;
 use crate::utils::{
@@ -269,7 +270,7 @@ pub fn view_configuration_editor<'a>(
             .push(Space::new().height(16))
             .push(view_section_block(
                 "Environment",
-                view_environment_bulk_input(env_bulk_text),
+                view_environment_bulk_input(env_bulk_text, &config.environment_variables),
             ));
     }
 
@@ -577,18 +578,46 @@ fn selected_package_json(project_directory: &str, working_directory: &str) -> Op
 ///
 /// IntelliJ Run/Debug Configuration의 Environment 필드와 동일한 UX.
 /// 직접 타이핑 가능하며 Enter로 적용. [편집] 버튼 클릭 시 모달이 열림.
-fn view_environment_bulk_input(env_bulk_text: &str) -> Element<'_, Message> {
-    row![
+/// input은 활성 항목만 담으므로, 비활성 항목이 있으면 그 수를 아래에 알린다.
+fn view_environment_bulk_input<'a>(env_bulk_text: &'a str, env: &EnvVars) -> Element<'a, Message> {
+    // 비활성 키와 같은 키를 입력하면 `EnvVars::replace_active`가 그 입력을 버린다 — 이유는 그 doc.
+    let collides = env.collides_with_disabled(&crate::env_string::parse_env_string(env_bulk_text));
+    let input_style: fn(&Theme, text_input::Status) -> text_input::Style = if collides {
+        text_input_warn_style
+    } else {
+        flat_text_input_style
+    };
+    let input_row = row![
         editor_input("KEY1=value1;KEY2=value2;...", env_bulk_text)
             .on_input(Message::EnvBulkInputChanged)
             .on_submit(Message::EnvBulkInputSubmitted)
+            .style(input_style)
             .width(Length::Fill),
         icon_button(ICON_EDIT, Some(Message::OpenEnvModal)),
     ]
     .spacing(5)
     .align_y(Alignment::Center)
-    .width(Length::Fill)
-    .into()
+    .width(Length::Fill);
+
+    let disabled_count = env.entries().iter().filter(|e| !e.enabled).count();
+    let hint = if collides {
+        Some(String::from(
+            "A key here is disabled in the editor; enable it there to change it.",
+        ))
+    } else if disabled_count > 0 {
+        Some(format!(
+            "{disabled_count} disabled variable(s) not shown; open the editor to manage them."
+        ))
+    } else {
+        None
+    };
+    match hint {
+        Some(hint) => column![input_row, text(hint).size(12).style(muted_text_style)]
+            .spacing(4)
+            .width(Length::Fill)
+            .into(),
+        None => input_row.into(),
+    }
 }
 
 /// Compound 구성 편집: 함께 실행할 멤버를 토글로 선택.
@@ -721,7 +750,7 @@ fn compound_member_row_style(
 /// always-inline 패턴 — 모든 row가 항상 input. view에서 마지막에 빈 row를
 /// 자동으로 한 줄 더 그려 auto-grow를 유도한다.
 pub struct EnvModalView<'a> {
-    pub entries: &'a [(String, String)],
+    pub entries: &'a [EnvEntry],
 }
 
 /// 환경변수 편집 모달 (반투명 배경 + 중앙 다이얼로그).
@@ -743,33 +772,37 @@ pub fn view_env_modal<'a>(props: EnvModalView<'a>) -> Element<'a, Message> {
 
     let duplicates = duplicate_key_indices(props.entries);
     let mut table = Column::new().spacing(5);
-    for (idx, (key, value)) in props.entries.iter().enumerate() {
+    for (idx, entry) in props.entries.iter().enumerate() {
         let is_duplicate = duplicates.contains(&idx);
         table = table.push(view_env_modal_row(
             idx,
-            key,
-            value,
+            &entry.key,
+            &entry.value,
+            Some(entry.enabled),
             is_duplicate,
-            /* is_placeholder = */ false,
         ));
     }
     // 항상 마지막에 빈 row 한 줄 더 — 사용자가 타이핑하면 handler가 entries에 push (auto-grow)
-    table = table.push(view_env_modal_row(
-        props.entries.len(),
-        "",
-        "",
-        false,
-        /* is_placeholder = */ true,
-    ));
+    table = table.push(view_env_modal_row(props.entries.len(), "", "", None, false));
 
+    let has_duplicates = !duplicates.is_empty();
+    let duplicate_hint: Element<'a, Message> = if has_duplicates {
+        text("Each key can appear only once.")
+            .size(12)
+            .style(muted_text_style)
+            .into()
+    } else {
+        Space::new().into()
+    };
     let footer = row![
+        duplicate_hint,
         Space::new().width(Length::Fill),
         button(text("Cancel").size(13))
             .on_press(Message::CancelEnvModal)
             .padding([6, 16])
             .style(modal_secondary_button_style),
         button(text("OK").size(13))
-            .on_press(Message::ConfirmEnvModal)
+            .on_press_maybe((!has_duplicates).then_some(Message::ConfirmEnvModal))
             .padding([6, 18])
             .style(modal_primary_button_style),
     ]
@@ -1526,38 +1559,24 @@ fn warn_text_style(_theme: &Theme) -> text::Style {
     }
 }
 
-/// staging entries 중 동일 키가 둘 이상 있는 row index 집합.
-/// trim 후 빈 키는 중복 검사에서 제외 (placeholder/입력 중인 row 보호).
-fn duplicate_key_indices(entries: &[(String, String)]) -> std::collections::HashSet<usize> {
-    use std::collections::HashMap;
-    let mut by_key: HashMap<&str, Vec<usize>> = HashMap::new();
-    for (idx, (key, _)) in entries.iter().enumerate() {
-        let trimmed = key.trim();
-        if !trimmed.is_empty() {
-            by_key.entry(trimmed).or_default().push(idx);
-        }
-    }
-    by_key
-        .into_values()
-        .filter(|indices| indices.len() > 1)
-        .flatten()
-        .collect()
-}
-
-/// 단일 row: [Key input] [Value input] [Duplicate] [Delete].
+/// 단일 row: [Enabled] [Key input] [Value input] [Duplicate] [Delete].
 ///
-/// `is_placeholder == true`이면 마지막 자동 추가 빈 row — Duplicate/Delete 비활성.
+/// `enabled == None`이면 마지막 자동 추가 빈 row(placeholder) — 체크박스·Duplicate·Delete 비활성.
+/// `Some(false)`이면 비활성 항목이라 input을 흐리게 그린다 (편집은 계속 가능).
 /// `is_duplicate == true`이면 Key/Value input에 경고 테두리 (같은 키 검출 시).
-/// Duplicate 버튼: 동일 (key, value)를 entries 끝에 push해 사본 생성.
+/// Duplicate 버튼: 동일 (key, value)를 원본 다음 위치에 insert해 사본 생성.
 fn view_env_modal_row<'a>(
     index: usize,
     key: &'a str,
     value: &'a str,
+    enabled: Option<bool>,
     is_duplicate: bool,
-    is_placeholder: bool,
 ) -> iced::widget::Row<'a, Message> {
+    let is_placeholder = enabled.is_none();
     let style_fn: fn(&Theme, text_input::Status) -> text_input::Style = if is_duplicate {
         text_input_warn_style
+    } else if enabled == Some(false) {
+        text_input_disabled_entry_style
     } else {
         text_input::default
     };
@@ -1581,7 +1600,15 @@ fn view_env_modal_row<'a>(
     let duplicate_msg = (!is_placeholder).then_some(Message::EnvModalDuplicateEntry(index));
     let delete_msg = (!is_placeholder).then_some(Message::EnvModalRemoveEntry(index));
 
+    let enabled_toggle = checkbox(enabled.unwrap_or(true))
+        .on_toggle_maybe(
+            (!is_placeholder)
+                .then_some(move |checked| Message::EnvModalToggleEntry(index, checked)),
+        )
+        .size(16);
+
     row![
+        enabled_toggle,
         key_input,
         value_input,
         icon_button(ICON_COPY, duplicate_msg),
@@ -1599,6 +1626,17 @@ pub fn env_modal_key_id(index: usize) -> iced::advanced::widget::Id {
 /// 모달 row의 value input에 부여하는 widget id.
 pub fn env_modal_value_id(index: usize) -> iced::advanced::widget::Id {
     iced::advanced::widget::Id::from(format!("env-modal-value-{index}"))
+}
+
+fn text_input_disabled_entry_style(theme: &Theme, status: text_input::Status) -> text_input::Style {
+    let base = text_input::default(theme, status);
+    text_input::Style {
+        value: Color {
+            a: 0.4,
+            ..base.value
+        },
+        ..base
+    }
 }
 
 fn text_input_warn_style(theme: &Theme, status: text_input::Status) -> text_input::Style {

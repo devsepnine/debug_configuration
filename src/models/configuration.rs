@@ -1,5 +1,5 @@
+use super::EnvVars;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use uuid::Uuid;
 
 /// 실행 구성의 타입을 정의하는 열거형
@@ -832,8 +832,8 @@ pub struct RunConfiguration {
     pub name: String,
     /// 작업 디렉토리 경로
     pub working_directory: String,
-    /// 환경 변수 맵 (key-value)
-    pub environment_variables: HashMap<String, String>,
+    /// 환경 변수 목록 (입력 순서, 항목별 활성 여부)
+    pub environment_variables: EnvVars,
     /// 타입별 데이터
     pub type_data: ConfigTypeData,
 }
@@ -844,7 +844,7 @@ impl Default for RunConfiguration {
             id: Uuid::new_v4(),
             name: String::from("New Configuration"),
             working_directory: String::from("."),
-            environment_variables: HashMap::new(),
+            environment_variables: EnvVars::default(),
             type_data: ConfigTypeData::Application {
                 command: String::new(),
                 arguments: String::new(),
