@@ -157,7 +157,11 @@ pub fn save_settings(settings: &AppSettings) {
 /// 만들지 않아도 이후 저장된 파일은 옛 앱에서 "newer version" 안내로 열린다.
 /// `SpringBoot`의 `module`은 v0.8.0 출시 전에 같은 버전 2 안에서 더했다 — 버전 2 파일을
 /// 쓴 배포본이 없어 올릴 필요가 없었다. 출시 이후에 필드를 더하면 이 예외는 적용되지 않는다.
-const CURRENT_CONFIG_VERSION: u32 = 2;
+///
+/// 3: `environment_variables`가 `{"KEY": "value"}` 맵에서 `[{key, value, enabled}]` 배열로
+/// 바뀌었다. 최상위 필드지만 옛 앱은 배열을 맵으로 읽지 못하므로 올린다. 옛 맵 형식은
+/// `EnvVars`의 역직렬화가 전부 활성 항목으로 읽는다.
+const CURRENT_CONFIG_VERSION: u32 = 3;
 
 /// 디스크에 저장되는 구성 파일 형식 (버전 envelope).
 ///
@@ -491,6 +495,41 @@ mod tests {
         ]}"#;
         let parsed = parse_config_file(v1).unwrap();
         assert_eq!(parsed[0].name, "Old");
+    }
+
+    #[test]
+    fn version_2_env_map_loads_as_enabled_entries() {
+        let v2 = r#"{"version":2,"configurations":[
+          {"id":"00000000-0000-0000-0000-000000000004","name":"Env",
+           "working_directory":".","environment_variables":{"B":"2","A":"1"},
+           "type_data":{"type":"Application","command":"echo","arguments":""}}
+        ]}"#;
+        let parsed = parse_config_file(v2).unwrap();
+        let env = &parsed[0].environment_variables;
+        assert_eq!(
+            env.active().collect::<Vec<_>>(),
+            vec![("A", "1"), ("B", "2")]
+        );
+    }
+
+    #[test]
+    fn disabled_env_entries_survive_a_save_and_load() {
+        let config = RunConfiguration {
+            environment_variables: crate::models::EnvVars::from_entries([
+                crate::models::EnvEntry::enabled("ON", "1"),
+                crate::models::EnvEntry {
+                    enabled: false,
+                    ..crate::models::EnvEntry::enabled("OFF", "2")
+                },
+            ]),
+            ..RunConfiguration::default()
+        };
+        let json = serialize_config_file(vec![config.clone()]).unwrap();
+        let parsed = parse_config_file(&json).unwrap();
+        assert_eq!(
+            parsed[0].environment_variables,
+            config.environment_variables
+        );
     }
 
     #[test]

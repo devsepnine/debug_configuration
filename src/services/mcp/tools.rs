@@ -424,6 +424,11 @@ static TOOLS: &[ToolSpec] = &[
                                         be an empty string.",
                     },
                     "environment_variables": env_map_schema(),
+                    "disabled_environment_variables": env_key_list_schema(
+                        "Names from environment_variables to store disabled: kept with the \
+                         configuration but not passed to runs until enabled. Every name must be \
+                         in environment_variables.",
+                    ),
                     "type_data": type_data_schema(),
                     "request_id": request_id_schema(
                         "Optional idempotency key. Retrying the same request_id within 60 seconds \
@@ -444,7 +449,11 @@ static TOOLS: &[ToolSpec] = &[
                       least one is required. Environment variables are edited by key \
                       (set_environment_variables / remove_environment_variables) rather than \
                       replaced wholesale, because values you read may be masked and writing them \
-                      back would destroy the real ones. \
+                      back would destroy the real ones. A disabled variable stays stored but is \
+                      not passed to runs; enable_environment_variables / \
+                      disable_environment_variables flip that by key, and are applied after the \
+                      set, so a new variable can be added disabled in one call. Setting the value \
+                      of an existing variable keeps its enabled state; a new one starts enabled. \
                       type_data, when present, replaces the whole object — copy it from \
                       get_configuration and edit it. The response's changed flag says whether the \
                       call altered anything; it is null when a retried request_id was absorbed, \
@@ -489,6 +498,15 @@ static TOOLS: &[ToolSpec] = &[
                                         ignored — the response's changed flag says whether the \
                                         call altered anything.",
                     },
+                    "enable_environment_variables": env_key_list_schema(
+                        "Variable names to pass to runs again. Names that are not set are ignored. \
+                         A name may not also appear in disable_environment_variables.",
+                    ),
+                    "disable_environment_variables": env_key_list_schema(
+                        "Variable names to keep stored but leave out of runs. Names that are not \
+                         set are ignored. A name may not also appear in \
+                         enable_environment_variables.",
+                    ),
                     "request_id": request_id_schema(
                         "Optional idempotency key. Retrying the same request_id within 60 seconds \
                          answers with the first call's result instead of applying the patch twice.",
@@ -553,6 +571,14 @@ fn env_map_schema() -> Value {
         "description": "Variable name to value. A value of \"<hidden>\" is rejected: that is the \
                         placeholder masked reads return, so accepting it would overwrite the real \
                         secret with the mask.",
+    })
+}
+
+fn env_key_list_schema(description: &str) -> Value {
+    json!({
+        "type": "array",
+        "items": { "type": "string", "maxLength": MAX_ENV_KEY_CHARS },
+        "description": description,
     })
 }
 
@@ -622,6 +648,8 @@ pub struct CreateConfigurationArgs {
     pub working_directory: String,
     #[serde(default)]
     pub environment_variables: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    pub disabled_environment_variables: Vec<String>,
     pub type_data: ConfigTypeData,
     pub request_id: Option<String>,
 }
@@ -638,6 +666,10 @@ pub struct UpdateConfigurationArgs {
     pub set_environment_variables: std::collections::HashMap<String, String>,
     #[serde(default)]
     pub remove_environment_variables: Vec<String>,
+    #[serde(default)]
+    pub enable_environment_variables: Vec<String>,
+    #[serde(default)]
+    pub disable_environment_variables: Vec<String>,
     pub request_id: Option<String>,
 }
 
@@ -650,6 +682,8 @@ impl UpdateConfigurationArgs {
             || self.type_data.is_some()
             || !self.set_environment_variables.is_empty()
             || !self.remove_environment_variables.is_empty()
+            || !self.enable_environment_variables.is_empty()
+            || !self.disable_environment_variables.is_empty()
     }
 }
 
@@ -847,6 +881,18 @@ pub fn parse_call(name: &str, args: &Value) -> Result<McpOp, JsonRpcError> {
             require_working_directory(&spec.working_directory, &spec.type_data)?;
             require_bounded_type_data(&spec.type_data)?;
             require_bounded_env(&spec.environment_variables)?;
+            // 상한 검사가 소속 검사보다 먼저다 — 소속 오류 문구가 키를 싣기 때문이다.
+            // update와 달리 "없는 키는 무시"하지 않는다 — 만드는 호출에는 무시할 기존 상태가 없으므로
+            // 없는 키는 오타이고, 무시하면 끄려던 변수가 켜진 채 만들어진다.
+            for key in &spec.disabled_environment_variables {
+                require_bounded("environment variable name", key, MAX_ENV_KEY_CHARS)?;
+                if !spec.environment_variables.contains_key(key) {
+                    return Err(invalid_params(format!(
+                        "disabled_environment_variables names '{key}', which is not in \
+                         environment_variables"
+                    )));
+                }
+            }
             Ok(McpOp::CreateConfiguration(Box::new(spec)))
         }
         "update_configuration" => {
@@ -870,8 +916,25 @@ pub fn parse_call(name: &str, args: &Value) -> Result<McpOp, JsonRpcError> {
                 require_bounded_type_data(type_data)?;
             }
             require_bounded_env(&patch.set_environment_variables)?;
-            for key in &patch.remove_environment_variables {
+            for key in patch
+                .remove_environment_variables
+                .iter()
+                .chain(&patch.enable_environment_variables)
+                .chain(&patch.disable_environment_variables)
+            {
                 require_bounded("environment variable name", key, MAX_ENV_KEY_CHARS)?;
+            }
+            // set/remove 충돌은 적용 순서로 정해지지만(설정이 이긴다), 켜고 끄는 요청은 어느
+            // 순서로 적용해도 호출자 의도 하나를 버리게 되므로 거절한다.
+            if let Some(key) = patch
+                .enable_environment_variables
+                .iter()
+                .find(|key| patch.disable_environment_variables.contains(key))
+            {
+                return Err(invalid_params(format!(
+                    "environment variable '{key}' is in both enable_environment_variables and \
+                     disable_environment_variables"
+                )));
             }
             if !patch.changes_something() {
                 return Err(invalid_params(
@@ -2241,6 +2304,12 @@ mod tests {
         ),
         (
             "create_configuration",
+            "disabled_environment_variables",
+            Slot::Item,
+            StringBound::Chars(MAX_ENV_KEY_CHARS),
+        ),
+        (
+            "create_configuration",
             "request_id",
             Slot::Value,
             StringBound::Chars(MAX_REQUEST_ID_CHARS),
@@ -2278,6 +2347,18 @@ mod tests {
         (
             "update_configuration",
             "remove_environment_variables",
+            Slot::Item,
+            StringBound::Chars(MAX_ENV_KEY_CHARS),
+        ),
+        (
+            "update_configuration",
+            "enable_environment_variables",
+            Slot::Item,
+            StringBound::Chars(MAX_ENV_KEY_CHARS),
+        ),
+        (
+            "update_configuration",
+            "disable_environment_variables",
             Slot::Item,
             StringBound::Chars(MAX_ENV_KEY_CHARS),
         ),
@@ -2362,7 +2443,12 @@ mod tests {
             // 파서와 스키마가 같은 단위를 센다(D51(c)).
             if let StringBound::Chars(limit) = bound {
                 let mut args = sample_args(tool);
-                with_string(&mut args, property, *slot, "가".repeat(*limit));
+                let value = "가".repeat(*limit);
+                // 끌 변수는 설정하는 변수 중에 있어야 하므로(`parse_call`) 같은 키를 함께 싣는다.
+                if *property == "disabled_environment_variables" {
+                    args["environment_variables"] = json!({ value.clone(): "v" });
+                }
+                with_string(&mut args, property, *slot, value);
                 assert!(
                     parse_call(tool, &args).is_ok(),
                     "{tool}.{property}: 상한 안의 멀티바이트 값이 거절됐다"
@@ -2840,6 +2926,51 @@ mod tests {
             "program_arguments": "",
         });
         assert!(parse_call("create_configuration", &args).is_ok());
+    }
+
+    #[test]
+    fn create_refuses_to_disable_a_variable_it_does_not_set() {
+        let mut args = create_args();
+        args["environment_variables"] = json!({ "MODE": "debug" });
+        args["disabled_environment_variables"] = json!(["MDOE"]);
+        let err = parse_call("create_configuration", &args).expect_err("typo");
+        assert_eq!(err.code, INVALID_PARAMS);
+        assert!(err.message.contains("MDOE"), "{}", err.message);
+
+        args["disabled_environment_variables"] = json!(["MODE"]);
+        assert!(parse_call("create_configuration", &args).is_ok());
+    }
+
+    #[test]
+    fn an_over_long_disabled_key_is_not_echoed_back_in_full() {
+        let mut args = create_args();
+        args["disabled_environment_variables"] = json!(["K".repeat(MAX_ENV_KEY_CHARS * 4)]);
+
+        let err = parse_call("create_configuration", &args).expect_err("긴 키는 거절");
+
+        assert!(
+            err.message.chars().count() < MAX_ENV_KEY_CHARS,
+            "{} chars",
+            err.message.chars().count()
+        );
+    }
+
+    #[test]
+    fn enabling_and_disabling_the_same_variable_is_refused() {
+        let args = json!({
+            "configuration": "build",
+            "enable_environment_variables": ["MODE"],
+            "disable_environment_variables": ["MODE"],
+        });
+        let err = parse_call("update_configuration", &args).expect_err("conflict");
+        assert_eq!(err.code, INVALID_PARAMS);
+        assert!(err.message.contains("MODE"), "{}", err.message);
+    }
+
+    #[test]
+    fn a_toggle_alone_counts_as_a_change() {
+        let args = json!({ "configuration": "build", "disable_environment_variables": ["MODE"] });
+        assert!(parse_call("update_configuration", &args).is_ok());
     }
 
     #[test]

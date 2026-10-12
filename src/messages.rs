@@ -219,7 +219,9 @@ pub enum Message {
     EnvModalRowKeyChanged(usize, String),
     /// 모달 row의 값 입력 변경 (인덱스, 새 값). 인덱스가 범위 밖이면 새 row 추가.
     EnvModalRowValueChanged(usize, String),
-    /// 모달 row 복제 — 동일 (key, value)을 entries 끝에 새로 push (인덱스)
+    /// 모달 row 활성/비활성 토글 (인덱스, 활성 여부). 비활성 row는 실행에 주입되지 않는다.
+    EnvModalToggleEntry(usize, bool),
+    /// 모달 row 복제 — 동일 (key, value)을 원본 바로 다음에 활성 상태로 insert (인덱스)
     EnvModalDuplicateEntry(usize),
     /// 모달 row 제거 (인덱스)
     EnvModalRemoveEntry(usize),

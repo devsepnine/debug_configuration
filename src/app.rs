@@ -493,7 +493,7 @@ pub struct RunConfigManager {
     status_message: String,
 
     /// 각 구성별 환경변수 메인 input의 raw text (`config_id` -> `KEY=val;...`)
-    /// `None`이면 `environment_variables`를 직렬화한 값을 표시
+    /// `None`이면 `environment_variables`의 활성 항목을 직렬화한 값을 표시
     env_bulk_inputs: HashMap<Uuid, String>,
     /// 환경변수 편집 모달 상태 (`Some`이면 모달 열림)
     env_modal: Option<EnvModalState>,
@@ -912,6 +912,7 @@ impl RunConfigManager {
             | Message::CancelEnvModal
             | Message::EnvModalRowKeyChanged(_, _)
             | Message::EnvModalRowValueChanged(_, _)
+            | Message::EnvModalToggleEntry(_, _)
             | Message::EnvModalDuplicateEntry(_)
             | Message::EnvModalRemoveEntry(_)
             | Message::EnvModalFocusNext
@@ -1152,6 +1153,9 @@ impl RunConfigManager {
             }
             Message::EnvModalRowValueChanged(idx, value) => {
                 self.handle_env_modal_row_value_changed(idx, value)
+            }
+            Message::EnvModalToggleEntry(idx, enabled) => {
+                self.handle_env_modal_toggle_entry(idx, enabled)
             }
             Message::EnvModalDuplicateEntry(idx) => self.handle_env_modal_duplicate_entry(idx),
             Message::EnvModalRemoveEntry(idx) => self.handle_env_modal_remove_entry(idx),
@@ -4832,7 +4836,7 @@ impl RunConfigManager {
         let id = config.id;
         self.env_bulk_inputs
             .entry(id)
-            .or_insert_with(|| crate::env_string::serialize_env_map(&config.environment_variables));
+            .or_insert_with(|| env_modal::active_env_text(&config.environment_variables));
     }
 
     /// ScriptText 에디터 버퍼를 모델과 동기화한다 — `update()` 말미에 매 메시지 후

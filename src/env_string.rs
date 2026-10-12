@@ -5,8 +5,6 @@
 //! Escape: `\;`, `\n`, `\\`
 //! 첫 번째 `=` 이전이 키, 이후가 값.
 
-use std::collections::HashMap;
-
 /// 환경변수 문자열을 (key, value) 쌍의 Vec으로 파싱.
 ///
 /// - 빈 항목, 빈 키, `=`가 없는 항목은 무시
@@ -32,12 +30,10 @@ pub fn parse_env_string(input: &str) -> Vec<(String, String)> {
     entries
 }
 
-/// `HashMap`을 환경변수 문자열로 직렬화. 키는 알파벳 정렬.
-pub fn serialize_env_map(map: &HashMap<String, String>) -> String {
-    let mut entries: Vec<(&String, &String)> = map.iter().collect();
-    entries.sort_by(|a, b| a.0.cmp(b.0));
-    entries
-        .iter()
+/// (key, value) 쌍을 주어진 순서대로 환경변수 문자열로 직렬화.
+pub fn serialize_env_pairs<'a>(pairs: impl IntoIterator<Item = (&'a str, &'a str)>) -> String {
+    pairs
+        .into_iter()
         .map(|(k, v)| format!("{k}={}", escape(v)))
         .collect::<Vec<_>>()
         .join(";")
@@ -175,35 +171,30 @@ mod tests {
     }
 
     #[test]
-    fn serializes_alphabetically() {
-        let mut map = HashMap::new();
-        map.insert("ZED".to_string(), "z".to_string());
-        map.insert("ALPHA".to_string(), "a".to_string());
-        map.insert("MID".to_string(), "m".to_string());
-        assert_eq!(serialize_env_map(&map), "ALPHA=a;MID=m;ZED=z");
+    fn serializes_in_given_order() {
+        let pairs = [("ZED", "z"), ("ALPHA", "a"), ("MID", "m")];
+        assert_eq!(serialize_env_pairs(pairs), "ZED=z;ALPHA=a;MID=m");
     }
 
     #[test]
-    fn serializes_empty_map_to_empty_string() {
-        assert_eq!(serialize_env_map(&HashMap::new()), "");
+    fn serializes_empty_to_empty_string() {
+        assert_eq!(serialize_env_pairs([]), "");
     }
 
     #[test]
     fn serializes_escapes_special_chars() {
-        let mut map = HashMap::new();
-        map.insert("PATH".to_string(), "a;b".to_string());
-        map.insert("WIN".to_string(), "C:\\Users".to_string());
-        assert_eq!(serialize_env_map(&map), "PATH=a\\;b;WIN=C:\\\\Users",);
+        let pairs = [("PATH", "a;b"), ("WIN", "C:\\Users")];
+        assert_eq!(serialize_env_pairs(pairs), "PATH=a\\;b;WIN=C:\\\\Users",);
     }
 
     #[test]
     fn round_trip_preserves_values() {
-        let mut map = HashMap::new();
-        map.insert("A".to_string(), "simple".to_string());
-        map.insert("B".to_string(), "has;semicolon".to_string());
-        map.insert("C".to_string(), "back\\slash".to_string());
-        let text = serialize_env_map(&map);
-        let parsed: HashMap<String, String> = parse_env_string(&text).into_iter().collect();
-        assert_eq!(parsed, map);
+        let pairs = [
+            ("A", "simple"),
+            ("B", "has;semicolon"),
+            ("C", "back\\slash"),
+        ];
+        let text = serialize_env_pairs(pairs);
+        assert_eq!(parse_env_string(&text), entries(&pairs));
     }
 }

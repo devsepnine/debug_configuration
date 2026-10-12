@@ -1224,11 +1224,12 @@ async fn send_command_info(
     // 환경변수는 더 이상 Command 문자열에 보이지 않으므로 별도 라인으로 표시해 가시성 유지.
     // 단, 설정에서 끄면(show_env=false) 출력하지 않는다. `Line`이 아니라 `EnvBanner`로 보내는
     // 이유는 그 variant의 문서에 있다 — 이 줄이 배너라는 사실을 아는 곳은 여기뿐이다.
-    if show_env && (!config.environment_variables.is_empty() || !extra_env.is_empty()) {
+    let has_user_env = config.environment_variables.active().next().is_some();
+    if show_env && (has_user_env || !extra_env.is_empty()) {
         let mut pairs: Vec<(String, String)> = config
             .environment_variables
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
+            .active()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
         pairs.sort_by(|a, b| a.0.cmp(&b.0));
         pairs.extend(extra_env.iter().cloned());
@@ -2913,18 +2914,18 @@ fn env_key_eq(a: &str, b: &str) -> bool {
     }
 }
 
-/// 사용자 `environment_variables` 위에 얹을 최종 추가 환경변수.
+/// 사용자 `environment_variables`(활성 항목) 위에 얹을 최종 추가 환경변수.
 /// `JAVA_TOOL_OPTIONS`는 사용자 값 뒤에 이어 붙이고(둘 다 살린다), `JAVA_HOME`은 사용자가 직접
 /// 지정했다면 그 값이 우선한다(명시적 의도). 그 외 키는 기존대로 추가 값이 덮어쓴다.
 /// 병합 대상은 구성의 `environment_variables`뿐이다 — 앱 프로세스의 ambient
 /// `JAVA_TOOL_OPTIONS`는 자식 프로세스가 상속만 할 뿐 여기서 합치지 않는다.
 fn effective_extra_env(
-    user_env: &std::collections::HashMap<String, String>,
+    user_env: &crate::models::EnvVars,
     extra_env: &[(String, String)],
 ) -> Vec<(String, String)> {
     let user_value = |name: &str| {
         user_env
-            .iter()
+            .active()
             .find(|(k, _)| env_key_eq(k, name))
             .map(|(_, v)| v)
     };
@@ -2958,8 +2959,8 @@ fn resolved_process_env(
 ) -> Vec<(String, String)> {
     config
         .environment_variables
-        .iter()
-        .map(|(k, v)| (k.clone(), v.clone()))
+        .active()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
         .chain(extra_env.iter().cloned())
         .collect()
 }
@@ -4567,7 +4568,7 @@ time.sleep(30)'";
             id: Uuid::new_v4(),
             name: String::from("k"),
             working_directory: String::from("."),
-            environment_variables: std::collections::HashMap::new(),
+            environment_variables: crate::models::EnvVars::default(),
             type_data: ConfigTypeData::Kotlin {
                 jdk_path: None,
                 launch_mode: kotlin_main_class("MainKt", "out"),
@@ -4730,10 +4731,10 @@ time.sleep(30)'";
         };
         config
             .environment_variables
-            .insert("TOKEN".to_string(), "a\nSECRET=b".to_string());
+            .set("TOKEN".to_string(), "a\nSECRET=b".to_string());
         config
             .environment_variables
-            .insert("CARRIAGE".to_string(), "x\rSECRET=c".to_string());
+            .set("CARRIAGE".to_string(), "x\rSECRET=c".to_string());
 
         let (mut tx, mut rx) = mpsc::channel(16);
         send_command_info(&mut tx, Uuid::new_v4(), &config, "echo hi", &[], true).await;
@@ -4788,7 +4789,7 @@ time.sleep(30)'";
         };
         config
             .environment_variables
-            .insert("FOO".to_string(), "bar".to_string());
+            .set("FOO".to_string(), "bar".to_string());
 
         async fn header(config: &RunConfiguration, show_env: bool) -> String {
             let (mut tx, mut rx) = mpsc::channel(16);
@@ -5306,10 +5307,10 @@ time.sleep(30)'";
         let mut config = RunConfiguration::default();
         config
             .environment_variables
-            .insert(String::from("JAVA_TOOL_OPTIONS"), String::from("-Duser=1"));
+            .set(String::from("JAVA_TOOL_OPTIONS"), String::from("-Duser=1"));
         config
             .environment_variables
-            .insert(String::from("JAVA_HOME"), String::from("/user/jdk"));
+            .set(String::from("JAVA_HOME"), String::from("/user/jdk"));
         let raw = vec![
             (String::from("JAVA_TOOL_OPTIONS"), String::from("-Xmx1g")),
             (String::from("JAVA_HOME"), String::from("/derived")),
@@ -5342,9 +5343,37 @@ time.sleep(30)'";
     }
 
     #[test]
+    fn disabled_env_entries_are_not_injected_or_merged() {
+        use crate::models::{EnvEntry, EnvVars};
+        let off = |k: &str, v: &str| EnvEntry {
+            enabled: false,
+            ..EnvEntry::enabled(k, v)
+        };
+        let config = RunConfiguration {
+            environment_variables: EnvVars::from_entries([
+                EnvEntry::enabled("ON", "1"),
+                off("OFF", "2"),
+                off("JAVA_HOME", "/disabled/jdk"),
+            ]),
+            ..RunConfiguration::default()
+        };
+        let raw = vec![(String::from("JAVA_HOME"), String::from("/derived"))];
+        // 꺼진 JAVA_HOME은 사용자 지정으로 치지 않으므로 파생 값이 살아남아야 한다.
+        let extra = effective_extra_env(&config.environment_variables, &raw);
+        assert_eq!(extra, raw);
+
+        let resolved = resolved_process_env(&config, &extra);
+        assert!(resolved.iter().all(|(k, _)| k != "OFF"));
+        assert!(resolved.contains(&(String::from("ON"), String::from("1"))));
+        assert!(!resolved.iter().any(|(_, v)| v == "/disabled/jdk"));
+    }
+
+    #[test]
     fn effective_extra_env_is_not_idempotent_so_it_must_run_once() {
-        let mut user = std::collections::HashMap::new();
-        user.insert(String::from("JAVA_TOOL_OPTIONS"), String::from("-Duser=1"));
+        let user: crate::models::EnvVars =
+            [(String::from("JAVA_TOOL_OPTIONS"), String::from("-Duser=1"))]
+                .into_iter()
+                .collect();
         let raw = vec![(String::from("JAVA_TOOL_OPTIONS"), String::from("-Xmx1g"))];
         let once = effective_extra_env(&user, &raw);
         let twice = effective_extra_env(&user, &once);
@@ -5355,8 +5384,8 @@ time.sleep(30)'";
     #[cfg(windows)]
     #[test]
     fn effective_env_matches_names_case_insensitively_on_windows() {
-        let mut user = std::collections::HashMap::new();
-        user.insert(String::from("java_home"), String::from("C:\\jdk"));
+        let mut user = crate::models::EnvVars::default();
+        user.set(String::from("java_home"), String::from("C:\\jdk"));
         let extra = vec![(String::from("JAVA_HOME"), String::from("C:\\derived"))];
         assert!(effective_extra_env(&user, &extra).is_empty());
     }
@@ -5364,8 +5393,8 @@ time.sleep(30)'";
     #[cfg(not(windows))]
     #[test]
     fn effective_env_matches_names_case_sensitively_on_unix() {
-        let mut user = std::collections::HashMap::new();
-        user.insert(String::from("java_home"), String::from("/x"));
+        let mut user = crate::models::EnvVars::default();
+        user.set(String::from("java_home"), String::from("/x"));
         let extra = vec![(String::from("JAVA_HOME"), String::from("/derived"))];
         assert_eq!(effective_extra_env(&user, &extra), extra);
     }
@@ -5618,9 +5647,9 @@ time.sleep(30)'";
 
     #[test]
     fn effective_env_appends_java_tool_options_and_user_java_home_wins() {
-        let mut user = std::collections::HashMap::new();
-        user.insert(String::from("JAVA_TOOL_OPTIONS"), String::from("-Duser=1 "));
-        user.insert(String::from("JAVA_HOME"), String::from("/user/jdk"));
+        let mut user = crate::models::EnvVars::default();
+        user.set(String::from("JAVA_TOOL_OPTIONS"), String::from("-Duser=1 "));
+        user.set(String::from("JAVA_HOME"), String::from("/user/jdk"));
         let extra = vec![
             (String::from("JAVA_TOOL_OPTIONS"), String::from("-Xmx1g")),
             (String::from("JAVA_HOME"), String::from("/derived")),
@@ -5637,7 +5666,7 @@ time.sleep(30)'";
             ]
         );
 
-        let none = std::collections::HashMap::new();
+        let none = crate::models::EnvVars::default();
         assert_eq!(effective_extra_env(&none, &extra), extra);
     }
 
