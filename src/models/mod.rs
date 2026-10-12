@@ -1,6 +1,5 @@
 mod configuration;
 mod env_vars;
-mod pane;
 mod session;
 
 pub use configuration::{
@@ -9,7 +8,6 @@ pub use configuration::{
     is_valid_spring_module, is_valid_spring_profiles,
 };
 pub use env_vars::{EnvEntry, EnvVars, duplicate_key_indices};
-pub use pane::{LayoutId, Pane, WorkspaceTab};
 pub use session::{
     DEFAULT_MAX_OUTPUT_LINES, OutputEvent, RunFailure, RunSession, SearchMatch, SearchState,
     SessionStatusKind, StdinWriteError, compile_search_regex,

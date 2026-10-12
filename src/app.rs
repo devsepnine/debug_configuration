@@ -1,8 +1,8 @@
 use crate::messages::{ConfigurationDropPosition, Message, StdinBarKey, ViewMode};
 use crate::models::{
     ConfigTypeData, ConfigurationType, ExecuteMode, ExecuteModeType, KotlinLaunchMode,
-    KotlinLaunchModeType, LayoutId, PackageManager, RunConfiguration, RunFailure, RunSession,
-    SearchState, SessionStatusKind, SpringBootBuildTool, WorkspaceTab,
+    KotlinLaunchModeType, PackageManager, RunConfiguration, RunFailure, RunSession, SearchState,
+    SessionStatusKind, SpringBootBuildTool,
 };
 use crate::services::{
     AppSettings, McpPermission, McpRequestLog, UpdateOutcome, check_latest_release, export_text,
@@ -24,6 +24,7 @@ use crate::views::{
     view_workspace_tab_bar,
 };
 use crate::widgets::pane_grid;
+use crate::widgets::pane_layout::{LayoutId, WorkspaceTab};
 use crate::widgets::title_bar_drag::TitleBarDragArea;
 use iced::{
     Alignment, Background, Border, Color, Element, Event, Length, Point, Size, Subscription, Task,

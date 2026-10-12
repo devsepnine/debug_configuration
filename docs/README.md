@@ -26,8 +26,7 @@ debug_configuration/
 │   │   ├── mod.rs           # 모델 모듈 재export
 │   │   ├── configuration.rs # RunConfiguration, ConfigurationType, ConfigTypeData, NodeCommand
 │   │   ├── env_vars.rs      # EnvVars/EnvEntry (환경변수 목록, 항목별 활성 여부, 키 유일성)
-│   │   ├── session.rs       # RunSession, SearchState, 세션 상태
-│   │   └── pane.rs          # Pane/WorkspaceTab 레이아웃 상태
+│   │   └── session.rs       # RunSession, SearchState, 세션 상태
 │   ├── services/
 │   │   ├── mod.rs           # 서비스 모듈 재export
 │   │   ├── executor.rs      # 프로세스 실행 및 명령어 빌드, PID 추적
@@ -53,6 +52,7 @@ debug_configuration/
 │   └── widgets/
 │       ├── mod.rs                  # 위젯 모듈 재export
 │       ├── configuration_list.rs   # 드래그 가능한 구성 리스트 위젯
+│       ├── pane_layout.rs          # Pane/WorkspaceTab 레이아웃 상태 (pane_grid 상태와 동기화)
 │       └── pane_grid/              # 커스텀 pane_grid 위젯 (분할/드래그/리사이즈)
 ├── assets/                  # SVG 아이콘 (mingcute, remix icon)
 ├── fonts/                   # D2Coding 폰트

@@ -17,10 +17,10 @@ Before adding a file in a new place, a new module, or an import that crosses uni
 |---|---|---|---|
 | `app` | `src/app.rs`, `src/app/` | `RunConfigManager` 상태, `update` 디스패치, 핸들러, `view` 조립, `subscription` | 모든 단위 |
 | `views` | `src/views/` | 상태 조각을 받아 `Element`를 만드는 뷰 함수와 `*View` props | `messages`, `models`, `widgets`, `utils`, `ansi`, `env_string`, `services`(타입만) |
-| `widgets` | `src/widgets/` | 재사용 커스텀 위젯(`pane_grid`, `configuration_list`, `title_bar_drag`) | `messages`, `models`, `utils`, `services`(타입만) |
+| `widgets` | `src/widgets/` | 재사용 커스텀 위젯(`pane_grid`, `configuration_list`, `title_bar_drag`)과 pane 레이아웃 상태(`pane_layout`) | `messages`, `models`, `utils`, `services`(타입만) |
 | `messages` | `src/messages.rs` | `Message` 열거형과 메시지 페이로드 타입 | `models`, `services`(이벤트 타입), `widgets`(위젯 이벤트 타입), `utils` |
 | `services` | `src/services/` | 부수 효과: 프로세스 실행, 파일 저장, 업데이트, MCP 서버 | `models`, `utils` |
-| `models` | `src/models/` | 도메인 데이터 타입(구성, 세션, 환경변수, pane 레이아웃)과 그 불변식 | `ansi` |
+| `models` | `src/models/` | 도메인 데이터 타입(구성, 세션, 환경변수)과 그 불변식 | `ansi` |
 | `utils` | `src/utils.rs` | 아이콘 상수, 텍스트 헬퍼, 런타임·JDK·package.json 감지 | `models` |
 | `ansi` | `src/ansi.rs` | ANSI 이스케이프를 `TextSegment`로 파싱 | none |
 | `env_string` | `src/env_string.rs` | `KEY=value;...` 문자열 파싱·직렬화 | none |
@@ -54,7 +54,7 @@ Before adding a file in a new place, a new module, or an import that crosses uni
 - **Level**: MUST
 - **Rule**: `src/models/`는 `crate::app`, `crate::views`, `crate::widgets`, `crate::messages`, `crate::services`를 참조하지 않는다.
 - **Why**: 2026-10-12 결정(표준 방식). 도메인 타입은 직렬화·테스트·MCP가 함께 쓰므로 UI 위젯 구현에 묶이면 안 된다.
-- **Evidence**: 1 of 5 files · `grep -rlE 'crate::(app|views|widgets|messages|services)(::|\b)' src/models`
+- **Evidence**: 0 of 4 files · `grep -rlE 'crate::(app|views|widgets|messages|services)(::|\b)' src/models`
 - **Exceptions**: none
 - **Enforced by**: draft: CI grep
 
@@ -116,7 +116,6 @@ Before adding a file in a new place, a new module, or an import that crosses uni
 
 | Path | Rule | Decision |
 |---|---|---|
-| `src/models/pane.rs` | `arch-models-no-ui` | fix: `crate::widgets::pane_grid`의 `Axis`·`Configuration`·`Node`·`Pane`·`State`를 직접 쓴다. 레이아웃 트리를 모델 자체 타입으로 표현하거나 `app` 쪽으로 옮긴다 |
 | `src/utils.rs` | `arch-io-in-services` | fix: package.json 읽기·디렉터리 스캔(`std::fs`)과 런타임·JDK 감지(`process::Command`)를 `services`로 옮긴다 |
 | `src/app.rs` | `arch-io-in-services` | fix: 파일 다이얼로그(`rfd`), OS 알림(`notify_rust`), URL 열기(`open::that`), 업데이트 후 재실행(`process::Command`)을 `services`로 옮긴다 |
 | `src/views/configuration_editor.rs` | `arch-modal-views-file` | accepted until moved: 기존 6개 모달 뷰 |
@@ -125,7 +124,7 @@ Before adding a file in a new place, a new module, or an import that crosses uni
 
 | Date | Question | Answer |
 |---|---|---|
-| `2026-10-12` | `src/models/pane.rs`가 `crate::widgets::pane_grid`를 직접 쓴다. 모델이 UI 위젯에 의존해도 되는가 | 표준 방식을 따른다. models는 UI에 의존하지 않는 MUST 규칙으로 두고 pane.rs는 고칠 위반으로 기록한다 |
+| `2026-10-12` | models/pane.rs(현 `src/widgets/pane_layout.rs`)가 `crate::widgets::pane_grid`를 직접 쓴다. 모델이 UI 위젯에 의존해도 되는가 | 표준 방식을 따른다. models는 UI에 의존하지 않는 MUST 규칙으로 두고 pane.rs는 고칠 위반으로 기록한다 |
 | `2026-10-12` | `executor.rs`는 `Message`를 직접 보내고 MCP는 자기 이벤트 타입을 낸다. 새 service는 어느 쪽인가 | 표준 방식으로 규칙을 추가한다. services는 자기 이벤트 타입을 내고 app이 감싼다(MUST). executor.rs는 고칠 위반 |
 | `2026-10-12` | 파일 I/O·프로세스 실행이 `utils.rs`와 `app.rs`에도 있다 | 표준 방식으로 작성한다. I/O는 services에만 둔다(MUST). 두 파일은 고칠 위반 |
 | `2026-10-12` | 모달 뷰 6개가 `configuration_editor.rs`에 있다. 새 모달 뷰는 어디인가 | 마이그레이션. 새 모달 뷰는 `<new> src/views/modals.rs`, 기존 6개는 옮길 때까지 허용 |

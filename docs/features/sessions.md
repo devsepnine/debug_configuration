@@ -177,9 +177,9 @@
 - **Code path**:
   - UI: `src/views/pane_view.rs` → `view_pane_layout`; `src/app.rs` → `view_sessions_screen`, `view_empty_workspace_content`
   - State / handler: `src/app.rs` → `handle_pane_grid_dragged`, `handle_pane_grid_resized`, `workspace_content_aspect`
-  - Model: `src/models/pane.rs` → `WorkspaceTab::open_session`, `remove_session`, `sync_layout_tree_from_pane_grid`, `LayoutTree::best_split_target`, `split_leaf`, `remove_empty_leaves`
+  - Model: `src/widgets/pane_layout.rs` → `WorkspaceTab::open_session`, `remove_session`, `sync_layout_tree_from_pane_grid`, `LayoutTree::best_split_target`, `split_leaf`, `remove_empty_leaves`
   - Widget: `src/widgets/pane_grid/mod.rs`, `src/widgets/pane_grid/state.rs`
-- **Tests**: `src/models/pane.rs` → `best_split_target_splits_largest_along_longer_side`, `open_session_keeps_layout_balanced`, `open_session_fills_empty_leaf_first`
+- **Tests**: `src/widgets/pane_layout.rs` → `best_split_target_splits_largest_along_longer_side`, `open_session_keeps_layout_balanced`, `open_session_fills_empty_leaf_first`
 - **Pitfalls**: none
 - **Shares**: `src/widgets/pane_grid/`
 - **Related**: `pane-controls`, `workspace-tabs`
@@ -193,11 +193,11 @@
 - **Code path**:
   - UI: `src/views/workspace_tabs.rs` → `view_workspace_tab_bar`, `view_tab_label`, `view_close_button`, `view_add_tab_button`
   - State / handler: `src/app.rs` → `handle_tab_name_clicked`, `finish_editing_tab_name`, `cancel_editing_tab_name_on_outside_click`, `handle_close_tab`, `next_workspace_name`, `unique_workspace_name`, `ensure_workspace_tab`
-  - Model: `src/models/pane.rs` → `WorkspaceTab::empty`, `clear`
+  - Model: `src/widgets/pane_layout.rs` → `WorkspaceTab::empty`, `clear`
   - Data: 탭은 메모리만 (영속 없음)
 - **Tests**: `src/app.rs` → `jump_to_workspace_switches_view_and_selects_tab`, `jump_to_workspace_out_of_range_is_noop`, `jump_to_workspace_from_sessions_only_changes_tab`, `next_workspace_name_numbers_and_fills_gaps`, `next_workspace_name_excludes_self_so_renamed_tab_reclaims_its_number`, `unique_workspace_name_keeps_base_then_numbers_on_collision`
 - **Pitfalls**: 마지막 탭 닫기가 탭을 안 없앰 → 1개면 비우고 "Workspace 1"로 리셋, source: `src/app.rs` → `handle_close_tab`; 이름을 지웠더니 "Workspace N"으로 바뀜 → 공백 이름은 번호 이름으로 대체, source: `src/app.rs` → `finish_editing_tab_name`; 탭 편집 중 단축키 무반응 → nav 단축키 비활성, source: `src/app.rs` → `subscription`
-- **Shares**: `src/models/pane.rs`
+- **Shares**: `src/widgets/pane_layout.rs`
 - **Related**: `pane-grid-layout`, `keyboard-shortcuts`
 
 ### `keyboard-shortcuts`: 전역 단축키(F1/F2 화면 전환, Cmd+1~9, Cmd+S/R/W/I/,, Cmd+F, Esc, Enter)

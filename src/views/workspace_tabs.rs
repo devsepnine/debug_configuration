@@ -1,7 +1,7 @@
 use crate::messages::Message;
-use crate::models::WorkspaceTab;
 use crate::utils::{ICON_ADD, ICON_CLOSE};
 use crate::views::shared::{IconButtonState, icon_button_foreground, icon_button_style};
+use crate::widgets::pane_layout::WorkspaceTab;
 use iced::{
     Alignment, Border, Color, Element, Length, Shadow, Theme,
     widget::{Space, button, container, mouse_area, row, scrollable, svg, text, text_input},
