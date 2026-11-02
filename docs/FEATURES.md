@@ -108,7 +108,7 @@ Aliases are inferred, not grepped.
 | MCP 서버가 안 켜져, Starting에서 멈춤, port in use, 포트 | `mcp-server-lifecycle` |
 | 401, Missing or invalid bearer token, Origin not allowed `(ambiguous)` | `mcp-http-auth`, `mcp-token` |
 | 클라이언트가 응답을 거부, resultType, protocol version | `mcp-http-auth` |
-| 토큰 복사, 재발급, claude mcp add 명령 | `mcp-token` |
+| 토큰 복사, 재발급, claude mcp add 명령, codex mcp add 명령 | `mcp-token` |
 | 툴이 안 보여, tool not found, Denied | `mcp-permission-tiers` |
 | 환경변수 값이 <hidden>, 값 노출 `(ambiguous)` | `mcp-read-configurations`, `mcp-read-session-output`, `mcp-edit-configurations` |
 | 세션 로그 읽기, 출력 검색 | `mcp-read-session-output` |
@@ -187,7 +187,7 @@ Entries live in one file per screen under `docs/features/`.
 | `toolbar` | Configurations 목록 상단 아이콘 툴바 (Add / Import / Export / Save / Settings) | [`docs/features/app.md`](features/app.md) |
 | `mcp-server-lifecycle` | 로컬 MCP 서버 켜기·포트 설정·리스너 상태 표시 | [`docs/features/mcp.md`](features/mcp.md) |
 | `mcp-http-auth` | HTTP 엔드포인트 `POST /mcp`의 Origin·Bearer·본문 상한·프로토콜 버전 검사 | [`docs/features/mcp.md`](features/mcp.md) |
-| `mcp-token` | Bearer 토큰 생성·복사·재발급과 `claude mcp add` 명령 복사 | [`docs/features/mcp.md`](features/mcp.md) |
+| `mcp-token` | Bearer 토큰 생성·복사·재발급과 Claude Code·Codex 등록 명령 복사 | [`docs/features/mcp.md`](features/mcp.md) |
 | `mcp-permission-tiers` | 권한 단계(Read only / Execute / Edit)와 `tools/list` 필터·호출 시점 재검사 | [`docs/features/mcp.md`](features/mcp.md) |
 | `mcp-read-configurations` | `list_configurations`·`get_configuration`과 환경변수 값 마스킹 토글 | [`docs/features/mcp.md`](features/mcp.md) |
 | `mcp-read-session-output` | `list_sessions`·`read_session_output`·`search_session_output`과 env 배너 마스킹 | [`docs/features/mcp.md`](features/mcp.md) |

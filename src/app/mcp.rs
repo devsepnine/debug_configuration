@@ -1216,7 +1216,7 @@ impl RunConfigManager {
 
     /// 등록용 `claude mcp add` 명령. `reveal_token`이 `false`면 토큰을 마스킹해, 화면에
     /// 그대로 표시해도 비밀이 노출되지 않는다(복사 버튼만 실제 토큰을 싣는다).
-    pub(super) fn mcp_add_command(&self, reveal_token: bool) -> String {
+    pub(super) fn claude_mcp_add_command(&self, reveal_token: bool) -> String {
         let token = match (&self.mcp_token, reveal_token) {
             (Some(token), true) => token.clone(),
             (Some(token), false) => crate::services::mask_token(token),
@@ -1224,6 +1224,16 @@ impl RunConfigManager {
         };
         format!(
             "claude mcp add --transport http runconfig http://127.0.0.1:{}/mcp -H \"Authorization: Bearer {token}\"",
+            self.mcp_listening_port()
+        )
+    }
+
+    /// Codex 등록 명령에는 환경변수 이름만 넣어 복사된 명령과 Codex 설정에 평문 토큰을
+    /// 남기지 않는다.
+    pub(super) fn codex_mcp_add_command(&self) -> String {
+        format!(
+            "codex mcp add runconfig --url http://127.0.0.1:{}/mcp \
+             --bearer-token-env-var RUN_CONFIG_MCP_TOKEN",
             self.mcp_listening_port()
         )
     }
@@ -2531,7 +2541,11 @@ mod tests {
 
         assert_eq!(app.mcp_status, McpServerStatus::Listening(51234));
         assert!(app.status_message.contains("51234"));
-        assert!(app.mcp_add_command(false).contains("127.0.0.1:51234"));
+        assert!(
+            app.claude_mcp_add_command(false)
+                .contains("127.0.0.1:51234")
+        );
+        assert!(app.codex_mcp_add_command().contains("127.0.0.1:51234"));
     }
 
     #[test]
@@ -2541,11 +2555,31 @@ mod tests {
         let token = "f".repeat(64);
         app.mcp_token = Some(token.clone());
 
-        let shown = app.mcp_add_command(false);
-        let copied = app.mcp_add_command(true);
+        let shown = app.claude_mcp_add_command(false);
+        let copied = app.claude_mcp_add_command(true);
 
         assert!(!shown.contains(&token), "displayed command must be masked");
         assert!(copied.contains(&token), "copied command must be usable");
+    }
+
+    #[test]
+    fn codex_command_uses_a_bearer_token_environment_variable() {
+        let (mut app, _task) = RunConfigManager::new();
+        app.reset_mcp_state_for_test();
+        let token = "f".repeat(64);
+        app.mcp_token = Some(token.clone());
+
+        let command = app.codex_mcp_add_command();
+
+        assert_eq!(
+            command,
+            "codex mcp add runconfig --url http://127.0.0.1:47355/mcp \
+             --bearer-token-env-var RUN_CONFIG_MCP_TOKEN"
+        );
+        assert!(
+            !command.contains(&token),
+            "Codex command must not expose the token"
+        );
     }
 
     #[test]

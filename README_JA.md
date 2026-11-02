@@ -259,13 +259,26 @@ open /Applications/RunConfigManager.app
 既定はオフかつ読み取り専用で、自分で有効化するまでリスナーは起動しない。
 
 1. `Settings` → `AI (MCP)` → `Enable local MCP server`、`Permission` を選び `OK`
-2. `Register with Claude Code` 行のコピーアイコン (実際のトークンが入る。画面表示は
-   マスクされている) でコマンドをコピーして実行する:
+2. 使用するクライアントの登録コマンドをコピーして実行する。Claude Code コマンドには
+   実際のトークンが入る。Codex コマンドは `RUN_CONFIG_MCP_TOKEN` 環境変数からトークンを
+   読み取る。
+
+Claude Code:
 
 ```bash
 claude mcp add --transport http runconfig http://127.0.0.1:47355/mcp \
   -H "Authorization: Bearer <token>"
 ```
+
+Codex:
+
+```bash
+codex mcp add runconfig --url http://127.0.0.1:47355/mcp \
+  --bearer-token-env-var RUN_CONFIG_MCP_TOKEN
+```
+
+Codex を起動する前に、`RUN_CONFIG_MCP_TOKEN` に `Token` 行の値を設定する。Codex CLI と
+IDE extension はこの MCP 設定を共有する。
 
 | 段階 | ツール |
 |---|---|

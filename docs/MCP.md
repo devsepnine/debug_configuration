@@ -1,6 +1,6 @@
 # MCP 연동 가이드
 
-> Last Updated: 2026-09-18
+> Last Updated: 2026-11-02
 > 대상: `run_config_manager` (로컬 MCP 서버)
 
 앱이 로컬 HTTP MCP 서버를 열어, 외부 AI 에이전트(Claude Code 등)가 구성 조회 · 실행 ·
@@ -22,7 +22,8 @@ Settings → `AI (MCP)` 섹션.
 | `Port` | `47355` | `127.0.0.1`의 바인드 포트 |
 | `Expose environment variable values` | off | off면 값이 `<hidden>`으로 나간다 (5장) |
 | `Token` | MCP가 켜져 있고 토큰이 없으면 생성 | 마스킹 표시 · 복사/재생성 아이콘 버튼 |
-| `Register with Claude Code` | — | `claude mcp add` 명령 · 복사 아이콘 버튼 |
+| `Register with Claude Code` | 없음 | `claude mcp add` 명령 · 복사 아이콘 버튼 |
+| `Register with Codex` | 없음 | `codex mcp add` 명령 · 복사 아이콘 버튼 |
 
 토큰 파일은 **MCP가 켜져 있고 토큰이 없을 때** 만들어진다 — 앱 시작 시점과 설정 `OK`를
 누를 때마다 이 조건을 다시 본다. 그래서 토큰 로드가 한 번 실패해도 `OK` 한 번으로 다시
@@ -40,16 +41,29 @@ Settings → `AI (MCP)` 섹션.
 
 ### 클라이언트 등록
 
+Claude Code:
+
 ```bash
 claude mcp add --transport http runconfig http://127.0.0.1:47355/mcp \
   -H "Authorization: Bearer <token>"
 ```
 
-`Register with Claude Code` 행의 복사 아이콘이 **실제 토큰이 박힌** 이 명령을 클립보드에
-넣는다(화면에 보이는 명령의 토큰은 마스킹돼 있다).
+`Register with Claude Code` 행의 복사 아이콘은 실제 토큰이 포함된 명령을 클립보드에 넣는다.
+화면에는 마스킹된 토큰이 보인다.
 
-**주의 — 셸 히스토리**: 이 명령을 그대로 터미널에 붙이면 토큰이 셸 히스토리 파일에 평문으로
-남는다. 토큰 파일을 `0600`으로 두는 것과 어긋나므로, 다음 중 하나를 쓴다.
+Codex:
+
+```bash
+codex mcp add runconfig --url http://127.0.0.1:47355/mcp \
+  --bearer-token-env-var RUN_CONFIG_MCP_TOKEN
+```
+
+Codex를 시작하기 전에 `RUN_CONFIG_MCP_TOKEN` 환경변수에 `Token` 행의 값을 설정한다.
+`Register with Codex` 행은 토큰 대신 환경변수 이름이 든 명령을 복사한다. Codex CLI와 IDE
+extension은 같은 MCP 설정을 사용한다.
+
+**주의: 셸 히스토리**: Claude Code 명령이나 토큰 환경변수 설정 명령을 그대로 터미널에
+붙이면 토큰이 셸 히스토리 파일에 평문으로 남을 수 있다. 다음 중 하나를 쓴다.
 
 - 명령 앞에 공백 하나를 넣어 실행한다 (`HISTCONTROL=ignorespace`/zsh `setopt histignorespace`가 켜져 있을 때만 유효하다)
 - 등록 후 히스토리에서 해당 줄을 지운다

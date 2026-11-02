@@ -37,7 +37,7 @@ const MIN_OUTPUT_LINES: usize = 1_000;
 const MAX_OUTPUT_LINES_LIMIT: usize = 1_000_000;
 
 /// MCP 포트 하한. 1024 미만은 대부분의 OS에서 관리자 권한을 요구하고, 0은 매 실행마다
-/// 포트가 달라져 사용자가 등록해 둔 `claude mcp add` 명령이 무효가 된다.
+/// 포트가 달라져 사용자가 등록해 둔 MCP 클라이언트 설정이 무효가 된다.
 const MIN_MCP_PORT: u16 = 1_024;
 
 impl RunConfigManager {
@@ -236,13 +236,23 @@ impl RunConfigManager {
         iced::clipboard::write(token)
     }
 
-    pub(super) fn handle_settings_copy_mcp_command(&mut self) -> Task<Message> {
+    pub(super) fn handle_settings_copy_claude_mcp_command(&mut self) -> Task<Message> {
         if self.mcp_token.is_none() {
             self.status_message = String::from("MCP token is not available yet");
             return Task::none();
         }
-        self.status_message = String::from("MCP registration command copied to clipboard");
-        iced::clipboard::write(self.mcp_add_command(true))
+        self.status_message =
+            String::from("Claude Code MCP registration command copied to clipboard");
+        iced::clipboard::write(self.claude_mcp_add_command(true))
+    }
+
+    pub(super) fn handle_settings_copy_codex_mcp_command(&mut self) -> Task<Message> {
+        if self.mcp_token.is_none() {
+            self.status_message = String::from("MCP token is not available yet");
+            return Task::none();
+        }
+        self.status_message = String::from("Codex MCP registration command copied to clipboard");
+        iced::clipboard::write(self.codex_mcp_add_command())
     }
 
     pub(super) fn handle_settings_regenerate_mcp_token(&mut self) -> Task<Message> {
@@ -625,10 +635,13 @@ mod tests {
     }
 
     #[test]
-    fn copy_without_a_token_reports_instead_of_copying_a_placeholder() {
+    fn registration_commands_cannot_be_copied_without_a_token() {
         let (mut app, _task) = RunConfigManager::new();
         app.reset_mcp_state_for_test();
-        let _ = app.handle_settings_copy_mcp_command();
+        let _ = app.handle_settings_copy_claude_mcp_command();
+        assert!(app.status_message.contains("not available"));
+
+        let _ = app.handle_settings_copy_codex_mcp_command();
         assert!(app.status_message.contains("not available"));
     }
 }

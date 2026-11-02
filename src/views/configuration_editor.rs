@@ -843,7 +843,7 @@ pub fn view_env_modal<'a>(props: EnvModalView<'a>) -> Element<'a, Message> {
 
 /// 앱 설정 모달 뷰 모델 (app의 staging 상태를 참조로 전달).
 ///
-/// `mcp_masked_token` · `mcp_add_command` · `mcp_status`는 staging이 아니라 **적용된**
+/// MCP 토큰 · 등록 명령 · 상태는 staging이 아니라 **적용된**
 /// 상태에서 온다. 토큰과 리스너는 Confirm과 무관하게 존재하므로, 실행 중인 서버의 실제
 /// 주소를 보여주는 것이 등록 명령을 복사하는 사용자에게 맞다.
 pub struct SettingsModalView<'a> {
@@ -858,7 +858,9 @@ pub struct SettingsModalView<'a> {
     /// 마스킹된 토큰. `None`이면 아직 발급/로드되지 않았다.
     pub mcp_masked_token: Option<String>,
     /// 토큰이 마스킹된 `claude mcp add` 명령 (Copy 버튼은 실제 토큰을 클립보드에 넣는다).
-    pub mcp_add_command: String,
+    pub claude_mcp_add_command: String,
+    /// 토큰 환경변수를 참조하는 `codex mcp add` 명령.
+    pub codex_mcp_add_command: String,
     /// 리스너 상태 한 줄.
     pub mcp_status: String,
     /// Apply로 할 일이 있는지(변경 또는 토큰 재시도). 없으면 Apply를 비활성화한다.
@@ -890,6 +892,7 @@ pub fn view_settings_modal(props: SettingsModalView<'_>) -> Element<'_, Message>
     .align_y(Alignment::Center)
     .spacing(10);
 
+    let token_ready = props.mcp_masked_token.is_some();
     let body = column![
         checkbox(props.show_environment)
             .label("Show environment line on run")
@@ -927,8 +930,20 @@ pub fn view_settings_modal(props: SettingsModalView<'_>) -> Element<'_, Message>
             .text_size(13),
         settings_hint("Off: names are shared, values are replaced with <hidden>."),
         mcp_status_row(props.mcp_status),
-        mcp_command_row(props.mcp_add_command, props.mcp_masked_token.is_some()),
         mcp_token_row(props.mcp_masked_token),
+        mcp_command_row(
+            "Register with Claude Code",
+            props.claude_mcp_add_command,
+            Message::SettingsCopyClaudeMcpCommand,
+            token_ready,
+        ),
+        mcp_command_row(
+            "Register with Codex",
+            props.codex_mcp_add_command,
+            Message::SettingsCopyCodexMcpCommand,
+            token_ready,
+        ),
+        settings_hint("Before starting Codex, set RUN_CONFIG_MCP_TOKEN to the token above."),
     ]
     .spacing(14);
 
@@ -1065,12 +1080,16 @@ fn mcp_token_row(masked_token: Option<String>) -> Element<'static, Message> {
     settings_field_row("Token", controls)
 }
 
-/// 등록 명령 행. 여기 보이는 명령의 토큰은 마스킹돼 있고, Copy가 실제 토큰을 넣는다.
-fn mcp_command_row(command: String, token_ready: bool) -> Element<'static, Message> {
-    let copy = token_ready.then_some(Message::SettingsCopyMcpCommand);
+fn mcp_command_row(
+    title: &'static str,
+    command: String,
+    copy_message: Message,
+    token_ready: bool,
+) -> Element<'static, Message> {
+    let copy = token_ready.then_some(copy_message);
     column![
         row![
-            settings_section_label("Register with Claude Code"),
+            settings_section_label(title),
             Space::new().width(Length::Fill),
             icon_button(ICON_COPY, copy),
         ]

@@ -255,13 +255,25 @@ open /Applications/RunConfigManager.app
 기본값은 꺼짐 · 읽기 전용이다 — 직접 켤 때까지 리스너가 뜨지 않는다.
 
 1. `Settings` → `AI (MCP)` → `Enable local MCP server`, `Permission` 단계 선택, `OK`
-2. `Register with Claude Code` 행의 복사 아이콘(실제 토큰이 박힌다 — 화면에 보이는 것은
-   마스킹)으로 명령을 복사해 실행한다:
+2. 사용하는 클라이언트의 등록 명령을 복사해 실행한다. Claude Code 명령에는 실제 토큰이
+   들어간다. Codex 명령은 `RUN_CONFIG_MCP_TOKEN` 환경변수에서 토큰을 읽는다.
+
+Claude Code:
 
 ```bash
 claude mcp add --transport http runconfig http://127.0.0.1:47355/mcp \
   -H "Authorization: Bearer <token>"
 ```
+
+Codex:
+
+```bash
+codex mcp add runconfig --url http://127.0.0.1:47355/mcp \
+  --bearer-token-env-var RUN_CONFIG_MCP_TOKEN
+```
+
+Codex를 시작하기 전에 `RUN_CONFIG_MCP_TOKEN`을 `Token` 행의 값으로 설정한다. Codex CLI와
+IDE extension은 이 MCP 설정을 함께 사용한다.
 
 | 단계 | 툴 |
 |---|---|

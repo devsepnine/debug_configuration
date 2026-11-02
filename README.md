@@ -262,13 +262,25 @@ The app never calls an LLM itself.
 The defaults are off and read-only — nothing listens until you turn it on.
 
 1. `Settings` → `AI (MCP)` → `Enable local MCP server`, choose a `Permission` tier, `OK`
-2. Press the copy button on the `Register with Claude Code` row — it copies the command
-   with the real token in it (the one shown on screen is masked) — and run it:
+2. Copy and run the command for your client. The Claude Code command contains the real
+   token. The Codex command reads it from `RUN_CONFIG_MCP_TOKEN`.
+
+Claude Code:
 
 ```bash
 claude mcp add --transport http runconfig http://127.0.0.1:47355/mcp \
   -H "Authorization: Bearer <token>"
 ```
+
+Codex:
+
+```bash
+codex mcp add runconfig --url http://127.0.0.1:47355/mcp \
+  --bearer-token-env-var RUN_CONFIG_MCP_TOKEN
+```
+
+Set `RUN_CONFIG_MCP_TOKEN` to the value from the `Token` row before starting Codex. The
+Codex CLI and IDE extension share this MCP configuration.
 
 | Tier | Tools |
 |---|---|

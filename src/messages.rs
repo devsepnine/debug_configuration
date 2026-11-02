@@ -258,7 +258,9 @@ pub enum Message {
     /// 설정: MCP Bearer 토큰을 클립보드로 복사
     SettingsCopyMcpToken,
     /// 설정: `claude mcp add` 등록 명령을 클립보드로 복사
-    SettingsCopyMcpCommand,
+    SettingsCopyClaudeMcpCommand,
+    /// 설정: `codex mcp add` 등록 명령을 클립보드로 복사
+    SettingsCopyCodexMcpCommand,
     /// 설정: MCP Bearer 토큰 재발급 (기존 토큰은 즉시 무효)
     SettingsRegenerateMcpToken,
 
