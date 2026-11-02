@@ -80,7 +80,7 @@ Aliases are inferred, not grepped.
 | JAVA_HOME | `run-env-banner` |
 | JAVA_TOOL_OPTIONS `(ambiguous)` | `run-env-banner`, `type-spring-boot` |
 | VM 옵션, VM options | `type-spring-boot`, `type-kotlin` |
-| 정지, 중지, 세션 삭제, 경과 시간, 상태 배지 | `session-list` |
+| 정지, 중지, 세션 삭제, 종료 세션 한꺼번에 제거, 경과 시간, 상태 배지 | `session-list` |
 | 재실행, rerun, 실패한 것만, 모두 중지 | `session-rerun-bulk` |
 | 색이 깨져, 복사가 안 돼, 링크 클릭, 화면이 튐, 로그가 멈춤 | `terminal-output` |
 | 최대 줄 수, 로그 잘림, max output lines `(ambiguous)` | `terminal-output`, `settings-run-defaults` |
@@ -163,7 +163,7 @@ Entries live in one file per screen under `docs/features/`.
 | `run-configuration` | 구성을 실행해 새 세션을 만들고 PTY로 프로세스를 띄운다 | [`docs/features/sessions.md`](features/sessions.md) |
 | `run-working-dir-check` | 실행 전 작업 디렉터리 존재 여부를 검사해 잘못된 cwd 실행을 막는다 | [`docs/features/sessions.md`](features/sessions.md) |
 | `run-env-banner` | 실행 배너(구성명·타입·cwd·명령)와 "Environment:" 줄, JAVA_HOME/JAVA_TOOL_OPTIONS 병합 | [`docs/features/sessions.md`](features/sessions.md) |
-| `session-list` | 좌측 세션 목록(상태 점·배지·경과시간), 개별 정지/제거, 클릭으로 워크스페이스에 열기 | [`docs/features/sessions.md`](features/sessions.md) |
+| `session-list` | 좌측 세션 목록, 개별 정지·제거, 종료 세션 일괄 제거, 워크스페이스 열기 | [`docs/features/sessions.md`](features/sessions.md) |
 | `session-rerun-bulk` | 세션 재실행(개별)과 전체 재실행 / 실패만 재실행 / 전체 정지 | [`docs/features/sessions.md`](features/sessions.md) |
 | `terminal-output` | 세션 출력 렌더링(ANSI 색, 줄바꿈, 스크롤바, URL 클릭, 선택·복사)과 출력 버퍼 상한 | [`docs/features/sessions.md`](features/sessions.md) |
 | `terminal-auto-scroll` | 새 출력 따라가기(자동 스크롤) 토글과 스크롤 시 자동 해제 | [`docs/features/sessions.md`](features/sessions.md) |

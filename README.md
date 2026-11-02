@@ -245,6 +245,7 @@ This removes the `com.apple.quarantine` attribute that triggers the Gatekeeper c
 - **Open Session**: Click a session in the left session list to open it in the selected workspace
 - **Hide Session**: Click the close button in a pane to remove it from the workspace without removing the running session
 - **Stop/Remove Session**: Use the session list actions to stop or remove a session
+- **Remove Ended Sessions**: Use the trash button in the Sessions header to remove every ended session
 - **Move Pane**: Drag the pane header to rearrange panes
 - **Resize Pane**: Drag the pane border to resize
 - **Maximize Pane**: Use the pane maximize button when the workspace has more than one pane

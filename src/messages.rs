@@ -340,6 +340,8 @@ pub enum Message {
     StopSession(Uuid),
     /// 세션 종료 및 제거 (`session_id`)
     RemoveSession(Uuid),
+    /// 종료된 모든 세션 제거
+    RemoveEndedSessions,
     /// 세션을 현재 워크스페이스에서 열기/focus (`session_id`)
     OpenSessionInWorkspace(Uuid),
     /// 세션 리스트 항목 hover 상태 변경 (표시용 인덱스)

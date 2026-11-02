@@ -44,25 +44,25 @@
 - **Shares**: `src/models/env_vars.rs` (`EnvVars::active`)
 - **Related**: `run-configuration`, `terminal-output`
 
-### `session-list`: 좌측 세션 목록(상태 점·배지·경과시간), 개별 정지/제거, 클릭으로 워크스페이스에 열기
+### `session-list`: 좌측 세션 목록, 개별 정지·제거, 종료 세션 일괄 제거, 워크스페이스 열기
 
 - **Where**: Sessions → 좌측 "Sessions" 패널 (260px)
-- **Aliases**: 세션 목록, 실행 목록, 정지, 중지, 삭제, 타이머, 경과 시간, 종료됨, session list, stop, kill, remove, elapsed, duration, status badge
-- **UI strings**: "Sessions", "Run a configuration to create a session.", "Ended", "Stop session", "Remove session", "Session stopped", "Session removed", "Session opened in workspace", "Session already open in workspace", "Running {}", "✕ exit {code}", "Stopped", "✕ error"
-- **Controls**: `ICON_STOP` "Stop session" → `Message::StopSession` / `handle_stop_session`; `ICON_DELETE` "Remove session" → `Message::RemoveSession` / `handle_remove_session`; 항목 클릭 → `Message::OpenSessionInWorkspace` / `handle_open_session_in_workspace`; hover → `Message::SessionListItemHovered`
+- **Aliases**: 세션 목록, 실행 목록, 정지, 중지, 삭제, 종료 세션 일괄 제거, 타이머, 경과 시간, 종료됨, session list, stop, kill, remove, remove ended, elapsed, duration, status badge
+- **UI strings**: "Sessions", "Run a configuration to create a session.", "Ended", "Stop session", "Remove session", "Remove ended sessions", "Session stopped", "Session removed", "No ended sessions to remove", "Removed 1 ended session", "Removed {count} ended sessions", "Session opened in workspace", "Session already open in workspace", "Running {}", "✕ exit {code}", "Stopped", "✕ error"
+- **Controls**: `ICON_STOP` "Stop session" → `Message::StopSession` / `handle_stop_session`; `ICON_DELETE` "Remove session" → `Message::RemoveSession` / `handle_remove_session`; `ICON_DELETE` "Remove ended sessions" → `Message::RemoveEndedSessions` / `handle_remove_ended_sessions`; 항목 클릭 → `Message::OpenSessionInWorkspace` / `handle_open_session_in_workspace`; hover → `Message::SessionListItemHovered`
 - **Code path**:
   - UI: `src/app.rs` → `view_session_list_panel`, `view_session_list_item`, `view_session_ended_divider`, `split_sessions_by_run_state`, `view_session_action_button`
-  - State / handler: `src/app.rs` → `handle_stop_session`, `handle_remove_session`; 1초 tick `Message::SessionTimerTick` in `subscription`
+  - State / handler: `src/app.rs` → `handle_stop_session`, `handle_remove_session`, `handle_remove_ended_sessions`; 1초 tick `Message::SessionTimerTick` in `subscription`
   - Model: `src/models/session.rs` → `status_kind`, `status_badge_label_compact`, `status_badge_label`, `format_duration`; 메인 탭 라이브 점 `src/views/main_tabs.rs` → `live_session_dot`
   - Executor: `src/services/executor.rs` → `terminate_session_process`, `unregister_running_pid`
-- **Tests**: `src/app.rs` → `split_sessions_keeps_store_indices_and_order`, `hovered_index_follows_the_session_moved_to_the_ended_group`, `remove_session_by_id_removes_the_correct_session`, `remove_session_shifts_hovered_index`, `stop_session_by_id_sets_cancel_flag`, `a_user_stop_is_not_reported_as_a_failure`, `stop_discards_output_queued_behind_cancel`; `src/models/session.rs` → `status_kind_reflects_state`, `compact_badge_stays_short_for_fixed_width_sidebar`, `status_badge_shows_live_elapsed_while_running`, `format_duration_is_human_readable`
-- **Pitfalls**: [fixed] 출력 폭주 중 Stop이 수 초 늦음 → 큐에 쌓인 배치 뒤에 RunCompleted가 도착했음(현재 가드: Stop 클릭 시 UI 상태 즉시 확정, 취소 뒤 배치 폐기), source: `8c68362`, `566291d` / `src/app.rs` → `handle_output_received`; hover 강조가 엉뚱한 항목 → 표시 순서와 저장 인덱스 혼동, source: `src/app.rs` → `split_sessions_by_run_state`; exit code 배지가 잘려 보임 → 이름 영역을 지키려고 배지를 11자로 절단, source: `src/app.rs` → `view_session_list_item`
+- **Tests**: `src/app.rs` → `split_sessions_keeps_store_indices_and_order`, `hovered_index_follows_the_session_moved_to_the_ended_group`, `remove_session_by_id_removes_the_correct_session`, `remove_session_shifts_hovered_index`, `remove_ended_sessions_keeps_running_sessions_and_clears_every_workspace`, `remove_ended_sessions_removes_every_non_running_state`, `remove_ended_sessions_is_a_noop_when_every_session_is_running`, `stop_session_by_id_sets_cancel_flag`, `a_user_stop_is_not_reported_as_a_failure`, `stop_discards_output_queued_behind_cancel`; `src/models/session.rs` → `status_kind_reflects_state`, `compact_badge_stays_short_for_fixed_width_sidebar`, `status_badge_shows_live_elapsed_while_running`, `format_duration_is_human_readable`
+- **Pitfalls**: [fixed] 출력 폭주 중 Stop이 수 초 늦음 → 큐에 쌓인 배치 뒤에 RunCompleted가 도착했음(현재 가드: Stop 클릭 시 UI 상태 즉시 확정, 취소 뒤 배치 폐기), source: `8c68362`, `566291d` / `src/app.rs` → `handle_output_received`; hover 강조가 엉뚱한 항목 → 표시 순서와 저장 인덱스 혼동, source: `src/app.rs` → `split_sessions_by_run_state`; exit code 배지가 잘려 보임 → 이름 영역을 지키려고 배지를 11자로 절단, source: `src/app.rs` → `view_session_list_item`; 종료 세션 일괄 제거가 실행 중 세션까지 지움 → 대상 ID를 `!session.is_running`으로 먼저 고정하고 기존 개별 제거 경로를 재사용, source: `src/app.rs` → `handle_remove_ended_sessions`
 - **Shares**: `src/models/session.rs`
 - **Related**: `session-rerun-bulk`, `pane-controls`
 
 ### `session-rerun-bulk`: 세션 재실행(개별)과 전체 재실행 / 실패만 재실행 / 전체 정지
 
-- **Where**: Sessions → 좌측 패널 헤더 아이콘 3개, pane 타이틀바 재실행 아이콘
+- **Where**: Sessions → 좌측 패널 헤더 재실행·정지 아이콘, pane 타이틀바 재실행 아이콘
 - **Aliases**: 재실행, 다시 실행, 모두 재시작, 실패한 것만, 모두 중지, rerun, restart, rerun failed, stop all, Cmd+R
 - **UI strings**: "Stop all running", "Rerun all", "Rerun failed", "Stopping session for restart...", "Rerunning: {}", "Configuration '{config_name}' not found", "No running sessions to stop", "Stopping {count} session(s)...", "No {noun} to rerun", "Rerunning {} {noun}..."
 - **Controls**: Cmd+R(Sessions 화면이면 포커스 세션 재실행) → `Message::RunShortcut` / `handle_run_shortcut`; `ICON_STOP` "Stop all running" → `Message::StopAllSessions` / `handle_stop_all_sessions`; `ICON_REFRESH` "Rerun all" → `Message::RerunAllSessions` / `handle_rerun_all_sessions`; `ICON_PLAY` "Rerun failed" → `Message::RerunFailedSessions` / `handle_rerun_failed_sessions`; pane `ICON_REFRESH` → `Message::RerunSession` / `handle_rerun_session`

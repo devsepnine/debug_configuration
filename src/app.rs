@@ -840,6 +840,7 @@ impl RunConfigManager {
             | Message::RerunSession(_)
             | Message::StopSession(_)
             | Message::RemoveSession(_)
+            | Message::RemoveEndedSessions
             | Message::OpenSessionInWorkspace(_)
             | Message::SessionListItemHovered(_)
             | Message::StopAllSessions
@@ -1100,6 +1101,7 @@ impl RunConfigManager {
             Message::RerunSession(session_id) => self.handle_rerun_session(session_id),
             Message::StopSession(session_id) => self.handle_stop_session(session_id),
             Message::RemoveSession(session_id) => self.handle_remove_session(session_id),
+            Message::RemoveEndedSessions => self.handle_remove_ended_sessions(),
             Message::OpenSessionInWorkspace(session_id) => {
                 self.handle_open_session_in_workspace(session_id)
             }
@@ -4406,6 +4408,27 @@ impl RunConfigManager {
         Task::none()
     }
 
+    fn handle_remove_ended_sessions(&mut self) -> Task<Message> {
+        let ended_session_ids: Vec<Uuid> = self
+            .sessions
+            .iter()
+            .filter(|session| !session.is_running)
+            .map(|session| session.id)
+            .collect();
+        let removed_count = ended_session_ids.len();
+
+        for session_id in ended_session_ids {
+            let _ = self.handle_remove_session(session_id);
+        }
+
+        self.status_message = match removed_count {
+            0 => String::from("No ended sessions to remove"),
+            1 => String::from("Removed 1 ended session"),
+            count => format!("Removed {count} ended sessions"),
+        };
+        Task::none()
+    }
+
     fn handle_open_session_in_workspace(&mut self, session_id: Uuid) -> Task<Message> {
         if !self.sessions.iter().any(|session| session.id == session_id) {
             return Task::none();
@@ -5183,6 +5206,7 @@ impl RunConfigManager {
         let current_tab = self.workspace_tabs.get(self.selected_tab_index);
 
         let has_running = self.sessions.iter().any(|session| session.is_running);
+        let has_ended = self.sessions.iter().any(|session| !session.is_running);
         let has_failed = self
             .sessions
             .iter()
@@ -5215,6 +5239,13 @@ impl RunConfigManager {
                     has_failed.then_some(Message::RerunFailedSessions),
                     SessionActionKind::Remove,
                     has_failed,
+                ))
+                .push(Self::view_session_action_button(
+                    "Remove ended sessions",
+                    ICON_DELETE,
+                    has_ended.then_some(Message::RemoveEndedSessions),
+                    SessionActionKind::Remove,
+                    has_ended,
                 ))
                 .push(Space::new().width(4));
         }
@@ -7938,6 +7969,71 @@ mod tests {
         app.hovered_session_index = Some(2); // "c" hover 중
         let _ = app.handle_remove_session(ids[0]); // 앞 항목 제거 → hover 인덱스 -1
         assert_eq!(app.hovered_session_index, Some(1));
+    }
+
+    #[test]
+    fn remove_ended_sessions_keeps_running_sessions_and_clears_every_workspace() {
+        let (mut app, ids) = manager_with_open_panes(&["running", "ended", "also-running"]);
+        app.sessions[1].is_running = false;
+        app.sessions[1].exit_code = Some(0);
+        app.hovered_session_index = Some(1);
+
+        let mut other_tab = WorkspaceTab::empty(String::from("Workspace 2"));
+        let _ = other_tab.open_session(ids[0], 1.0);
+        let _ = other_tab.open_session(ids[1], 1.0);
+        app.workspace_tabs.push(other_tab);
+
+        let _ = app.dispatch_message(Message::RemoveEndedSessions);
+
+        assert_eq!(
+            app.sessions
+                .iter()
+                .map(|session| session.id)
+                .collect::<Vec<_>>(),
+            vec![ids[0], ids[2]]
+        );
+        assert!(
+            app.workspace_tabs
+                .iter()
+                .all(|tab| !tab.contains_session(ids[1]))
+        );
+        assert!(app.workspace_tabs[0].contains_session(ids[0]));
+        assert!(app.workspace_tabs[0].contains_session(ids[2]));
+        assert!(app.workspace_tabs[1].contains_session(ids[0]));
+        assert_eq!(app.hovered_session_index, None);
+        assert_eq!(app.status_message, "Removed 1 ended session");
+    }
+
+    #[test]
+    fn remove_ended_sessions_removes_every_non_running_state() {
+        let (mut app, ids) = manager_with_sessions(&["running", "success", "failed", "stopped"]);
+        app.sessions[1].is_running = false;
+        app.sessions[1].exit_code = Some(0);
+        app.sessions[2].is_running = false;
+        app.sessions[2].exit_code = Some(7);
+        app.sessions[3].is_running = false;
+
+        let _ = app.handle_remove_ended_sessions();
+
+        assert_eq!(app.sessions.len(), 1);
+        assert_eq!(app.sessions[0].id, ids[0]);
+        assert_eq!(app.status_message, "Removed 3 ended sessions");
+    }
+
+    #[test]
+    fn remove_ended_sessions_is_a_noop_when_every_session_is_running() {
+        let (mut app, ids) = manager_with_sessions(&["a", "b"]);
+
+        let _ = app.handle_remove_ended_sessions();
+
+        assert_eq!(
+            app.sessions
+                .iter()
+                .map(|session| session.id)
+                .collect::<Vec<_>>(),
+            ids
+        );
+        assert_eq!(app.status_message, "No ended sessions to remove");
     }
 
     #[test]
