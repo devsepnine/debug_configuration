@@ -1,6 +1,6 @@
 # MCP 연동 가이드
 
-> Last Updated: 2026-11-02
+> Last Updated: 2026-11-09
 > 대상: `run_config_manager` (로컬 MCP 서버)
 
 앱이 로컬 HTTP MCP 서버를 열어, 외부 AI 에이전트(Claude Code 등)가 구성 조회 · 실행 ·
@@ -22,8 +22,9 @@ Settings → `AI (MCP)` 섹션.
 | `Port` | `47355` | `127.0.0.1`의 바인드 포트 |
 | `Expose environment variable values` | off | off면 값이 `<hidden>`으로 나간다 (5장) |
 | `Token` | MCP가 켜져 있고 토큰이 없으면 생성 | 마스킹 표시 · 복사/재생성 아이콘 버튼 |
-| `Register with Claude Code` | 없음 | `claude mcp add` 명령 · 복사 아이콘 버튼 |
-| `Register with Codex` | 없음 | `codex mcp add` 명령 · 복사 아이콘 버튼 |
+| `Client connection guide` | 접힘 | 클릭하면 Claude Code와 Codex 연결 절차 표시 |
+| `Register with Claude Code` | 안내 안에 표시 | `claude mcp add` 명령 · 복사 아이콘 버튼 |
+| `Register with Codex` | 안내 안에 표시 | `codex mcp add` 명령 · 복사 아이콘 버튼 |
 
 토큰 파일은 **MCP가 켜져 있고 토큰이 없을 때** 만들어진다 — 앱 시작 시점과 설정 `OK`를
 누를 때마다 이 조건을 다시 본다. 그래서 토큰 로드가 한 번 실패해도 `OK` 한 번으로 다시
@@ -31,8 +32,8 @@ Settings → `AI (MCP)` 섹션.
 `Not created yet`이고 복사·재생성 아이콘은 눌리지 않는다 — 이 기능을 쓰지 않는 사용자의 홈에는
 비밀 파일이 남지 않는다.
 
-설정 모달은 staging 방식이다 — `OK`를 눌러야 적용되고 `Cancel`은 폐기한다. 적용 후
-`Status` 행이 결과를 싣는다:
+`Apply`는 설정을 적용하고 모달을 유지한다. `OK`는 적용 후 모달을 닫는다.
+`Cancel`은 마지막 적용 이후의 변경을 폐기한다. 적용 후 `Status` 행이 결과를 싣는다:
 
 - `Disabled` — 꺼짐
 - `Starting…` — 바인드 결과 대기
@@ -41,10 +42,14 @@ Settings → `AI (MCP)` 섹션.
 
 ### 클라이언트 등록
 
+`Apply`를 누르고 `Status`가 `Listening`이 되면 `Client connection guide`를 펼친다.
+연결 안내는 Settings를 다시 열면 접힌 상태로 시작한다. MCP 등록 이름과 서버 이름은
+`rundebugconfig`다. 기존 `runconfig` 등록은 자동으로 이름이 바뀌지 않는다.
+
 Claude Code:
 
 ```bash
-claude mcp add --transport http runconfig http://127.0.0.1:47355/mcp \
+claude mcp add --transport http rundebugconfig http://127.0.0.1:47355/mcp \
   -H "Authorization: Bearer <token>"
 ```
 
@@ -53,24 +58,52 @@ claude mcp add --transport http runconfig http://127.0.0.1:47355/mcp \
 
 Codex:
 
+1. `Register with Codex` 행에서 명령을 복사한다. 서버 등록과 인증 헤더 저장이 함께 복사되며,
+   실제 토큰이 자동으로 포함된다. 화면에서는 토큰이 마스킹된다.
+2. 터미널에 붙여넣고 실행한다. macOS와 Linux에서는 zsh 또는 bash, Windows에서는
+   PowerShell용 명령이 복사된다.
+
+macOS / Linux에서 복사되는 명령의 형태:
+
 ```bash
-codex mcp add runconfig --url http://127.0.0.1:47355/mcp \
-  --bearer-token-env-var RUN_CONFIG_MCP_TOKEN
+codex mcp add rundebugconfig --url http://127.0.0.1:47355/mcp &&
+printf '\n%s\n%s\n' '[mcp_servers.rundebugconfig.http_headers]' \
+  'Authorization = "Bearer <token>"' >> "${CODEX_HOME:-$HOME/.codex}/config.toml"
 ```
 
-Codex를 시작하기 전에 `RUN_CONFIG_MCP_TOKEN` 환경변수에 `Token` 행의 값을 설정한다.
-`Register with Codex` 행은 토큰 대신 환경변수 이름이 든 명령을 복사한다. Codex CLI와 IDE
-extension은 같은 MCP 설정을 사용한다.
+Windows에서 복사되는 명령의 형태:
 
-**주의: 셸 히스토리**: Claude Code 명령이나 토큰 환경변수 설정 명령을 그대로 터미널에
+```powershell
+codex mcp add rundebugconfig --url http://127.0.0.1:47355/mcp
+if ($? -and $LASTEXITCODE -eq 0) {
+  $rdcCodexDir = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME '.codex' }
+  [System.IO.File]::AppendAllText((Join-Path $rdcCodexDir 'config.toml'), '
+[mcp_servers.rundebugconfig.http_headers]
+Authorization = "Bearer <token>"
+')
+} else { throw 'Codex MCP registration failed.' }
+```
+
+3. Codex를 재시작하고 `/mcp`에서 `rundebugconfig` 연결을 확인한다.
+
+명령은 `~/.codex/config.toml`의 `mcp_servers.rundebugconfig.http_headers.Authorization`에
+토큰을 평문으로 저장한다. `CODEX_HOME`이 있으면 그 디렉터리의 `config.toml`을 쓴다.
+새 터미널에서도 저장된 토큰을 읽으므로 토큰 환경변수를 설정할 필요가 없다.
+기존 `rundebugconfig` 항목은 새 URL과 헤더로 교체하고, 다른 서버와 Codex 설정은 유지한다.
+이전에 등록한 `bearer_token_env_var`도 제거되어 낡은 환경변수가 새 토큰을 덮지 않는다.
+등록 명령이 실패하면 인증 헤더를 추가하지 않는다. Codex CLI와 IDE extension은 같은
+MCP 설정을 사용한다.
+설정 방식은 [OpenAI MCP 문서](https://learn.chatgpt.com/docs/extend/mcp?surface=cli)를 따른다.
+
+**주의: 셸 히스토리**: Claude Code 또는 Codex 등록 명령을 그대로 터미널에
 붙이면 토큰이 셸 히스토리 파일에 평문으로 남을 수 있다. 다음 중 하나를 쓴다.
 
 - 명령 앞에 공백 하나를 넣어 실행한다 (`HISTCONTROL=ignorespace`/zsh `setopt histignorespace`가 켜져 있을 때만 유효하다)
 - 등록 후 히스토리에서 해당 줄을 지운다
 - 등록 후 Settings의 `Token` 행에서 재생성 아이콘으로 토큰을 새로 만들고 다시 등록한다 (히스토리에 남은 값이 무효가 된다)
 
-`Port`를 바꾸거나 토큰을 재생성하면 등록해 둔 명령이 무효가 된다 — 옛 토큰은 `401`을
-받는다. 클라이언트를 다시 등록한다.
+`Port`를 바꾸거나 토큰을 재생성하면 갱신된 명령을 다시 복사해 실행한다.
+Codex를 재시작한다. 이전 토큰으로 요청하면 `401`을 받는다.
 
 ---
 

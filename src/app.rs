@@ -714,6 +714,9 @@ impl RunConfigManager {
                 self.handle_settings_toggle_mcp_expose_env(value)
             }
             Message::SettingsCopyMcpToken => self.handle_settings_copy_mcp_token(),
+            Message::SettingsToggleMcpConnectionGuide => {
+                self.handle_settings_toggle_mcp_connection_guide()
+            }
             Message::SettingsCopyClaudeMcpCommand => self.handle_settings_copy_claude_mcp_command(),
             Message::SettingsCopyCodexMcpCommand => self.handle_settings_copy_codex_mcp_command(),
             Message::SettingsRegenerateMcpToken => self.handle_settings_regenerate_mcp_token(),
@@ -6016,9 +6019,10 @@ impl RunConfigManager {
                 mcp_port_text: &modal.mcp_port_text,
                 mcp_permission: modal.mcp_permission,
                 mcp_expose_env_values: modal.mcp_expose_env_values,
+                mcp_connection_guide_expanded: modal.mcp_connection_guide_expanded,
                 mcp_masked_token: self.mcp_token.as_deref().map(mask_token),
                 claude_mcp_add_command: self.claude_mcp_add_command(false),
-                codex_mcp_add_command: self.codex_mcp_add_command(),
+                codex_mcp_add_command: self.codex_mcp_add_command(false),
                 mcp_status: self.mcp_status.label(),
                 can_apply: self.settings_modal_can_apply(),
             };

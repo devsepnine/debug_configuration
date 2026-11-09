@@ -1217,25 +1217,48 @@ impl RunConfigManager {
     /// 등록용 `claude mcp add` 명령. `reveal_token`이 `false`면 토큰을 마스킹해, 화면에
     /// 그대로 표시해도 비밀이 노출되지 않는다(복사 버튼만 실제 토큰을 싣는다).
     pub(super) fn claude_mcp_add_command(&self, reveal_token: bool) -> String {
-        let token = match (&self.mcp_token, reveal_token) {
-            (Some(token), true) => token.clone(),
-            (Some(token), false) => crate::services::mask_token(token),
-            (None, _) => String::from("<token unavailable>"),
-        };
+        let token = self.mcp_command_token(reveal_token);
         format!(
-            "claude mcp add --transport http runconfig http://127.0.0.1:{}/mcp -H \"Authorization: Bearer {token}\"",
+            "claude mcp add --transport http rundebugconfig http://127.0.0.1:{}/mcp -H \"Authorization: Bearer {token}\"",
             self.mcp_listening_port()
         )
     }
 
-    /// Codex 등록 명령에는 환경변수 이름만 넣어 복사된 명령과 Codex 설정에 평문 토큰을
-    /// 남기지 않는다.
-    pub(super) fn codex_mcp_add_command(&self) -> String {
-        format!(
-            "codex mcp add runconfig --url http://127.0.0.1:{}/mcp \
-             --bearer-token-env-var RUN_CONFIG_MCP_TOKEN",
+    /// 새 터미널에서도 인증되도록 Codex 설정에 헤더를 저장한다. `mcp add`가 대상 서버의
+    /// 기존 항목을 교체하므로 재등록해도 헤더 테이블이 중복되지 않는다.
+    pub(super) fn codex_mcp_add_command(&self, reveal_token: bool) -> String {
+        let token = self.mcp_command_token(reveal_token);
+        let register = format!(
+            "codex mcp add rundebugconfig --url http://127.0.0.1:{}/mcp",
             self.mcp_listening_port()
-        )
+        );
+        if cfg!(target_os = "windows") {
+            format!(
+                "{register}\n\
+                 if ($? -and $LASTEXITCODE -eq 0) {{\n  \
+                 $rdcCodexDir = if ($env:CODEX_HOME) {{ $env:CODEX_HOME }} else {{ Join-Path $HOME '.codex' }}\n  \
+                 [System.IO.File]::AppendAllText((Join-Path $rdcCodexDir 'config.toml'), '\n\
+                 [mcp_servers.rundebugconfig.http_headers]\n\
+                 Authorization = \"Bearer {token}\"\n\
+                 ')\n\
+                 }} else {{ throw 'Codex MCP registration failed.' }}"
+            )
+        } else {
+            format!(
+                "{register} &&\n\
+                 printf '\\n%s\\n%s\\n' '[mcp_servers.rundebugconfig.http_headers]' \
+                 'Authorization = \"Bearer {token}\"' >> \
+                 \"${{CODEX_HOME:-$HOME/.codex}}/config.toml\""
+            )
+        }
+    }
+
+    fn mcp_command_token(&self, reveal_token: bool) -> String {
+        match (&self.mcp_token, reveal_token) {
+            (Some(token), true) => token.clone(),
+            (Some(token), false) => crate::services::mask_token(token),
+            (None, _) => String::from("<token unavailable>"),
+        }
     }
 
     /// 안내에 쓸 포트. 리스닝 중이면 실제 바인드된 포트, 아니면 설정값.
@@ -2545,7 +2568,7 @@ mod tests {
             app.claude_mcp_add_command(false)
                 .contains("127.0.0.1:51234")
         );
-        assert!(app.codex_mcp_add_command().contains("127.0.0.1:51234"));
+        assert!(app.codex_mcp_add_command(false).contains("127.0.0.1:51234"));
     }
 
     #[test]
@@ -2563,23 +2586,28 @@ mod tests {
     }
 
     #[test]
-    fn codex_command_uses_a_bearer_token_environment_variable() {
+    fn codex_command_persists_an_authorization_header_without_an_environment_token() {
         let (mut app, _task) = RunConfigManager::new();
         app.reset_mcp_state_for_test();
         let token = "f".repeat(64);
         app.mcp_token = Some(token.clone());
 
-        let command = app.codex_mcp_add_command();
+        let shown = app.codex_mcp_add_command(false);
+        let copied = app.codex_mcp_add_command(true);
 
-        assert_eq!(
-            command,
-            "codex mcp add runconfig --url http://127.0.0.1:47355/mcp \
-             --bearer-token-env-var RUN_CONFIG_MCP_TOKEN"
+        assert!(
+            copied.starts_with("codex mcp add rundebugconfig --url http://127.0.0.1:47355/mcp"),
+            "register the server before writing its header"
         );
         assert!(
-            !command.contains(&token),
-            "Codex command must not expose the token"
+            !shown.contains(&token),
+            "displayed Codex command must be masked"
         );
+        assert!(copied.contains("[mcp_servers.rundebugconfig.http_headers]"));
+        assert!(copied.contains(&format!("Authorization = \"Bearer {token}\"")));
+        assert!(!copied.contains("RUN_CONFIG_MCP_TOKEN"));
+        assert!(!copied.contains("--bearer-token-env-var"));
+        assert!(copied.contains("CODEX_HOME"));
     }
 
     #[test]

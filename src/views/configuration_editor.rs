@@ -855,11 +855,12 @@ pub struct SettingsModalView<'a> {
     pub mcp_port_text: &'a str,
     pub mcp_permission: McpPermission,
     pub mcp_expose_env_values: bool,
+    pub mcp_connection_guide_expanded: bool,
     /// 마스킹된 토큰. `None`이면 아직 발급/로드되지 않았다.
     pub mcp_masked_token: Option<String>,
     /// 토큰이 마스킹된 `claude mcp add` 명령 (Copy 버튼은 실제 토큰을 클립보드에 넣는다).
     pub claude_mcp_add_command: String,
-    /// 토큰 환경변수를 참조하는 `codex mcp add` 명령.
+    /// 토큰이 마스킹된 Codex 설정·등록 명령. 복사 버튼만 실제 토큰을 싣는다.
     pub codex_mcp_add_command: String,
     /// 리스너 상태 한 줄.
     pub mcp_status: String,
@@ -931,19 +932,12 @@ pub fn view_settings_modal(props: SettingsModalView<'_>) -> Element<'_, Message>
         settings_hint("Off: names are shared, values are replaced with <hidden>."),
         mcp_status_row(props.mcp_status),
         mcp_token_row(props.mcp_masked_token),
-        mcp_command_row(
-            "Register with Claude Code",
+        mcp_connection_guide(
+            props.mcp_connection_guide_expanded,
             props.claude_mcp_add_command,
-            Message::SettingsCopyClaudeMcpCommand,
-            token_ready,
-        ),
-        mcp_command_row(
-            "Register with Codex",
             props.codex_mcp_add_command,
-            Message::SettingsCopyCodexMcpCommand,
             token_ready,
         ),
-        settings_hint("Before starting Codex, set RUN_CONFIG_MCP_TOKEN to the token above."),
     ]
     .spacing(14);
 
@@ -1080,6 +1074,60 @@ fn mcp_token_row(masked_token: Option<String>) -> Element<'static, Message> {
     settings_field_row("Token", controls)
 }
 
+fn mcp_connection_guide(
+    expanded: bool,
+    claude_command: String,
+    codex_command: String,
+    token_ready: bool,
+) -> Element<'static, Message> {
+    let header = button(
+        row![
+            text("Client connection guide").size(13),
+            Space::new().width(Length::Fill),
+            text(if expanded { "−" } else { "+" }).size(16),
+        ]
+        .align_y(Alignment::Center),
+    )
+    .on_press(Message::SettingsToggleMcpConnectionGuide)
+    .padding([8, 10])
+    .width(Length::Fill)
+    .style(modal_secondary_button_style);
+    let mut content = column![header].spacing(12);
+    if expanded {
+        content = content.push(
+            column![
+                settings_hint("Enable the MCP server and click Apply. Wait for Listening before connecting."),
+                mcp_command_row(
+                    "Register with Claude Code",
+                    claude_command,
+                    Message::SettingsCopyClaudeMcpCommand,
+                    token_ready,
+                ),
+                settings_hint("Copy and run this command. The copied Claude Code command includes your token."),
+                settings_section_label("Connect with Codex"),
+                settings_hint("1. Copy the command below and paste it into your terminal. It registers rundebugconfig and saves its token in your Codex configuration."),
+                settings_hint(if cfg!(target_os = "windows") {
+                    "Run in PowerShell. The displayed token is masked; Copy includes the actual value."
+                } else {
+                    "Run in zsh or bash. The displayed token is masked; Copy includes the actual value."
+                }),
+                mcp_command_row(
+                    "Register with Codex",
+                    codex_command,
+                    Message::SettingsCopyCodexMcpCommand,
+                    token_ready,
+                ),
+                settings_hint("2. Restart Codex, then use /mcp to check rundebugconfig. New terminals use the saved token automatically; no environment variable setup is needed."),
+                settings_hint("The token is stored in plain text in ~/.codex/config.toml, or under CODEX_HOME if set. Other Codex settings are preserved; the rundebugconfig entry is replaced."),
+                settings_hint("After changing the port or regenerating the token, copy and run the updated command and restart Codex. The copied command contains a secret; avoid saving it in shell history."),
+            ]
+            .spacing(10)
+            .padding([0, 10]),
+        );
+    }
+    content.into()
+}
+
 fn mcp_command_row(
     title: &'static str,
     command: String,
@@ -1094,17 +1142,22 @@ fn mcp_command_row(
             icon_button(ICON_COPY, copy),
         ]
         .align_y(Alignment::Center),
-        container(
-            text(command)
-                .size(11)
-                .font(iced::Font::MONOSPACE)
-                .color(Color::from_rgba8(255, 255, 255, 0.70))
-        )
-        .padding(8)
-        .width(Length::Fill)
-        .style(mcp_command_box_style),
+        mcp_command_box(command),
     ]
     .spacing(6)
+    .into()
+}
+
+fn mcp_command_box(command: String) -> Element<'static, Message> {
+    container(
+        text(command)
+            .size(11)
+            .font(iced::Font::MONOSPACE)
+            .color(Color::from_rgba8(255, 255, 255, 0.70)),
+    )
+    .padding(8)
+    .width(Length::Fill)
+    .style(mcp_command_box_style)
     .into()
 }
 

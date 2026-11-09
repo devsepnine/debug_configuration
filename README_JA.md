@@ -259,27 +259,31 @@ open /Applications/RunConfigManager.app
 
 既定はオフかつ読み取り専用で、自分で有効化するまでリスナーは起動しない。
 
-1. `Settings` → `AI (MCP)` → `Enable local MCP server`、`Permission` を選び `OK`
-2. 使用するクライアントの登録コマンドをコピーして実行する。Claude Code コマンドには
-   実際のトークンが入る。Codex コマンドは `RUN_CONFIG_MCP_TOKEN` 環境変数からトークンを
-   読み取る。
+1. `Settings` → `AI (MCP)` → `Enable local MCP server`、`Permission` を選び `Apply`。
+2. `Client connection guide` を開き、使用するクライアントの登録コマンドをコピーして実行する。
+   両方のコマンドに実際のトークンが入る。Codex コマンドはサーバー登録と認証ヘッダーの保存を行う。
 
 Claude Code:
 
 ```bash
-claude mcp add --transport http runconfig http://127.0.0.1:47355/mcp \
+claude mcp add --transport http rundebugconfig http://127.0.0.1:47355/mcp \
   -H "Authorization: Bearer <token>"
 ```
 
-Codex:
+macOS / Linux の zsh または bash で Codex を登録:
 
 ```bash
-codex mcp add runconfig --url http://127.0.0.1:47355/mcp \
-  --bearer-token-env-var RUN_CONFIG_MCP_TOKEN
+codex mcp add rundebugconfig --url http://127.0.0.1:47355/mcp &&
+printf '\n%s\n%s\n' '[mcp_servers.rundebugconfig.http_headers]' \
+  'Authorization = "Bearer <token>"' >> "${CODEX_HOME:-$HOME/.codex}/config.toml"
 ```
 
-Codex を起動する前に、`RUN_CONFIG_MCP_TOKEN` に `Token` 行の値を設定する。Codex CLI と
-IDE extension はこの MCP 設定を共有する。
+画面ではトークンを隠し、コピーしたコマンドには実際の値を含める。Windows では PowerShell
+コマンドをコピーする。登録後に Codex を再起動し、`/mcp` で `rundebugconfig` を確認する。
+トークンは `~/.codex/config.toml` に平文で保存する。`CODEX_HOME` があればそのパスを使う。
+新しいターミナルでトークン環境変数を設定する必要はない。他の設定を保持し、`rundebugconfig`
+の項目を置き換える。ポート変更やトークン再生成後は、更新されたコマンドを再実行する。
+詳しい手順は [接続ガイド](docs/MCP.md#클라이언트-등록)を参照。
 
 | 段階 | ツール |
 |---|---|
@@ -288,7 +292,7 @@ IDE extension はこの MCP 設定を共有する。
 | `Edit` | + 構成の作成・更新・削除 |
 
 - ループバック専用 (`127.0.0.1`)、Bearer トークン必須、ループバック以外の `Origin` は拒否
-- トークンは `~/.run_config_mcp_token` にあり (unix では `0600`)、設定ファイルには入らない。
+- サーバートークンは `~/.run_config_mcp_token` にあり (unix では `0600`)、アプリの設定ファイルには入らない。
   Windows ではユーザープロファイルの ACL に依存する
 - 登録コマンドをシェルに貼り付けるとトークンがシェル履歴に残る。その行を削除するか、登録後に
   `Token` 行の再生成アイコンで無効化する

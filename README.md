@@ -262,26 +262,32 @@ The app never calls an LLM itself.
 
 The defaults are off and read-only — nothing listens until you turn it on.
 
-1. `Settings` → `AI (MCP)` → `Enable local MCP server`, choose a `Permission` tier, `OK`
-2. Copy and run the command for your client. The Claude Code command contains the real
-   token. The Codex command reads it from `RUN_CONFIG_MCP_TOKEN`.
+1. `Settings` → `AI (MCP)` → `Enable local MCP server`, choose a `Permission` tier, `Apply`.
+2. Expand `Client connection guide`, copy the command for your client, and paste it into
+   your terminal. Both commands include the real token. The Codex command registers
+   the server and saves its authorization header in one paste.
 
 Claude Code:
 
 ```bash
-claude mcp add --transport http runconfig http://127.0.0.1:47355/mcp \
+claude mcp add --transport http rundebugconfig http://127.0.0.1:47355/mcp \
   -H "Authorization: Bearer <token>"
 ```
 
-Codex:
+Codex on macOS / Linux using zsh or bash:
 
 ```bash
-codex mcp add runconfig --url http://127.0.0.1:47355/mcp \
-  --bearer-token-env-var RUN_CONFIG_MCP_TOKEN
+codex mcp add rundebugconfig --url http://127.0.0.1:47355/mcp &&
+printf '\n%s\n%s\n' '[mcp_servers.rundebugconfig.http_headers]' \
+  'Authorization = "Bearer <token>"' >> "${CODEX_HOME:-$HOME/.codex}/config.toml"
 ```
 
-Set `RUN_CONFIG_MCP_TOKEN` to the value from the `Token` row before starting Codex. The
-Codex CLI and IDE extension share this MCP configuration.
+The copied command already contains your token; the screen masks it. On Windows, Copy
+provides a PowerShell command. Restart Codex and check `rundebugconfig` with `/mcp`.
+The token is stored in plain text in `~/.codex/config.toml`, or under `CODEX_HOME`
+if set, so new terminals need no token environment variable. Other settings are preserved;
+the `rundebugconfig` entry is replaced. Copy and run the updated command after changing
+the port or regenerating the token. See the [connection steps](docs/MCP.md#클라이언트-등록).
 
 | Tier | Tools |
 |---|---|
@@ -290,7 +296,7 @@ Codex CLI and IDE extension share this MCP configuration.
 | `Edit` | + create, update, delete configurations |
 
 - Loopback only (`127.0.0.1`), bearer token required, non-loopback `Origin` rejected
-- The token lives in `~/.run_config_mcp_token` (`0600` on unix) and never in the settings
+- The server token lives in `~/.run_config_mcp_token` (`0600` on unix) and never in the app settings
   file. On Windows it relies on the user-profile ACL
 - Pasting the registration command into a shell leaves the token in shell history — clear
   that line, or regenerate the token afterwards (the refresh button on the `Token` row) to

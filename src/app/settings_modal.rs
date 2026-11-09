@@ -29,6 +29,7 @@ pub struct SettingsModalState {
     pub mcp_permission: McpPermission,
     /// MCP 응답에 환경변수 값 노출 (staging)
     pub mcp_expose_env_values: bool,
+    pub mcp_connection_guide_expanded: bool,
 }
 
 /// 출력 라인 수 설정의 허용 범위. 너무 작으면 출력이 즉시 잘리고, 너무 크면 메모리
@@ -54,6 +55,7 @@ impl RunConfigManager {
             mcp_port_text: self.mcp_port.to_string(),
             mcp_permission: self.mcp_permission,
             mcp_expose_env_values: self.mcp_expose_env_values,
+            mcp_connection_guide_expanded: false,
         });
         Task::none()
     }
@@ -227,6 +229,13 @@ impl RunConfigManager {
         Task::none()
     }
 
+    pub(super) fn handle_settings_toggle_mcp_connection_guide(&mut self) -> Task<Message> {
+        if let Some(modal) = self.settings_modal.as_mut() {
+            modal.mcp_connection_guide_expanded = !modal.mcp_connection_guide_expanded;
+        }
+        Task::none()
+    }
+
     pub(super) fn handle_settings_copy_mcp_token(&mut self) -> Task<Message> {
         let Some(token) = self.mcp_token.clone() else {
             self.status_message = String::from("MCP token is not available yet");
@@ -252,7 +261,7 @@ impl RunConfigManager {
             return Task::none();
         }
         self.status_message = String::from("Codex MCP registration command copied to clipboard");
-        iced::clipboard::write(self.codex_mcp_add_command())
+        iced::clipboard::write(self.codex_mcp_add_command(true))
     }
 
     pub(super) fn handle_settings_regenerate_mcp_token(&mut self) -> Task<Message> {

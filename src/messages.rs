@@ -255,6 +255,7 @@ pub enum Message {
     SettingsMcpPermissionChanged(McpPermission),
     /// 설정: MCP 응답에 환경변수 값 노출 토글
     SettingsToggleMcpExposeEnv(bool),
+    SettingsToggleMcpConnectionGuide,
     /// 설정: MCP Bearer 토큰을 클립보드로 복사
     SettingsCopyMcpToken,
     /// 설정: `claude mcp add` 등록 명령을 클립보드로 복사

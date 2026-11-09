@@ -24,7 +24,7 @@ pub const PROTOCOL_LEGACY: &str = "2025-11-25";
 pub const SUPPORTED_PROTOCOL_VERSIONS: [&str; 2] = [PROTOCOL_MODERN, PROTOCOL_LEGACY];
 
 /// MCP 클라이언트에 노출되는 서버 이름.
-pub const SERVER_NAME: &str = "run-config-manager";
+pub const SERVER_NAME: &str = "rundebugconfig";
 
 /// modern 리비전이 요청 `params._meta`에 버전을 싣는 키.
 const META_PROTOCOL_VERSION: &str = "io.modelcontextprotocol/protocolVersion";
